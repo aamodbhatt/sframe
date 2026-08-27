@@ -4,7 +4,7 @@ Updated: 2026-08-27 (Asia/Kolkata)
 
 ## Executive state
 
-Candidate U has **green local Phase 0 technical evidence**. It is not a completed MVP and cannot yet become the normative architecture because it differs from two requirements in `APEX_MVP_BUILD_SPEC.md`. ADR-0005 records the working design and the founder-acceptance hold. Phase 1 and Phase 2 have not been started or claimed.
+Candidate U has **green local Phase 0 technical evidence** and is now the founder-accepted normative local architecture. It is not a completed MVP. ADR-0005 records the two accepted local specification amendments and the exact scope restriction. Phase 1 is authorized and in progress; Phase 2 has not been started or claimed.
 
 This result is meaningful: the browser isolation premise, channel confinement, artifact pinning, bounded watchdog recovery, actual Wasm startup, strict deployment configuration, and a minimal SQLite Durable Object CAS/ticket/fallback spike now work locally. It is not proof that the business will sell, that Cloudflare production will behave identically, or that the system has received independent review.
 
@@ -27,8 +27,8 @@ This result is meaningful: the browser isolation premise, channel confinement, a
 - [x] Production-HTTPS/local-loopback configuration assertion wired to Worker and DO startup.
 - [x] Minimal local SQLite Durable Object CAS/ticket/budgeted-fallback spike.
 - [x] Phase 0 technical evidence gate locally green.
-- [ ] Founder accepts Candidate U's normative sandbox/Worker-loader amendments.
-- [ ] Phase 1 — not started or claimed.
+- [x] Founder accepted Candidate U's normative sandbox/Worker-loader amendments on 2026-08-27.
+- [ ] Phase 1 — authorized and in progress; completion not claimed.
 - [ ] Phase 1 gate — not started or claimed.
 - [ ] Phase 2 — not started or claimed.
 - [ ] Phase 2 gate — not started or claimed.
@@ -106,7 +106,7 @@ The Miniflare spike proves exact ETag CAS, one winning concurrent write, fixed-s
 
 Exact dev-dependency fixes: AJV 8.20.0, Vite 6.4.3, Vitest 3.2.7. Miniflare's Undici override remains scoped at 7.29.0.
 
-## Normative deviations requiring founder acceptance
+## Founder-accepted normative deviations
 
 1. The spec requires the iframe attribute and response CSP to independently impose sandboxing. The working design omits the iframe `sandbox` attribute because that opaque navigation bypassed Service Worker control in the three pinned engines. It relies on the exact cached response CSP and the tested opacity/authority oracles.
 2. The spec requires a two-Blob module/dynamic-import loader. The working design uses one classic Blob Worker because module loading from the opaque renderer failed cross-engine. A trusted lexical sibling owns the private port and captured intrinsics.
@@ -125,6 +125,6 @@ No `allow-same-origin`, publisher DOM realm, arbitrary network, network renderer
 - Phase 1's production package verifier and Phase 2's usable personal app flow do not exist yet.
 - No interviews, willingness-to-pay evidence, name/license clearance, deployment, external accounts, public release, or fundraising claim has been made.
 
-## Decision needed before Phase 1
+## Authorization boundary
 
-The founder should either accept ADR-0005's two architecture amendments and authorize Candidate U as the normative local path, or hold/pivot. Continuing Phase 1 while pretending the original browser architecture still applies would create two incompatible specifications.
+The founder accepted ADR-0005's two architecture amendments and authorized Candidate U through Phase 1 only. Deployment, publication, spending, Phase 2, and market/security validation claims require a later explicit gate.

@@ -1,6 +1,6 @@
 # Smallframe architecture evidence
 
-Status: Candidate U local Phase 0 evidence is green; the normative architecture amendment in ADR-0005 still requires founder acceptance.
+Status: Candidate U local Phase 0 evidence is green and the founder accepted the normative local architecture amendments in ADR-0005. Phase 1 only is authorized.
 
 Smallframe has three browser realms. The trusted controller currently owns local state, renderer verification, and DOM chrome; the target trust boundary also assigns it room capabilities, persistence, and package verification once those phases are implemented. A build-pinned renderer response is synthesized and cached by the controller Service Worker, then navigated only after the controller independently hashes and checks its exact response policy. Publisher code runs only in a classic Blob Worker created by that renderer and can emit only the declarative SDK protocol.
 

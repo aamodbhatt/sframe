@@ -21,9 +21,9 @@ No Docker, cloud account, paid service, global project binary, or external
 telemetry is required. The browser proof uses loopback `app.localhost` and
 `api.localhost` origins. The local renderer is verified and cached by the
 service worker before a response-CSP-sandboxed frame is created. Candidate U
-has a formal specification-amendment hold because the working browser shape
-omits the iframe `sandbox` attribute and uses one classic Blob Worker; see
-ADR-0005 before extending it.
+is the founder-accepted normative local path: the working browser shape omits
+the iframe `sandbox` attribute and uses one classic Blob Worker. ADR-0005
+records the deviations and authorizes Phase 1 only.
 
 Phase 0 technical evidence is locally green. Phase 1/2 product work, signed
 packages, encrypted Automerge rooms, publisher enrollment, and public

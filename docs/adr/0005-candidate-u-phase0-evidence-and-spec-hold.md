@@ -1,6 +1,6 @@
 # ADR-0005: Candidate U closes the Phase 0 evidence loop with a specification hold
 
-Status: **Phase 0 technical evidence PASS / normative specification amendment HOLD**
+Status: **accepted normative local architecture / Phase 1 authorized**
 
 Date: 2026-08-27
 
@@ -10,7 +10,11 @@ Candidates original, R, A, and S disproved combinations of opaque iframe navigat
 
 ## Decision
 
-Use Candidate U for further local engineering only after the founder accepts the two normative deviations below. Do not call it deployed, independently secure, beta-ready, or market-proven.
+Use Candidate U as the normative local engineering architecture. Do not call it deployed, independently secure, beta-ready, or market-proven.
+
+## Founder acceptance
+
+On 2026-08-27, the founder explicitly accepted both local specification amendments in this ADR and required the exact Firefox `/sw.js` exception and negative tests to remain. The authorization extends through Phase 1 only. It does not authorize deployment, publication, spending, or market/security validation claims.
 
 The tested browser architecture is:
 
@@ -64,9 +68,9 @@ composite bytes: 33,901
 
 One WebKit watchdog run stalled once during development. The isolated case then passed four consecutive times and two later complete 24-test matrices passed. Record this history; do not erase it from release risk assessment.
 
-## Required specification amendment
+## Accepted local specification amendments
 
-`APEX_MVP_BUILD_SPEC.md` remains unchanged. Before treating Candidate U as the normative implementation, the founder must accept:
+`APEX_MVP_BUILD_SPEC.md` remains unchanged. The founder accepted:
 
 1. **Sandbox change:** omit the iframe `sandbox` attribute and require the exact cached response CSP sandbox plus the tested opacity/authority oracles. The attribute caused opaque navigation to bypass Service Worker control in the pinned engines, so the spec's claim of two independent sandbox layers is false for the working design.
 2. **Worker-loader change:** replace the two-Blob module/dynamic-import loader with one classic Blob Worker whose trusted lexical sibling owns the private port and captured intrinsics. Blob module loading from the opaque renderer failed cross-engine.
