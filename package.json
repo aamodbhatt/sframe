@@ -1,0 +1,52 @@
+{
+  "name": "smallframe",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "npm@11.11.0",
+  "engines": {
+    "node": ">=24 <26",
+    "npm": ">=11 <12"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*",
+    "examples/*"
+  ],
+  "scripts": {
+    "bootstrap": "node scripts/bootstrap.mjs",
+    "bootstrap:extended": "node scripts/bootstrap-extended.mjs",
+    "doctor": "node scripts/doctor.mjs",
+    "build": "node scripts/build.mjs",
+    "test": "vitest run --config vitest.config.ts",
+    "test:e2e": "npm run clean && npm run build && playwright test --config=playwright.config.ts",
+    "test:phase0:do": "vitest run apps/api/src/do-fallback-policy.test.ts tests/phase0-do.integration.test.ts --config vitest.config.ts",
+    "test:phase0:u": "node scripts/test-candidate-u.mjs",
+    "typecheck": "tsc -b tsconfig.json",
+    "lint": "node scripts/lint.mjs",
+    "check": "npm run doctor && npm run build && npm test && npm run test:e2e",
+    "dev": "node scripts/dev.mjs",
+    "cli": "cargo run -q -p smallframe-cli --",
+    "disk-usage": "node scripts/disk-usage.mjs",
+    "clean": "node scripts/clean.mjs"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20260825.1",
+    "@noble/ed25519": "2.2.3",
+    "@playwright/test": "1.62.1",
+    "@types/node": "22.10.5",
+    "ajv": "8.20.0",
+    "canonicalize": "2.1.0",
+    "lit": "3.2.1",
+    "miniflare": "4.20260730.0",
+    "typescript": "5.7.3",
+    "vite": "6.4.3",
+    "vitest": "3.2.7",
+    "wrangler": "4.116.0",
+    "ws": "8.21.3"
+  },
+  "overrides": {
+    "miniflare": {
+      "undici": "7.29.0"
+    }
+  }
+}

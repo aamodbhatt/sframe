@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = ["crates/smallframe-core", "crates/smallframe-cli", "crates/smallframe-phase0-wasm"]
+
+[profile.release.package.smallframe-phase0-wasm]
+opt-level = "s"
+strip = true

@@ -1,0 +1,6 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {"composite": true, "rootDir": "src", "outDir": "../../dist/api", "tsBuildInfoFile": "../../dist/api.tsbuildinfo", "types": ["node"]},
+  "include": ["src/**/*.ts"],
+  "references": [{"path": "../../packages/protocol"}]
+}

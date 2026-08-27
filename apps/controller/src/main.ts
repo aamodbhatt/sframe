@@ -1,0 +1,387 @@
+const RENDERER_DIGEST = '__RENDERER_DIGEST__';
+const CONTROLLER_ORIGIN = 'http://app.localhost:4173';
+const ARCHITECTURE_CANDIDATE: string = '__ARCHITECTURE_CANDIDATE__';
+const CHANNEL_TEST_FIXTURE: string = '__CHANNEL_TEST_FIXTURE__';
+const PHASE0_WASM_BYTES = Number('__PHASE0_WASM_BYTES__');
+const USES_CLASSIC_WORKER = ARCHITECTURE_CANDIDATE === 'S' || ARCHITECTURE_CANDIDATE === 'T' || ARCHITECTURE_CANDIDATE === 'U';
+const IS_CANDIDATE_U = ARCHITECTURE_CANDIDATE === 'U';
+const RENDERER_PATH = `/runtime/renderer/${RENDERER_DIGEST}.html`;
+const MAX_RENDERER_BYTES = 2 * 1024 * 1024;
+const REQUIRED_RENDERER_CSP = "default-src 'none'; script-src 'sha256-__RENDERER_BOOTSTRAP_HASH__'__RENDERER_WASM_EVAL_SOURCE__ blob:; style-src 'sha256-__RENDERER_CSS_HASH__'; img-src 'none'; font-src 'none'; connect-src 'none'; worker-src blob:; child-src 'none'; frame-src 'none'; media-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; navigate-to 'none'; frame-ancestors http://app.localhost:4173; sandbox allow-scripts; require-trusted-types-for 'script'; trusted-types smallframe-renderer-worker";
+const MAX_MESSAGE_BYTES = 256 * 1024;
+let frame: HTMLIFrameElement | undefined;
+let port: MessagePort | undefined;
+let portSequence = 0;
+let expectedPortSequence = 1;
+let activeSessionId = '';
+let controllerChannelTerminal = false;
+let channelFixtureInjected = false;
+let rendererInitTimer = 0;
+let workerLifecycleState: 'idle' | 'booting' | 'running' | 'restarting' | 'stopped' = 'idle';
+let workerLifecycleGeneration = 0;
+let workerLifecycleRestartCount = 0;
+let acceptedAppReadyGeneration = 0;
+let localState: Record<string, unknown> = {decisions: {}};
+
+const text = (value: string): Text => document.createTextNode(value);
+const byId = <T extends HTMLElement>(id: string): T => {
+  const element = document.getElementById(id);
+  if (!(element instanceof HTMLElement)) throw new Error(`missing ${id}`);
+  return element as T;
+};
+const byteLength = (value: unknown): number => {
+  const encoded = JSON.stringify(value);
+  if (typeof encoded !== 'string') throw new Error('CHANNEL_MESSAGE_NOT_JSON');
+  return new TextEncoder().encode(encoded).byteLength;
+};
+const isPlainRecord = (value: unknown): value is Record<string, unknown> => {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+};
+const exactKeys = (value: unknown, expected: readonly string[]): value is Record<string, unknown> => {
+  if (!isPlainRecord(value)) return false;
+  const keys = Reflect.ownKeys(value);
+  if (keys.some((key) => typeof key !== 'string') || keys.length !== expected.length) return false;
+  const sorted = [...keys as string[]].sort();
+  const required = [...expected].sort();
+  return sorted.every((key, index) => key === required[index]);
+};
+const safeMessageBytes = (value: unknown): number => {
+  try { return byteLength(value); } catch (_) { return Number.POSITIVE_INFINITY; }
+};
+let approvedSrcdoc = '';
+const controllerPolicy = (() => {
+  const types = (globalThis as typeof globalThis & {trustedTypes?: {createPolicy: (name: string, rules: {createScriptURL: (url: string) => string; createHTML: (html: string) => string}) => {createScriptURL: (url: string) => unknown; createHTML: (html: string) => unknown}}}).trustedTypes;
+  if (!types) return undefined;
+  return types.createPolicy('smallframe-controller', {
+    createScriptURL: (url) => url === '/sw.js' ? url : (() => { throw new Error('SCRIPT_URL_NOT_ALLOWED'); })(),
+    createHTML: (html) => html !== '' && html === approvedSrcdoc ? html : (() => { throw new Error('SRCDOC_NOT_VERIFIED'); })()
+  });
+})();
+const scriptUrl = (value: string): string => controllerPolicy ? controllerPolicy.createScriptURL(value) as string : value;
+const verifiedSrcdoc = (value: string): string => {
+  approvedSrcdoc = value;
+  try { return controllerPolicy ? controllerPolicy.createHTML(value) as string : value; } finally { approvedSrcdoc = ''; }
+};
+const randomBase64Url = (length: number): string => {
+  const bytes = new Uint8Array(length);
+  crypto.getRandomValues(bytes);
+  return btoa(String.fromCharCode(...bytes)).replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '');
+};
+const post = (type: string, body: Record<string, unknown> = {}): void => {
+  if (!port || controllerChannelTerminal || !activeSessionId) throw new Error('CHANNEL_CLOSED');
+  if (Reflect.ownKeys(body).some((key) => typeof key !== 'string' || ['channel', 'protocol', 'session', 'sequence', 'type'].includes(key))) throw new Error('CHANNEL_INTERNAL_SCHEMA');
+  const nextSequence = portSequence + 1;
+  if (!Number.isSafeInteger(nextSequence)) throw new Error('CHANNEL_SEQUENCE_EXHAUSTED');
+  const message = {channel: 'smallframe-controller', protocol: 1, session: activeSessionId, sequence: nextSequence, type, ...body};
+  if (byteLength(message) > MAX_MESSAGE_BYTES) throw new Error('CHANNEL_MESSAGE_TOO_LARGE');
+  port.postMessage(message);
+  portSequence = nextSequence;
+};
+const bounded = async <T>(promise: Promise<T>, milliseconds: number, errorCode: string): Promise<T> => await Promise.race([promise, new Promise<T>((_, reject) => window.setTimeout(() => reject(new Error(errorCode)), milliseconds))]);
+
+const sha256Hex = async (body: ArrayBuffer): Promise<string> => {
+  const digest = await crypto.subtle.digest('SHA-256', body);
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+};
+
+const readVerifiedRenderer = async (): Promise<string> => {
+  const response = await caches.match(RENDERER_PATH);
+  if (!response || response.status !== 200 || response.headers.get('content-type')?.toLowerCase() !== 'text/html; charset=utf-8') throw new Error('RENDERER_CACHE_ENTRY_INVALID');
+  if (response.headers.get('content-security-policy') !== REQUIRED_RENDERER_CSP) throw new Error('RENDERER_POLICY_MISMATCH');
+  const body = await response.arrayBuffer();
+  if (body.byteLength > MAX_RENDERER_BYTES) throw new Error('RENDERER_TOO_LARGE');
+  let html: string;
+  try { html = new TextDecoder('utf-8', {fatal: true}).decode(body); } catch (_) { throw new Error('RENDERER_UTF8_INVALID'); }
+  if (html.startsWith('\ufeff')) throw new Error('RENDERER_UTF8_BOM');
+  const roundTrip = new TextEncoder().encode(html);
+  if (roundTrip.byteLength !== body.byteLength || await sha256Hex(roundTrip.buffer) !== RENDERER_DIGEST) throw new Error('RENDERER_BYTE_IDENTITY_MISMATCH');
+  return html;
+};
+
+const setupServiceWorker = async (): Promise<string | undefined> => {
+  if (!('serviceWorker' in navigator)) throw new Error('SERVICE_WORKER_UNAVAILABLE');
+  const existing = await navigator.serviceWorker.getRegistration('/');
+  const registration = existing ?? await navigator.serviceWorker.register(scriptUrl('/sw.js'), {scope: '/', type: 'module'});
+  if (!registration.active) await bounded(navigator.serviceWorker.ready, 5000, 'SERVICE_WORKER_READY_TIMEOUT');
+  if (!navigator.serviceWorker.controller) {
+    registration.active?.postMessage({type: 'sf.claim'});
+    const controlled = await new Promise<boolean>((resolve) => {
+      let settled = false;
+      const finish = (value: boolean): void => {
+        if (settled) return;
+        settled = true;
+        navigator.serviceWorker.removeEventListener('controllerchange', onChange);
+        window.clearTimeout(timer);
+        resolve(value);
+      };
+      const onChange = (): void => finish(Boolean(navigator.serviceWorker.controller));
+      const timer = window.setTimeout(() => finish(Boolean(navigator.serviceWorker.controller)), 3000);
+      navigator.serviceWorker.addEventListener('controllerchange', onChange);
+      if (navigator.serviceWorker.controller) finish(true);
+    });
+    if (!controlled) {
+      const reloadKey = 'smallframe-sw-control-reload';
+      if (sessionStorage.getItem(reloadKey) === '1') throw new Error('SERVICE_WORKER_CONTROL_UNAVAILABLE');
+      sessionStorage.setItem(reloadKey, '1');
+      location.reload();
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 5000));
+      throw new Error('SERVICE_WORKER_RELOAD_TIMEOUT');
+    }
+  }
+  sessionStorage.removeItem('smallframe-sw-control-reload');
+  const controller = navigator.serviceWorker.controller;
+  if (!controller) throw new Error('SERVICE_WORKER_NOT_CONTROLLING');
+  const channel = new MessageChannel();
+  const result = new Promise<{digest: string; csp: string}>((resolve, reject) => {
+    const timeout = window.setTimeout(() => reject(new Error('SERVICE_WORKER_ATTEST_TIMEOUT')), 2000);
+    channel.port1.onmessage = (event: MessageEvent) => {
+      window.clearTimeout(timeout);
+      if (event.data?.type !== 'sf.attest.result' || event.data.digest !== RENDERER_DIGEST || event.data.cachePresent !== true || event.data.responseDigest !== RENDERER_DIGEST || event.data.provenance !== 'service-worker-cache' || event.data.contentSecurityPolicy !== REQUIRED_RENDERER_CSP) reject(new Error('SERVICE_WORKER_ATTEST_MISMATCH'));
+      else resolve({digest: event.data.digest as string, csp: event.data.contentSecurityPolicy as string});
+    };
+  });
+  controller.postMessage({type: 'sf.attest'}, [channel.port2]);
+  await result;
+  byId<HTMLElement>('build').textContent = `Verified renderer ${RENDERER_DIGEST.slice(0, 16)}…`;
+  void registration;
+  return ARCHITECTURE_CANDIDATE === 'A' ? await readVerifiedRenderer() : undefined;
+};
+
+const renderControllerError = (error: unknown): void => {
+  const panel = byId<HTMLElement>('status');
+  panel.replaceChildren(text(`Controller stopped: ${error instanceof Error ? error.message : 'unknown error'}. Local export remains available.`));
+  panel.dataset.state = 'error';
+};
+
+const terminateControllerChannel = (reason: string, destroyFrame = IS_CANDIDATE_U): void => {
+  if (controllerChannelTerminal) return;
+  controllerChannelTerminal = true;
+  window.clearTimeout(rendererInitTimer);
+  port?.close();
+  port = undefined;
+  if (destroyFrame) frame?.remove();
+  activeSessionId = '';
+  renderControllerError(new Error(reason));
+};
+
+const injectControllerChannelFixture = (): void => {
+  if (!IS_CANDIDATE_U || channelFixtureInjected || !port || !activeSessionId || !CHANNEL_TEST_FIXTURE.startsWith('controller-')) return;
+  channelFixtureInjected = true;
+  const sequence = portSequence + 1;
+  const base = {channel: 'smallframe-controller', protocol: 1, session: activeSessionId, sequence};
+  if (CHANNEL_TEST_FIXTURE === 'controller-replay') {
+    const replay = {...base, type: 'sf.controller.snapshot', state: localState, role: 'editor', online: true, revision: 0};
+    port.postMessage(replay);
+    port.postMessage(replay);
+  }
+  else if (CHANNEL_TEST_FIXTURE === 'controller-wrong-session') port.postMessage({...base, session: randomBase64Url(16), type: 'sf.controller.snapshot', state: localState, role: 'editor', online: true, revision: 0});
+  else if (CHANNEL_TEST_FIXTURE === 'controller-extra-key') port.postMessage({...base, type: 'sf.controller.snapshot', state: localState, role: 'editor', online: true, revision: 0, unexpected: true});
+  else if (CHANNEL_TEST_FIXTURE === 'controller-unknown-type') port.postMessage({...base, type: 'sf.controller.unknown'});
+  else if (CHANNEL_TEST_FIXTURE === 'controller-oversized') port.postMessage({...base, type: 'sf.controller.snapshot', state: {oversized: 'x'.repeat(MAX_MESSAGE_BYTES)}, role: 'editor', online: true, revision: 0});
+  else if (CHANNEL_TEST_FIXTURE === 'controller-transfer') {
+    const transferred = new MessageChannel();
+    port.postMessage({...base, type: 'sf.controller.snapshot', state: localState, role: 'editor', online: true, revision: 0}, [transferred.port2]);
+    window.setTimeout(() => transferred.port1.close(), 1000);
+  }
+};
+
+const startFrame = async (rendererHtml?: string): Promise<void> => {
+  window.clearTimeout(rendererInitTimer);
+  const nonce = ARCHITECTURE_CANDIDATE === 'A' ? '' : randomBase64Url(16);
+  frame = document.createElement('iframe');
+  frame.title = 'Smallframe app renderer';
+  if (ARCHITECTURE_CANDIDATE !== 'R' && !USES_CLASSIC_WORKER) frame.sandbox.add('allow-scripts');
+  frame.referrerPolicy = 'no-referrer';
+  frame.setAttribute('allow', "camera 'none'; microphone 'none'; geolocation 'none'; clipboard-read 'none'; payment 'none'");
+  frame.dataset.rendererPath = RENDERER_PATH;
+  if (!frame) throw new Error('RENDERER_FRAME_MISSING');
+  const currentFrame = frame;
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const finish = (error?: Error): void => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timer);
+      window.removeEventListener('message', onMessage);
+      if (error) reject(error);
+      else resolve();
+    };
+    const onMessage = (event: MessageEvent): void => {
+      const challenge = ARCHITECTURE_CANDIDATE === 'A' ? event.data?.challenge : event.data?.nonce;
+      const readyKeys = ARCHITECTURE_CANDIDATE === 'A' ? ['type', 'protocol', 'challenge'] : ['type', 'protocol', 'nonce'];
+      if (event.source !== currentFrame.contentWindow || event.origin !== 'null' || event.data?.type !== 'sf.renderer.ready' || event.data?.protocol !== 1 || (IS_CANDIDATE_U && (!exactKeys(event.data, readyKeys) || event.ports.length !== 0)) || typeof challenge !== 'string' || !/^[A-Za-z0-9_-]{22}$/u.test(challenge) || (ARCHITECTURE_CANDIDATE !== 'A' && challenge !== nonce)) return;
+      const channel = new MessageChannel();
+      port = channel.port1;
+      portSequence = 0;
+      expectedPortSequence = 1;
+      controllerChannelTerminal = false;
+      channelFixtureInjected = false;
+      workerLifecycleState = 'idle';
+      workerLifecycleGeneration = 0;
+      workerLifecycleRestartCount = 0;
+      acceptedAppReadyGeneration = 0;
+      port.onmessage = onPortMessage;
+      port.onmessageerror = () => terminateControllerChannel('CHANNEL_MESSAGE_DESERIALIZATION_FAILED', true);
+      port.start();
+      byId<HTMLElement>('app-host').dataset.rendererOrigin = event.origin;
+      const sessionId = randomBase64Url(16);
+      activeSessionId = sessionId;
+      const appModule = (window as Window & {SMALLFRAME_APP_MODULE?: string}).SMALLFRAME_APP_MODULE ?? '';
+      const init = {type: 'sf.renderer.init', protocol: 1, ...(ARCHITECTURE_CANDIDATE === 'A' ? {challenge} : {nonce: challenge}), sessionId, ...(USES_CLASSIC_WORKER ? {} : {appModule}), state: localState, role: 'editor', ...(IS_CANDIDATE_U && CHANNEL_TEST_FIXTURE === 'init-schema-extra' ? {unexpected: true} : {}), ...(IS_CANDIDATE_U && CHANNEL_TEST_FIXTURE === 'init-oversized' ? {testPadding: 'x'.repeat(MAX_MESSAGE_BYTES)} : {})};
+      if (safeMessageBytes(init) > MAX_MESSAGE_BYTES) { channel.port1.close(); finish(new Error('INIT_MESSAGE_TOO_LARGE')); return; }
+      currentFrame.contentWindow?.postMessage(init, '*', [channel.port2]);
+      rendererInitTimer = window.setTimeout(() => terminateControllerChannel('RENDERER_INIT_TIMEOUT', true), 2500);
+      if (IS_CANDIDATE_U && CHANNEL_TEST_FIXTURE === 'window-init-replay') {
+        const replayChannel = new MessageChannel();
+        replayChannel.port1.onmessage = () => { byId<HTMLElement>('app-host').dataset.replayedInitAccepted = 'true'; };
+        replayChannel.port1.start();
+        const replayInit = {...init, sessionId: randomBase64Url(16), state: {decisions: {replayed: {title: 'must remain unreachable'}}}};
+        currentFrame.contentWindow?.postMessage(replayInit, '*', [replayChannel.port2]);
+        window.setTimeout(() => replayChannel.port1.close(), 2000);
+      }
+      finish();
+    };
+    const timer = window.setTimeout(() => finish(new Error('RENDERER_HANDSHAKE_TIMEOUT')), 5000);
+    window.addEventListener('message', onMessage);
+    byId('app-host').replaceChildren(currentFrame);
+    if (ARCHITECTURE_CANDIDATE === 'A') {
+      if (!rendererHtml) { finish(new Error('RENDERER_SRCDOC_MISSING')); return; }
+      currentFrame.srcdoc = verifiedSrcdoc(rendererHtml);
+    } else {
+      currentFrame.src = `${RENDERER_PATH}#${nonce}`;
+    }
+  });
+};
+
+const onPortMessage = (event: MessageEvent): void => {
+  if (controllerChannelTerminal) return;
+  if (event.ports.length !== 0) { terminateControllerChannel('CHANNEL_TRANSFER_FORBIDDEN', true); return; }
+  const raw = event.data;
+  const messageBytes = safeMessageBytes(raw);
+  if (messageBytes > MAX_MESSAGE_BYTES) { terminateControllerChannel('CHANNEL_MESSAGE_TOO_LARGE', true); return; }
+  if (!isPlainRecord(raw)) { terminateControllerChannel('CHANNEL_ENVELOPE_INVALID', true); return; }
+  const message = raw as {channel?: unknown; protocol?: unknown; session?: unknown; sequence?: unknown; type?: unknown; tree?: unknown; error?: unknown; requestId?: unknown; operations?: unknown; workerKind?: unknown; blobCount?: unknown; workerSelfOrigin?: unknown; workerLocationOrigin?: unknown; workerLocationHref?: unknown; wasmStarted?: unknown; wasmBytes?: unknown; wasmProbe?: unknown; wasmDigest?: unknown; state?: unknown; generation?: unknown; restartCount?: unknown; lastReason?: unknown; stopCode?: unknown};
+  if (message.channel !== 'smallframe-renderer' || message.protocol !== 1 || typeof message.type !== 'string' || !Number.isSafeInteger(message.sequence)) { terminateControllerChannel('CHANNEL_ENVELOPE_INVALID', true); return; }
+  if (message.session !== activeSessionId) { terminateControllerChannel('CHANNEL_SESSION_INVALID', true); return; }
+  if (message.sequence !== expectedPortSequence) { terminateControllerChannel('CHANNEL_SEQUENCE_REPLAY', true); return; }
+  const baseKeys = ['channel', 'protocol', 'session', 'sequence', 'type'];
+  let schemaValid = false;
+  if (message.type === 'sf.renderer.rendered') schemaValid = exactKeys(message, baseKeys) && (!IS_CANDIDATE_U || (workerLifecycleState === 'running' && acceptedAppReadyGeneration === workerLifecycleGeneration));
+  else if (message.type === 'sf.renderer.app-ready') {
+    const expected = USES_CLASSIC_WORKER ? [...baseKeys, 'workerKind', 'blobCount', 'workerSelfOrigin', 'workerLocationOrigin', 'workerLocationHref', 'wasmStarted', 'wasmBytes', 'wasmProbe', 'wasmDigest', 'generation', 'restartCount', 'lastReason'] : baseKeys;
+    schemaValid = exactKeys(message, expected) && (!IS_CANDIDATE_U || (message.workerKind === 'classic-blob' && message.blobCount === 1 && message.workerSelfOrigin === 'null' && message.workerLocationOrigin === 'null' && typeof message.workerLocationHref === 'string' && message.workerLocationHref.startsWith('blob:null/') && message.wasmStarted === true && Number.isSafeInteger(message.wasmBytes) && message.wasmBytes === PHASE0_WASM_BYTES && message.wasmProbe === 0xf88bbfb9 && typeof message.wasmDigest === 'string' && /^[0-9a-f]{64}$/u.test(message.wasmDigest) && Number.isSafeInteger(message.generation) && Number(message.generation) >= 1 && Number.isSafeInteger(message.restartCount) && Number(message.restartCount) >= 0 && typeof message.lastReason === 'string' && message.lastReason.length <= 64 && workerLifecycleState === 'running' && message.generation === workerLifecycleGeneration && message.restartCount === workerLifecycleRestartCount && acceptedAppReadyGeneration !== workerLifecycleGeneration));
+  }
+  else if (message.type === 'sf.renderer.worker-lifecycle') {
+    const hasStopCode = Object.prototype.hasOwnProperty.call(message, 'stopCode');
+    schemaValid = exactKeys(message, hasStopCode ? [...baseKeys, 'state', 'generation', 'restartCount', 'lastReason', 'stopCode'] : [...baseKeys, 'state', 'generation', 'restartCount', 'lastReason']) &&
+      ['booting', 'running', 'restarting', 'stopped'].includes(String(message.state)) && Number.isSafeInteger(message.generation) && Number(message.generation) >= 1 && Number.isSafeInteger(message.restartCount) && Number(message.restartCount) >= 0 && typeof message.lastReason === 'string' && message.lastReason.length <= 64 && (!hasStopCode || (typeof message.stopCode === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/u.test(message.stopCode)));
+    if (schemaValid) {
+      const state = message.state as 'booting' | 'running' | 'restarting' | 'stopped';
+      const generation = Number(message.generation);
+      const restartCount = Number(message.restartCount);
+      const transitionValid =
+        (state === 'booting' && ((workerLifecycleState === 'idle' && generation === 1 && restartCount === 0) || (workerLifecycleState === 'restarting' && generation === workerLifecycleGeneration + 1 && restartCount === workerLifecycleRestartCount))) ||
+        (state === 'running' && workerLifecycleState === 'booting' && generation === workerLifecycleGeneration && restartCount === workerLifecycleRestartCount) ||
+        (state === 'restarting' && workerLifecycleState === 'running' && generation === workerLifecycleGeneration && restartCount === workerLifecycleRestartCount + 1) ||
+        (state === 'stopped' && workerLifecycleState !== 'idle' && workerLifecycleState !== 'stopped' && generation === workerLifecycleGeneration && restartCount === workerLifecycleRestartCount);
+      schemaValid = transitionValid;
+      if (transitionValid) {
+        workerLifecycleState = state;
+        workerLifecycleGeneration = generation;
+        workerLifecycleRestartCount = restartCount;
+        if (state === 'booting' || state === 'restarting') acceptedAppReadyGeneration = 0;
+      }
+    }
+  }
+  else if (message.type === 'sf.renderer.state.batch') schemaValid = exactKeys(message, [...baseKeys, 'requestId', 'operations']) && typeof message.requestId === 'string' && /^[0-9a-f]{32}$/u.test(message.requestId) && (!IS_CANDIDATE_U || (workerLifecycleState === 'running' && acceptedAppReadyGeneration === workerLifecycleGeneration));
+  else if (message.type === 'sf.renderer.error') {
+    const withLifecycle = Object.prototype.hasOwnProperty.call(message, 'generation') || Object.prototype.hasOwnProperty.call(message, 'restartCount');
+    schemaValid = exactKeys(message, withLifecycle ? [...baseKeys, 'error', 'generation', 'restartCount'] : [...baseKeys, 'error']) && typeof message.error === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/u.test(message.error) && (!withLifecycle || (Number.isSafeInteger(message.generation) && Number.isSafeInteger(message.restartCount)));
+  }
+  if (!schemaValid) { terminateControllerChannel(message.type === 'sf.renderer.worker-lifecycle' ? 'CHANNEL_STATE_TRANSITION_INVALID' : 'CHANNEL_MESSAGE_SCHEMA', true); return; }
+  window.clearTimeout(rendererInitTimer);
+  expectedPortSequence += 1;
+  try {
+  if (message.type === 'sf.renderer.rendered') {
+    byId<HTMLElement>('status').textContent = 'App Worker running; renderer accepted the declarative tree.';
+  } else if (message.type === 'sf.renderer.app-ready') {
+    acceptedAppReadyGeneration = Number(message.generation) || acceptedAppReadyGeneration;
+    const host = byId<HTMLElement>('app-host');
+    if (typeof message.workerKind === 'string') host.dataset.workerKind = message.workerKind;
+    if (typeof message.blobCount === 'number') host.dataset.workerBlobCount = String(message.blobCount);
+    if (typeof message.workerSelfOrigin === 'string') host.dataset.workerSelfOrigin = message.workerSelfOrigin;
+    if (typeof message.workerLocationOrigin === 'string') host.dataset.workerLocationOrigin = message.workerLocationOrigin;
+    if (typeof message.workerLocationHref === 'string') host.dataset.workerLocationHref = message.workerLocationHref;
+    if (typeof message.wasmStarted === 'boolean') host.dataset.workerWasmStarted = String(message.wasmStarted);
+    if (Number.isSafeInteger(message.wasmBytes)) host.dataset.workerWasmBytes = String(message.wasmBytes);
+    if (Number.isSafeInteger(message.wasmProbe)) host.dataset.workerWasmProbe = String(message.wasmProbe);
+    if (typeof message.wasmDigest === 'string') host.dataset.workerWasmDigest = message.wasmDigest;
+    if (Number.isSafeInteger(message.generation)) host.dataset.workerGeneration = String(message.generation);
+    if (Number.isSafeInteger(message.restartCount)) host.dataset.workerRestartCount = String(message.restartCount);
+    if (typeof message.lastReason === 'string') host.dataset.workerLastReason = message.lastReason;
+    injectControllerChannelFixture();
+  } else if (message.type === 'sf.renderer.worker-lifecycle') {
+    const host = byId<HTMLElement>('app-host');
+    if (!['booting', 'running', 'restarting', 'stopped'].includes(String(message.state)) || !Number.isSafeInteger(message.generation) || !Number.isSafeInteger(message.restartCount) || typeof message.lastReason !== 'string' || (message.stopCode !== undefined && typeof message.stopCode !== 'string')) { port?.close(); renderControllerError(new Error('WORKER_LIFECYCLE_INVALID')); return; }
+    host.dataset.workerState = String(message.state);
+    host.dataset.workerGeneration = String(message.generation);
+    host.dataset.workerRestartCount = String(message.restartCount);
+    host.dataset.workerLastReason = message.lastReason;
+    if (typeof message.stopCode === 'string') host.dataset.workerStopCode = message.stopCode;
+    else delete host.dataset.workerStopCode;
+    if (message.state === 'restarting') byId<HTMLElement>('status').textContent = `App Worker restarting after ${message.lastReason}.`;
+  } else if (message.type === 'sf.renderer.state.batch') {
+    const operations = message.operations;
+    if (!Array.isArray(operations) || operations.length > 32) { post('sf.controller.result', {result: {requestId: message.requestId, kind: 'state', ok: false, error: {code: 'STATE_INVALID', message: 'The bounded local operation batch was rejected.'}}}); return; }
+    const next = structuredClone(localState);
+    for (const operation of operations) {
+      if (typeof operation !== 'object' || operation === null) { post('sf.controller.result', {result: {requestId: message.requestId, kind: 'state', ok: false, error: {code: 'STATE_INVALID', message: 'The bounded local operation batch was rejected.'}}}); return; }
+      const candidate = operation as {op?: unknown; path?: unknown; value?: unknown};
+      if ((candidate.op !== 'set' && candidate.op !== 'delete') || !Array.isArray(candidate.path) || candidate.path.length < 1 || candidate.path.length > 16 || candidate.path.some((part) => typeof part !== 'string' || part.length < 1 || part.length > 64 || ['__proto__', 'prototype', 'constructor'].includes(part))) { post('sf.controller.result', {result: {requestId: message.requestId, kind: 'state', ok: false, error: {code: 'STATE_INVALID', message: 'The bounded local operation batch was rejected.'}}}); return; }
+      let parent = next as Record<string, unknown>;
+      for (const part of candidate.path.slice(0, -1)) { const child = parent[part]; if (typeof child !== 'object' || child === null || Array.isArray(child)) { parent[part] = {}; } parent = parent[part] as Record<string, unknown>; }
+      const leaf = candidate.path[candidate.path.length - 1] as string;
+      if (candidate.op === 'set') parent[leaf] = structuredClone(candidate.value);
+      else delete parent[leaf];
+    }
+    localState = next;
+    post('sf.controller.snapshot', {state: localState, role: 'editor', online: navigator.onLine, revision: 0});
+    post('sf.controller.result', {result: {requestId: message.requestId, kind: 'state', ok: true}});
+  } else if (message.type === 'sf.renderer.error') {
+    terminateControllerChannel(message.error as string);
+  }
+  } catch (_) {
+    terminateControllerChannel('CHANNEL_DISPATCH_FAILED', true);
+  }
+};
+
+const main = async (): Promise<void> => {
+  const module = (window as Window & {SMALLFRAME_APP_MODULE?: string}).SMALLFRAME_APP_MODULE;
+  if (!USES_CLASSIC_WORKER && !module) throw new Error('APP_MODULE_MISSING');
+  byId('status').textContent = 'Verifying renderer…';
+  const rendererHtml = await setupServiceWorker();
+  await startFrame(rendererHtml);
+};
+
+const reopenRendererForPhase0 = async (): Promise<void> => {
+  if (!IS_CANDIDATE_U) throw new Error('PHASE0_REOPEN_UNAVAILABLE');
+  port?.close();
+  port = undefined;
+  frame?.remove();
+  frame = undefined;
+  await startFrame();
+};
+
+if (IS_CANDIDATE_U) {
+  if (window.location.hash) history.replaceState(null, document.title, `${window.location.pathname}${window.location.search}`);
+  Object.defineProperty(window, '__smallframePhase0ReopenRenderer', {value: reopenRendererForPhase0, configurable: false, enumerable: false, writable: false});
+}
+
+void main().catch((error: unknown) => {
+  if (IS_CANDIDATE_U) terminateControllerChannel(error instanceof Error ? error.message : 'CONTROLLER_STARTUP_FAILED', true);
+  else renderControllerError(error);
+});
+
+export {};

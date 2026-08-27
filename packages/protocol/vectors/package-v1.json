@@ -1,0 +1,6 @@
+{
+  "validManifest": {"schemaVersion":"1.0","id":"dev.example.decision-board","name":"Decision Board","version":"0.1.0","description":"A local decision board.","runtime":"smallframe-view/1","state":{"mode":"personal","maxPlaintextBytes":393216,"jsonSchema":{"type":"object","additionalProperties":true}},"capabilities":[],"limits":{"maxViewNodes":2000,"maxEventRate":30},"publisher":{"displayName":"Example Studio","publicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","keyId":"sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},"files":{"app.worker.js":{"sha256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","bytes":1}}},
+  "negativeUnknownCapability": "UNKNOWN_CAPABILITY",
+  "negativeExtraFile": "EXTRA_FILE",
+  "negativeDuplicateJsonKey": "DUPLICATE_JSON_KEY"
+}

@@ -1,0 +1,41 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "smallframe-api",
+  "main": "src/do-worker.ts",
+  "compatibility_date": "2026-07-30",
+  "workers_dev": false,
+  "vars": {
+    "CONTROLLER_ORIGIN": "http://app.localhost:4173",
+    "API_ORIGIN": "http://api.localhost:8787",
+    "WEBSOCKET_ORIGIN": "ws://api.localhost:8787",
+    "ENVIRONMENT": "local",
+    "BUILD_VERSION": "local"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "smallframe-local",
+      "database_id": "00000000-0000-0000-0000-000000000000"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "PACKAGES",
+      "bucket_name": "smallframe-packages-local"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "ROOMS",
+        "class_name": "RoomDurableObject"
+      }
+    ]
+  },
+  "exports": {
+    "RoomDurableObject": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  }
+}
