@@ -27,6 +27,7 @@
     "check": "npm run doctor && npm run build && npm run complexity && npm test && npm run test:e2e",
     "dev": "node scripts/dev.mjs",
     "cli": "cargo run -q -p smallframe-cli --",
+    "adapt": "node scripts/adaptation-harness.mjs",
     "disk-usage": "node scripts/disk-usage.mjs",
     "clean": "node scripts/clean.mjs"
   },

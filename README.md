@@ -100,6 +100,22 @@ npm run cli -- dev ./examples/decision-board/package --test-store /path/to/dispo
 
 The source is validated, signed into a temporary package, verified again inside the browser Wasm boundary, and deleted from the temporary directory when the server exits. Validation failures use stable error codes and do not start the runtime.
 
+## Ten-minute adaptation exercise
+
+Smallframe includes three intentionally different constrained apps: a tracker, a calculator, and a decision board. Start a timed, non-overwriting copy with:
+
+```bash
+npm run adapt -- start tracker /path/to/my-tracker
+```
+
+Edit only `app.worker.js` first—for example change the heading and add one action—then finish:
+
+```bash
+npm run adapt -- finish /path/to/my-tracker
+```
+
+The harness refreshes the declared file digest, validates the entire source package, reports elapsed seconds, and preserves the session after a rejection so you can fix the stable diagnostic and retry. Once it passes, run the adapted app with the custom-source `dev` command above. Replace `tracker` with `calculator` or `decision-board` to exercise a different state shape.
+
 ## Architecture principles
 
 | Principle | Consequence |
