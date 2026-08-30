@@ -3,7 +3,7 @@ use crate::{
     encoding::{decode_base64url_fixed, encode_base64url},
     hex_digest,
     package::sha256,
-    verify_package_archive,
+    prepare_classic_module_source, verify_package_archive,
 };
 use serde_json::json;
 use wasm_bindgen::prelude::*;
@@ -59,6 +59,47 @@ pub fn wasm_verify_package(
             "publisherKeyId": package.publisher_key_id,
         })
         .to_string(),
+        Err(error) => json!({"ok": false, "error": {"code": error.code().as_str()}}).to_string(),
+    }
+}
+
+#[wasm_bindgen]
+pub fn wasm_prepare_package(
+    archive: &[u8],
+    expected_digest_value: &str,
+    expected_key_id: &str,
+) -> String {
+    let result = expected_digest(expected_digest_value).and_then(|expected| {
+        verify_package_archive(
+            archive,
+            expected.as_ref(),
+            (!expected_key_id.is_empty()).then_some(expected_key_id),
+        )
+    });
+    match result {
+        Ok(package) => match prepare_classic_module_source(&package.canonical_files.module) {
+            Ok(module_source) => {
+                match serde_json::from_slice::<serde_json::Value>(&package.canonical_files.manifest)
+                {
+                    Ok(manifest) => json!({
+                        "ok": true,
+                        "packageDigest": encode_base64url(&package.package_digest),
+                        "artifactDigest": encode_base64url(&package.artifact_digest),
+                        "publisherKeyId": package.publisher_key_id,
+                        "manifest": manifest,
+                        "moduleSource": module_source,
+                    })
+                    .to_string(),
+                    Err(_) => {
+                        json!({"ok": false, "error": {"code": ErrorCode::JsonInvalid.as_str()}})
+                            .to_string()
+                    }
+                }
+            }
+            Err(error) => {
+                json!({"ok": false, "error": {"code": error.code().as_str()}}).to_string()
+            }
+        },
         Err(error) => json!({"ok": false, "error": {"code": error.code().as_str()}}).to_string(),
     }
 }

@@ -2,6 +2,9 @@ const sw = globalThis as unknown as ServiceWorkerGlobalScope;
 const RENDERER_DIGEST = '__RENDERER_DIGEST__';
 const RENDERER_PATH = `/runtime/renderer/${RENDERER_DIGEST}.html`;
 const CACHE = `smallframe-renderer-${RENDERER_DIGEST}`;
+const SHELL_CACHE = `smallframe-shell-${RENDERER_DIGEST}`;
+const SHELL_PATHS = ['/', '/main.js', '/personal-store.js', '/personal-runtime.js', '/fixture-module.js', '/controller.css', '/manifest.webmanifest', '/icon.svg'];
+const shellFetchPath = (path: string): string => path === '/' ? '/index.html' : path;
 const MAX_RENDERER_BYTES = 2 * 1024 * 1024;
 const RENDERER_CSP = "default-src 'none'; script-src 'sha256-__RENDERER_BOOTSTRAP_HASH__'__RENDERER_WASM_EVAL_SOURCE__ blob:; style-src 'sha256-__RENDERER_CSS_HASH__'; img-src 'none'; font-src 'none'; connect-src 'none'; worker-src blob:; child-src 'none'; frame-src 'none'; media-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; navigate-to 'none'; frame-ancestors http://app.localhost:4173; sandbox allow-scripts; require-trusted-types-for 'script'; trusted-types smallframe-renderer-worker";
 const PROVENANCE_HEADER = 'X-Smallframe-Response-Provenance';
@@ -30,6 +33,12 @@ sw.addEventListener('install', (event) => {
     if (body.byteLength > MAX_RENDERER_BYTES || await sha256Hex(body) !== RENDERER_DIGEST) throw new Error('RENDERER_DIGEST_MISMATCH');
     const cache = await caches.open(CACHE);
     await cache.put(RENDERER_PATH, new Response(body, {status: 200, headers: rendererHeaders()}));
+    const shell = await caches.open(SHELL_CACHE);
+    for (const path of SHELL_PATHS) {
+      const shellResponse = await fetch(new URL(shellFetchPath(path), sw.location.origin).href, {redirect: 'error', cache: 'no-store'});
+      if (shellResponse.status !== 200 || shellResponse.type === 'opaque') throw new Error('SHELL_RESPONSE_INVALID');
+      await shell.put(path, shellResponse);
+    }
     await sw.skipWaiting();
   })());
 });
@@ -37,7 +46,7 @@ sw.addEventListener('install', (event) => {
 sw.addEventListener('activate', (event) => {
   event.waitUntil((async () => {
     const keys = await caches.keys();
-    await Promise.all(keys.filter((key) => key.startsWith('smallframe-renderer-') && key !== CACHE).map((key) => caches.delete(key)));
+    await Promise.all(keys.filter((key) => (key.startsWith('smallframe-renderer-') && key !== CACHE) || (key.startsWith('smallframe-shell-') && key !== SHELL_CACHE)).map((key) => caches.delete(key)));
     await sw.clients.claim();
   })());
 });
@@ -50,6 +59,19 @@ sw.addEventListener('fetch', (event) => {
   }
   if (event.request.method !== 'GET' || url.pathname !== RENDERER_PATH || url.search || event.request.headers.has('range')) return;
   event.respondWith(caches.open(CACHE).then((cache) => cache.match(RENDERER_PATH)).then((response) => response ?? new Response('renderer unavailable', {status: 503})));
+});
+
+sw.addEventListener('fetch', (event) => {
+  const url = new URL(event.request.url);
+  if (event.request.method !== 'GET' || url.origin !== sw.location.origin || event.request.headers.has('range') || url.pathname === RENDERER_PATH) return;
+  const isControllerNavigation = event.request.mode === 'navigate' && url.pathname === '/';
+  if (event.request.mode === 'navigate' && !isControllerNavigation) return;
+  const shellPath = isControllerNavigation ? '/' : url.pathname;
+  if (!SHELL_PATHS.includes(shellPath)) return;
+  event.respondWith(fetch(event.request).catch(async () => {
+    const cached = await caches.open(SHELL_CACHE).then((cache) => cache.match(shellPath));
+    return cached ?? new Response('offline shell unavailable', {status: 503});
+  }));
 });
 
 sw.addEventListener('message', (event) => {

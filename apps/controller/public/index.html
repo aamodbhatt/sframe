@@ -4,20 +4,61 @@
     <meta charset="utf-8">
     <meta name="referrer" content="no-referrer">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Smallframe local evidence MVP</title>
+    <meta name="theme-color" content="#101827">
+    <title>Smallframe local workspace</title>
     <link rel="manifest" href="/manifest.webmanifest">
+    <link rel="stylesheet" href="/controller.css">
     <script src="/fixture-module.js"></script>
+    <script src="/personal-store.js"></script>
+    <script src="/personal-runtime.js"></script>
   </head>
   <body>
     <a class="skip" href="#app-host">Skip to app</a>
     <header class="chrome" aria-label="Smallframe controller">
-      <strong>Smallframe</strong><span aria-hidden="true"> · </span><span>personal local workspace</span>
-      <span id="build" class="build">Build pending</span>
+      <div class="brand"><span class="brand-mark" aria-hidden="true">S</span><strong>Smallframe</strong></div>
+      <div class="chrome-app"><span id="app-title">Local workspace</span><span id="app-version" class="chip">verifying</span></div>
+      <div class="chrome-status" aria-label="Workspace status"><span id="role" class="chip">editor</span><span id="connectivity" class="chip" role="status" aria-live="polite">On this device</span></div>
+      <button id="chrome-menu" class="quiet" type="button" aria-expanded="false" aria-controls="workspace-actions">Workspace</button>
     </header>
+    <aside id="workspace-actions" class="workspace-actions" hidden aria-label="Workspace actions">
+      <p><strong>Exact package</strong><br><span id="digest" class="mono">pending</span></p>
+      <p><strong>Publisher key</strong><br><span id="publisher" class="mono">pending</span></p>
+      <p id="build" class="muted">Build pending</p>
+      <p id="last-sync" class="muted">Saved locally: not yet</p>
+      <div class="action-grid">
+        <button id="export-json" type="button">Export readable JSON</button>
+        <button id="export-package" type="button">Export executable package</button>
+        <button id="import-json" type="button">Import JSON</button>
+        <button id="forget-workspace" class="danger" type="button">Forget device</button>
+      </div>
+      <input id="import-file" type="file" accept="application/json,.json" hidden>
+      <p class="warning compact">Exports leave Smallframe’s local protection. Package exports contain executable bundled code.</p>
+    </aside>
     <main>
-      <h1>Decision Board</h1>
-      <p id="status" role="status" aria-live="polite">Starting local proof…</p>
-      <section id="app-host" aria-label="App workspace"></section>
+      <section id="trust-panel" class="trust-panel" aria-labelledby="trust-title" hidden>
+        <p class="eyebrow">Review exact version</p>
+        <h2 id="trust-title">Verify before opening</h2>
+        <p id="trust-description"></p>
+        <dl class="trust-facts">
+          <div><dt>Published by</dt><dd id="trust-publisher"></dd></div>
+          <div><dt>Package</dt><dd id="trust-package" class="mono"></dd></div>
+          <div><dt>Context</dt><dd id="trust-context">Signed personal editor</dd></div>
+          <div><dt>Capabilities</dt><dd id="trust-capabilities">No optional capabilities</dd></div>
+        </dl>
+        <p>App logic can read the state displayed inside this app. This personal workspace has no room, invite, publisher enrollment, or relay call; its state stays on this device.</p>
+        <p class="warning"><strong>Do not enter passwords, card numbers, bank instructions, health records, or other high-risk secrets.</strong> Smallframe verifies the package signature, not the app’s honesty.</p>
+        <label class="remember"><input id="remember-approval" type="checkbox" checked> Remember this signed workspace on this device</label>
+        <div class="trust-actions">
+          <button id="approve-package" type="button">Open this exact version</button>
+          <button id="review-export" class="quiet" type="button">Export package</button>
+          <button id="leave-package" class="quiet" type="button">Leave</button>
+        </div>
+      </section>
+      <section id="runtime-panel" hidden>
+        <h1 id="runtime-title" class="sr-only">Decision Board</h1>
+        <p id="status" role="status" aria-live="polite">Starting local workspace…</p>
+        <section id="app-host" tabindex="-1" aria-label="App workspace"></section>
+      </section>
     </main>
     <script src="/main.js"></script>
   </body>

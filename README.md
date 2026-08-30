@@ -44,7 +44,7 @@ This is a product and security hypothesis, not a validated market claim.
 
 ## Current state
 
-The repository has passed its **local Phase 1 protocol and package-core gate**. Candidate U is the accepted local browser architecture.
+The repository has passed its **local Phase 1 protocol and package-core gate**. Candidate U is the accepted local browser architecture, and Phase 2 personal-runtime implementation is in progress.
 
 Working locally today:
 
@@ -58,7 +58,7 @@ Working locally today:
 - versioned protocol schemas and language-neutral golden vectors;
 - Chromium, Firefox, and WebKit local evidence.
 
-Not claimed: a completed MVP, deployed Cloudflare behavior, independent security review, market validation, or production readiness. Phase 2 and later product flows have not begun.
+Not claimed: a completed MVP, deployed Cloudflare behavior, independent security review, market validation, or production readiness.
 
 ## Quick start
 
@@ -103,18 +103,18 @@ crates/smallframe-cli/   identity and package-authoring commands
 packages/protocol/       shared schemas, TypeScript boundaries, golden vectors
 packages/sdk/            constrained authoring contract
 examples/decision-board/ deterministic example package
-docs/adr/                architecture decisions and accepted constraints
-evidence/                reproducible local gate reports
+docs/adr/                local architecture decisions and accepted constraints
+evidence/                local reproducible gate reports
 fuzz/corpus/             bounded parser regression seeds
 ```
 
-The normative engineering contract is [APEX_MVP_BUILD_SPEC.md](APEX_MVP_BUILD_SPEC.md). Current evidence and limitations live in [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md); the reproducible Phase 1 results are in [evidence/phase1/RESULTS.md](evidence/phase1/RESULTS.md).
+The normative specification, ADRs, status notes, and evidence reports are intentionally retained in the founder workspace but excluded from the public Git repository. The code and automated checks remain the public, reproducible implementation record.
 
 ## Security posture
 
 Please do not treat this repository as a safe place for real secrets or production rooms yet. The accepted architecture deliberately records its browser gaps and residual risks. Never commit room keys, capability links, private keys, plaintext room state, or invite URLs.
 
-If you are reviewing the design, start with [ADR-0005](docs/adr/0005-candidate-u-phase0-evidence-and-spec-hold.md), the [threat model](docs/threat-model.md), and the latest evidence report.
+The repository is still experimental. Review the implementation boundaries and tests critically, and report suspected vulnerabilities privately to the owner until a formal disclosure process exists.
 
 ## License and contribution status
 

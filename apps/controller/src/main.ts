@@ -4,8 +4,16 @@ const ARCHITECTURE_CANDIDATE: string = '__ARCHITECTURE_CANDIDATE__';
 const CHANNEL_TEST_FIXTURE: string = '__CHANNEL_TEST_FIXTURE__';
 const PHASE0_WASM_BYTES = Number('__PHASE0_WASM_BYTES__');
 const PHASE1_WASM_BYTES = Number('__PHASE1_WASM_BYTES__');
+const PHASE2_PACKAGE_BASE64 = '__PHASE2_PACKAGE_BASE64__';
+const PHASE2_DEFAULT = Boolean(Number('__PHASE2_DEFAULT_FLAG__'));
+const PHASE2_EXPECTED_DIGEST = '__PHASE2_EXPECTED_DIGEST__';
+const PHASE2_EXPECTED_KEY_ID = '__PHASE2_EXPECTED_KEY_ID__';
 const USES_CLASSIC_WORKER = ARCHITECTURE_CANDIDATE === 'S' || ARCHITECTURE_CANDIDATE === 'T' || ARCHITECTURE_CANDIDATE === 'U';
 const IS_CANDIDATE_U = ARCHITECTURE_CANDIDATE === 'U';
+const PERSONAL_MODE = IS_CANDIDATE_U && (PHASE2_DEFAULT || new URLSearchParams(location.search).get('personal') === '1');
+const PERSONAL_ROLE: 'viewer' | 'editor' = new URLSearchParams(location.search).get('role') === 'viewer' ? 'viewer' : 'editor';
+const executionRole = (): 'viewer' | 'editor' => PERSONAL_MODE ? PERSONAL_ROLE : 'editor';
+const executionIsReadOnly = (): boolean => PERSONAL_MODE && PERSONAL_ROLE === 'viewer';
 const RENDERER_PATH = `/runtime/renderer/${RENDERER_DIGEST}.html`;
 const MAX_RENDERER_BYTES = 2 * 1024 * 1024;
 const REQUIRED_RENDERER_CSP = "default-src 'none'; script-src 'sha256-__RENDERER_BOOTSTRAP_HASH__'__RENDERER_WASM_EVAL_SOURCE__ blob:; style-src 'sha256-__RENDERER_CSS_HASH__'; img-src 'none'; font-src 'none'; connect-src 'none'; worker-src blob:; child-src 'none'; frame-src 'none'; media-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; navigate-to 'none'; frame-ancestors http://app.localhost:4173; sandbox allow-scripts; require-trusted-types-for 'script'; trusted-types smallframe-renderer-worker";
@@ -23,6 +31,11 @@ let workerLifecycleGeneration = 0;
 let workerLifecycleRestartCount = 0;
 let acceptedAppReadyGeneration = 0;
 let localState: Record<string, unknown> = {decisions: {}};
+let localRevision = 0;
+let personalArchive = new Uint8Array();
+type PersonalPackageMetadata = {packageDigest: string; artifactDigest: string; publisherKeyId: string; publisherPublicKey: string; publisherDisplayName: string; appName: string; appVersion: string; description: string; capabilities: string[]; publicTemplate: Record<string, unknown>; maxPlaintextBytes: number; declaredMode: 'personal' | 'shared'};
+type PersonalSession = {handleVerified: (metadata: PersonalPackageMetadata) => Promise<void>; stateChanged: (state: Record<string, unknown>, revision: number) => Promise<void>};
+let personalSession: PersonalSession | undefined;
 
 const text = (value: string): Text => document.createTextNode(value);
 const byId = <T extends HTMLElement>(id: string): T => {
@@ -101,6 +114,19 @@ const readVerifiedRenderer = async (): Promise<string> => {
   return html;
 };
 
+const phase2InitFields = (): {fields: Record<string, unknown>; packageBytes?: Uint8Array<ArrayBuffer>} => {
+  if (!PERSONAL_MODE) return {fields: {}};
+  const packageBytes = personalArchive.slice();
+  return {fields: {packageBytes, expectedPackageDigest: PHASE2_EXPECTED_DIGEST, expectedPublisherKeyId: PHASE2_EXPECTED_KEY_ID}, packageBytes};
+};
+
+const postRendererInit = (target: Window | null, init: Record<string, unknown>, channelPort: MessagePort, packageBytes?: Uint8Array<ArrayBuffer>): void => {
+  if (!target) throw new Error('RENDERER_WINDOW_MISSING');
+  const transfers: Transferable[] = [channelPort];
+  if (packageBytes) transfers.push(packageBytes.buffer);
+  target.postMessage(init, '*', transfers);
+};
+
 const setupServiceWorker = async (): Promise<string | undefined> => {
   if (!('serviceWorker' in navigator)) throw new Error('SERVICE_WORKER_UNAVAILABLE');
   const existing = await navigator.serviceWorker.getRegistration('/');
@@ -151,6 +177,8 @@ const setupServiceWorker = async (): Promise<string | undefined> => {
 };
 
 const renderControllerError = (error: unknown): void => {
+  byId<HTMLElement>('trust-panel').hidden = true;
+  byId<HTMLElement>('runtime-panel').hidden = false;
   const panel = byId<HTMLElement>('status');
   panel.replaceChildren(text(`Controller stopped: ${error instanceof Error ? error.message : 'unknown error'}. Local export remains available.`));
   panel.dataset.state = 'error';
@@ -230,9 +258,10 @@ const startFrame = async (rendererHtml?: string): Promise<void> => {
       const sessionId = randomBase64Url(16);
       activeSessionId = sessionId;
       const appModule = (window as Window & {SMALLFRAME_APP_MODULE?: string}).SMALLFRAME_APP_MODULE ?? '';
-      const init = {type: 'sf.renderer.init', protocol: 1, ...(ARCHITECTURE_CANDIDATE === 'A' ? {challenge} : {nonce: challenge}), sessionId, ...(USES_CLASSIC_WORKER ? {} : {appModule}), state: localState, role: 'editor', ...(IS_CANDIDATE_U && CHANNEL_TEST_FIXTURE === 'init-schema-extra' ? {unexpected: true} : {}), ...(IS_CANDIDATE_U && CHANNEL_TEST_FIXTURE === 'init-oversized' ? {testPadding: 'x'.repeat(MAX_MESSAGE_BYTES)} : {})};
+      const phase2 = phase2InitFields();
+      const init = {type: 'sf.renderer.init', protocol: 1, ...(ARCHITECTURE_CANDIDATE === 'A' ? {challenge} : {nonce: challenge}), sessionId, ...(USES_CLASSIC_WORKER ? {} : {appModule}), state: localState, role: executionRole(), ...phase2.fields, ...(IS_CANDIDATE_U && CHANNEL_TEST_FIXTURE === 'init-schema-extra' ? {unexpected: true} : {}), ...(IS_CANDIDATE_U && CHANNEL_TEST_FIXTURE === 'init-oversized' ? {testPadding: 'x'.repeat(MAX_MESSAGE_BYTES)} : {})};
       if (safeMessageBytes(init) > MAX_MESSAGE_BYTES) { channel.port1.close(); finish(new Error('INIT_MESSAGE_TOO_LARGE')); return; }
-      currentFrame.contentWindow?.postMessage(init, '*', [channel.port2]);
+      postRendererInit(currentFrame.contentWindow, init, channel.port2, phase2.packageBytes);
       rendererInitTimer = window.setTimeout(() => terminateControllerChannel('RENDERER_INIT_TIMEOUT', true), 2500);
       if (IS_CANDIDATE_U && CHANNEL_TEST_FIXTURE === 'window-init-replay') {
         const replayChannel = new MessageChannel();
@@ -256,6 +285,44 @@ const startFrame = async (rendererHtml?: string): Promise<void> => {
   });
 };
 
+type RendererMessage = {channel?: unknown; protocol?: unknown; session?: unknown; sequence?: unknown; type?: unknown; tree?: unknown; error?: unknown; requestId?: unknown; operations?: unknown; workerKind?: unknown; blobCount?: unknown; workerSelfOrigin?: unknown; workerLocationOrigin?: unknown; workerLocationHref?: unknown; wasmStarted?: unknown; wasmBytes?: unknown; wasmProbe?: unknown; wasmDigest?: unknown; verifierStarted?: unknown; verifierBytes?: unknown; verifierVersion?: unknown; verifierDigest?: unknown; state?: unknown; generation?: unknown; restartCount?: unknown; lastReason?: unknown; stopCode?: unknown; packageDigest?: unknown; artifactDigest?: unknown; publisherKeyId?: unknown; publisherPublicKey?: unknown; publisherDisplayName?: unknown; appName?: unknown; appVersion?: unknown; description?: unknown; capabilities?: unknown; publicTemplate?: unknown; maxPlaintextBytes?: unknown; declaredMode?: unknown};
+
+const validPersonalMetadata = (message: RendererMessage, baseKeys: string[]): boolean => {
+  if (!PERSONAL_MODE || workerLifecycleState !== 'idle') return false;
+  const fields = ['packageDigest', 'artifactDigest', 'publisherKeyId', 'publisherPublicKey', 'publisherDisplayName', 'appName', 'appVersion', 'description', 'capabilities', 'publicTemplate', 'maxPlaintextBytes', 'declaredMode'];
+  if (!exactKeys(message, [...baseKeys, ...fields])) return false;
+  const stringFields = fields.slice(0, 8);
+  if (!stringFields.every((field) => typeof message[field as keyof RendererMessage] === 'string')) return false;
+  if (!Array.isArray(message.capabilities) || !message.capabilities.every((value) => typeof value === 'string')) return false;
+  if (!isPlainRecord(message.publicTemplate) || !Number.isSafeInteger(message.maxPlaintextBytes)) return false;
+  return message.declaredMode === 'personal' || message.declaredMode === 'shared';
+};
+
+const rejectStateBatch = (requestId: unknown, code = 'STATE_INVALID', message = 'The bounded local operation batch was rejected.'): void => {
+  post('sf.controller.result', {result: {requestId, kind: 'state', ok: false, error: {code, message}}});
+};
+
+const dispatchStateBatch = (message: RendererMessage): void => {
+  if (executionIsReadOnly()) { rejectStateBatch(message.requestId, 'READ_ONLY', 'Viewer simulation cannot change local state.'); return; }
+  if (!Array.isArray(message.operations) || message.operations.length > 32) { rejectStateBatch(message.requestId); return; }
+  const next = structuredClone(localState);
+  for (const operation of message.operations) {
+    if (typeof operation !== 'object' || operation === null) { rejectStateBatch(message.requestId); return; }
+    const candidate = operation as {op?: unknown; path?: unknown; value?: unknown};
+    if ((candidate.op !== 'set' && candidate.op !== 'delete') || !Array.isArray(candidate.path) || candidate.path.length < 1 || candidate.path.length > 16 || candidate.path.some((part) => typeof part !== 'string' || part.length < 1 || part.length > 64 || ['__proto__', 'prototype', 'constructor'].includes(part))) { rejectStateBatch(message.requestId); return; }
+    let parent = next as Record<string, unknown>;
+    for (const part of candidate.path.slice(0, -1)) { const child = parent[part]; if (typeof child !== 'object' || child === null || Array.isArray(child)) parent[part] = {}; parent = parent[part] as Record<string, unknown>; }
+    const leaf = candidate.path[candidate.path.length - 1] as string;
+    if (candidate.op === 'set') parent[leaf] = structuredClone(candidate.value);
+    else delete parent[leaf];
+  }
+  localState = next;
+  localRevision += 1;
+  post('sf.controller.snapshot', {state: localState, role: PERSONAL_MODE ? PERSONAL_ROLE : 'editor', online: navigator.onLine, revision: localRevision});
+  post('sf.controller.result', {result: {requestId: message.requestId, kind: 'state', ok: true}});
+  if (personalSession) void personalSession.stateChanged(localState, localRevision).catch(() => { byId<HTMLElement>('status').textContent = 'Local save failed; export before leaving.'; });
+};
+
 const onPortMessage = (event: MessageEvent): void => {
   if (controllerChannelTerminal) return;
   if (event.ports.length !== 0) { terminateControllerChannel('CHANNEL_TRANSFER_FORBIDDEN', true); return; }
@@ -263,7 +330,7 @@ const onPortMessage = (event: MessageEvent): void => {
   const messageBytes = safeMessageBytes(raw);
   if (messageBytes > MAX_MESSAGE_BYTES) { terminateControllerChannel('CHANNEL_MESSAGE_TOO_LARGE', true); return; }
   if (!isPlainRecord(raw)) { terminateControllerChannel('CHANNEL_ENVELOPE_INVALID', true); return; }
-  const message = raw as {channel?: unknown; protocol?: unknown; session?: unknown; sequence?: unknown; type?: unknown; tree?: unknown; error?: unknown; requestId?: unknown; operations?: unknown; workerKind?: unknown; blobCount?: unknown; workerSelfOrigin?: unknown; workerLocationOrigin?: unknown; workerLocationHref?: unknown; wasmStarted?: unknown; wasmBytes?: unknown; wasmProbe?: unknown; wasmDigest?: unknown; verifierStarted?: unknown; verifierBytes?: unknown; verifierVersion?: unknown; verifierDigest?: unknown; state?: unknown; generation?: unknown; restartCount?: unknown; lastReason?: unknown; stopCode?: unknown};
+  const message = raw as RendererMessage;
   if (message.channel !== 'smallframe-renderer' || message.protocol !== 1 || typeof message.type !== 'string' || !Number.isSafeInteger(message.sequence)) { terminateControllerChannel('CHANNEL_ENVELOPE_INVALID', true); return; }
   if (message.session !== activeSessionId) { terminateControllerChannel('CHANNEL_SESSION_INVALID', true); return; }
   if (message.sequence !== expectedPortSequence) { terminateControllerChannel('CHANNEL_SEQUENCE_REPLAY', true); return; }
@@ -297,6 +364,7 @@ const onPortMessage = (event: MessageEvent): void => {
     }
   }
   else if (message.type === 'sf.renderer.state.batch') schemaValid = exactKeys(message, [...baseKeys, 'requestId', 'operations']) && typeof message.requestId === 'string' && /^[0-9a-f]{32}$/u.test(message.requestId) && (!IS_CANDIDATE_U || (workerLifecycleState === 'running' && acceptedAppReadyGeneration === workerLifecycleGeneration));
+  else if (message.type === 'sf.renderer.package-verified') schemaValid = validPersonalMetadata(message, baseKeys);
   else if (message.type === 'sf.renderer.error') {
     const withLifecycle = Object.prototype.hasOwnProperty.call(message, 'generation') || Object.prototype.hasOwnProperty.call(message, 'restartCount');
     schemaValid = exactKeys(message, withLifecycle ? [...baseKeys, 'error', 'generation', 'restartCount'] : [...baseKeys, 'error']) && typeof message.error === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/u.test(message.error) && (!withLifecycle || (Number.isSafeInteger(message.generation) && Number.isSafeInteger(message.restartCount)));
@@ -337,23 +405,12 @@ const onPortMessage = (event: MessageEvent): void => {
     if (typeof message.stopCode === 'string') host.dataset.workerStopCode = message.stopCode;
     else delete host.dataset.workerStopCode;
     if (message.state === 'restarting') byId<HTMLElement>('status').textContent = `App Worker restarting after ${message.lastReason}.`;
+  } else if (message.type === 'sf.renderer.package-verified') {
+    if (!personalSession) { terminateControllerChannel('PERSONAL_SESSION_MISSING', true); return; }
+    const metadata = {packageDigest: message.packageDigest, artifactDigest: message.artifactDigest, publisherKeyId: message.publisherKeyId, publisherPublicKey: message.publisherPublicKey, publisherDisplayName: message.publisherDisplayName, appName: message.appName, appVersion: message.appVersion, description: message.description, capabilities: message.capabilities, publicTemplate: message.publicTemplate, maxPlaintextBytes: message.maxPlaintextBytes, declaredMode: message.declaredMode} as PersonalPackageMetadata;
+    void personalSession.handleVerified(metadata).catch((error: unknown) => terminateControllerChannel(error instanceof Error ? error.message : 'PERSONAL_SETUP_FAILED', true));
   } else if (message.type === 'sf.renderer.state.batch') {
-    const operations = message.operations;
-    if (!Array.isArray(operations) || operations.length > 32) { post('sf.controller.result', {result: {requestId: message.requestId, kind: 'state', ok: false, error: {code: 'STATE_INVALID', message: 'The bounded local operation batch was rejected.'}}}); return; }
-    const next = structuredClone(localState);
-    for (const operation of operations) {
-      if (typeof operation !== 'object' || operation === null) { post('sf.controller.result', {result: {requestId: message.requestId, kind: 'state', ok: false, error: {code: 'STATE_INVALID', message: 'The bounded local operation batch was rejected.'}}}); return; }
-      const candidate = operation as {op?: unknown; path?: unknown; value?: unknown};
-      if ((candidate.op !== 'set' && candidate.op !== 'delete') || !Array.isArray(candidate.path) || candidate.path.length < 1 || candidate.path.length > 16 || candidate.path.some((part) => typeof part !== 'string' || part.length < 1 || part.length > 64 || ['__proto__', 'prototype', 'constructor'].includes(part))) { post('sf.controller.result', {result: {requestId: message.requestId, kind: 'state', ok: false, error: {code: 'STATE_INVALID', message: 'The bounded local operation batch was rejected.'}}}); return; }
-      let parent = next as Record<string, unknown>;
-      for (const part of candidate.path.slice(0, -1)) { const child = parent[part]; if (typeof child !== 'object' || child === null || Array.isArray(child)) { parent[part] = {}; } parent = parent[part] as Record<string, unknown>; }
-      const leaf = candidate.path[candidate.path.length - 1] as string;
-      if (candidate.op === 'set') parent[leaf] = structuredClone(candidate.value);
-      else delete parent[leaf];
-    }
-    localState = next;
-    post('sf.controller.snapshot', {state: localState, role: 'editor', online: navigator.onLine, revision: 0});
-    post('sf.controller.result', {result: {requestId: message.requestId, kind: 'state', ok: true}});
+    dispatchStateBatch(message);
   } else if (message.type === 'sf.renderer.error') {
     terminateControllerChannel(message.error as string);
   }
@@ -365,7 +422,16 @@ const onPortMessage = (event: MessageEvent): void => {
 const main = async (): Promise<void> => {
   const module = (window as Window & {SMALLFRAME_APP_MODULE?: string}).SMALLFRAME_APP_MODULE;
   if (!USES_CLASSIC_WORKER && !module) throw new Error('APP_MODULE_MISSING');
-  byId('status').textContent = 'Verifying renderer…';
+  if (PERSONAL_MODE) {
+    const binary = atob(PHASE2_PACKAGE_BASE64);
+    personalArchive = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+    const runtime = (globalThis as typeof globalThis & {SmallframePersonalRuntime?: {createSession: (options: {archive: Uint8Array; role: 'viewer' | 'editor'; onApprove: (state: Record<string, unknown>, role: 'viewer' | 'editor') => void; onReplaceState: (state: Record<string, unknown>) => void}) => PersonalSession}}).SmallframePersonalRuntime;
+    if (!runtime) throw new Error('PERSONAL_RUNTIME_MISSING');
+    personalSession = runtime.createSession({archive: personalArchive, role: PERSONAL_ROLE, onApprove: (state, role) => { localState = structuredClone(state); post('sf.controller.approval', {state: localState, role}); }, onReplaceState: (state) => { localState = structuredClone(state); localRevision += 1; post('sf.controller.snapshot', {state: localState, role: PERSONAL_ROLE, online: navigator.onLine, revision: localRevision}); }});
+  } else {
+    byId<HTMLElement>('runtime-panel').hidden = false;
+  }
+  byId('status').textContent = PERSONAL_MODE ? 'Verifying signed package…' : 'Verifying renderer…';
   const rendererHtml = await setupServiceWorker();
   await startFrame(rendererHtml);
 };

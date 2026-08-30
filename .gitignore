@@ -17,3 +17,7 @@ playwright-report/
 *.pem
 *.zip
 .DS_Store
+
+# Founder engineering records stay local. Only the public root README is tracked.
+**/*.md
+!/README.md

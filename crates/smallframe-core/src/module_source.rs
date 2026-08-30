@@ -1,9 +1,9 @@
 use crate::{CoreError, ErrorCode, Result};
 use oxc_allocator::Allocator;
-use oxc_ast::ast_kind::AstKind;
+use oxc_ast::{ast::Statement, ast_kind::AstKind};
 use oxc_ast_visit::Visit;
 use oxc_parser::Parser;
-use oxc_span::SourceType;
+use oxc_span::{GetSpan, SourceType};
 
 const MAX_MODULE_BYTES: usize = 768 * 1024;
 
@@ -18,7 +18,9 @@ impl<'a> Visit<'a> for ForbiddenSyntaxVisitor {
             AstKind::ImportDeclaration(_)
             | AstKind::ImportExpression(_)
             | AstKind::ExportAllDeclaration(_)
-            | AstKind::ExportFromDeclaration(_) => {
+            | AstKind::ExportDeclaration(_)
+            | AstKind::ExportFromDeclaration(_)
+            | AstKind::ExportNamedDeclaration(_) => {
                 self.has_forbidden_import = true;
             }
             AstKind::IdentifierReference(identifier) if identifier.name == "importScripts" => {
@@ -64,6 +66,59 @@ pub fn validate_module_source(source: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Converts the single default export of a verified package module into the
+/// registration call consumed by Candidate U's classic Worker prelude. The
+/// expression range comes from Oxc rather than from publisher-controlled text
+/// matching, and no other module declarations are accepted by this adapter.
+pub fn prepare_classic_module_source(source: &[u8]) -> Result<String> {
+    validate_module_source(source)?;
+    let source = std::str::from_utf8(source)
+        .map_err(|_| CoreError::new(ErrorCode::AppModuleSyntaxInvalid, "module is not UTF-8"))?;
+    let allocator = Allocator::default();
+    let parsed = Parser::new(&allocator, source, SourceType::mjs()).parse();
+    let mut default_export = None;
+    for (index, statement) in parsed.program.body.iter().enumerate() {
+        match statement {
+            Statement::ExportDefaultDeclaration(declaration) => {
+                if default_export.is_some() || index + 1 != parsed.program.body.len() {
+                    return Err(CoreError::new(
+                        ErrorCode::AppModuleSyntaxInvalid,
+                        "runtime module requires one final default export",
+                    ));
+                }
+                default_export = Some((declaration.span.start, declaration.declaration.span()));
+            }
+            Statement::ImportDeclaration(_)
+            | Statement::ExportAllDeclaration(_)
+            | Statement::ExportDeclaration(_)
+            | Statement::ExportNamedDeclaration(_) => {
+                return Err(CoreError::new(
+                    ErrorCode::AppModuleImportForbidden,
+                    "runtime module contains another module declaration",
+                ));
+            }
+            _ => {}
+        }
+    }
+    let Some((export_start, expression_span)) = default_export else {
+        return Err(CoreError::new(
+            ErrorCode::AppModuleSyntaxInvalid,
+            "runtime module is missing a default export",
+        ));
+    };
+    let prefix = source
+        .get(..export_start as usize)
+        .ok_or_else(|| CoreError::new(ErrorCode::AppModuleSyntaxInvalid, "invalid export span"))?;
+    let expression = source
+        .get(expression_span.start as usize..expression_span.end as usize)
+        .ok_or_else(|| {
+            CoreError::new(ErrorCode::AppModuleSyntaxInvalid, "invalid expression span")
+        })?;
+    Ok(format!(
+        "{prefix}__smallframeRegister(() => ({expression}));\n"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,5 +143,18 @@ mod tests {
             let error = validate_module_source(source.as_bytes()).expect_err("import must fail");
             assert_eq!(error.code(), ErrorCode::AppModuleImportForbidden);
         }
+    }
+
+    #[test]
+    fn prepares_one_final_default_export_for_the_classic_prelude() {
+        let source =
+            b"const value = {view(){return {text:'ok'};},onEvent(){}};\nexport default value;\n";
+        let prepared = prepare_classic_module_source(source).expect("prepare module");
+        assert_eq!(
+            prepared,
+            "const value = {view(){return {text:'ok'};},onEvent(){}};\n__smallframeRegister(() => (value));\n"
+        );
+        assert!(prepare_classic_module_source(b"export const x=1; export default x;").is_err());
+        assert!(prepare_classic_module_source(b"export default {}; const x=1;").is_err());
     }
 }

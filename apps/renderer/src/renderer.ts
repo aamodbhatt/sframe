@@ -48,12 +48,15 @@ let classicWorkerTerminal = false;
 type Phase1VerifierGlue = {
   initSync: (options: {module: Uint8Array}) => unknown;
   wasm_sha256_hex: (input: Uint8Array) => string;
+  wasm_prepare_package: (archive: Uint8Array, expectedDigest: string, expectedKeyId: string) => string;
   wasm_verifier_self_test: () => boolean;
   wasm_verifier_version: () => number;
   wasm_verify_package: (archive: Uint8Array, expectedDigest: string, expectedKeyId: string) => string;
 };
 let phase1Verifier: Phase1VerifierGlue | undefined;
 let phase1VerifierStarted = false;
+let preparedModuleSource = '';
+let packageApprovalPending = false;
 const startPhase1Verifier = (): boolean => {
   try {
     const glue = (globalThis as typeof globalThis & {__smallframePhase1Verifier?: Phase1VerifierGlue}).__smallframePhase1Verifier;
@@ -77,6 +80,14 @@ const verifyPhase1Package = (archive: Uint8Array, expectedDigest = '', expectedK
   return JSON.parse(phase1Verifier.wasm_verify_package(archive, expectedDigest, expectedKeyId));
 };
 void verifyPhase1Package;
+type PreparedPackage = {ok: true; packageDigest: string; artifactDigest: string; publisherKeyId: string; manifest: Record<string, unknown>; moduleSource: string};
+const preparePhase2Package = (archive: Uint8Array, expectedDigest: string, expectedKeyId: string): PreparedPackage => {
+  if (!phase1VerifierStarted || !phase1Verifier) throw new Error('PHASE1_VERIFIER_NOT_READY');
+  const result = JSON.parse(phase1Verifier.wasm_prepare_package(archive, expectedDigest, expectedKeyId)) as Partial<PreparedPackage> & {error?: {code?: unknown}};
+  if (result.ok !== true) throw new Error(typeof result.error?.code === 'string' ? result.error.code : 'PACKAGE_VERIFY_FAILED');
+  if (!isPlainRecord(result.manifest) || typeof result.moduleSource !== 'string' || result.moduleSource.length > 786432 || typeof result.packageDigest !== 'string' || typeof result.artifactDigest !== 'string' || typeof result.publisherKeyId !== 'string') throw new Error('PACKAGE_VERIFY_RESULT_INVALID');
+  return result as PreparedPackage;
+};
 type WorkerTrustedTypesPolicy = {createScriptURL: (url: string) => unknown};
 let workerPolicy: WorkerTrustedTypesPolicy | undefined;
 
@@ -463,10 +474,10 @@ ${CANDIDATE_FACTORY_SOURCE}
 })();
 `;
 
-const candidateUBlobWorkerSource = (): string => `
+const candidateUBlobWorkerSource = (publisherSource = CANDIDATE_FACTORY_SOURCE): string => `
 const __smallframePublisherEntry = (__smallframeRegister) => {
   'use strict';
-${CANDIDATE_FACTORY_SOURCE}
+${publisherSource}
 };
 
 (() => {
@@ -920,7 +931,7 @@ const bootApp = (appModule: string): void => {
     if (IS_CANDIDATE_U && classicWorkerTerminal) return;
     classicWorkerGeneration += 1;
     if (IS_CANDIDATE_U) publishWorkerLifecycle('booting');
-    classicWorkerPayload = classicWorkerPayload || (IS_CANDIDATE_U ? candidateUBlobWorkerSource() : classicBlobWorkerSource());
+    classicWorkerPayload = classicWorkerPayload || (IS_CANDIDATE_U ? candidateUBlobWorkerSource(preparedModuleSource || CANDIDATE_FACTORY_SOURCE) : classicBlobWorkerSource());
     classicWorkerOutgoingSequence = 0;
     classicWorkerIncomingSequence = 1;
     classicWorkerReady = false;
@@ -1014,6 +1025,26 @@ const terminateParentChannel = (reason: string): void => {
   port = undefined;
 };
 
+type ControllerMessage = PortMessage & {state?: unknown; role?: unknown; online?: unknown; revision?: unknown; result?: unknown};
+const acceptSnapshot = (message: ControllerMessage, baseKeys: string[]): void => {
+  if (!exactKeys(message, [...baseKeys, 'state', 'role', 'online', 'revision']) || !isPlainRecord(message.state) || (message.role !== 'editor' && message.role !== 'viewer') || typeof message.online !== 'boolean' || !Number.isSafeInteger(message.revision) || Number(message.revision) < 0) { terminateParentChannel('CHANNEL_MESSAGE_SCHEMA'); return; }
+  try {
+    const nextState = structuredClone(message.state);
+    sendWorker('snapshot', {state: nextState, role: message.role, online: message.online, revision: message.revision});
+    currentState = nextState;
+    incomingSequence += 1;
+  } catch (_) { terminateParentChannel('CHANNEL_DISPATCH_FAILED'); }
+};
+const acceptApproval = (message: ControllerMessage, baseKeys: string[]): void => {
+  if (!packageApprovalPending || !exactKeys(message, [...baseKeys, 'state', 'role']) || !isPlainRecord(message.state) || (message.role !== 'editor' && message.role !== 'viewer')) { terminateParentChannel('CHANNEL_MESSAGE_SCHEMA'); return; }
+  try {
+    currentState = structuredClone(message.state);
+    packageApprovalPending = false;
+    incomingSequence += 1;
+    bootApp('');
+  } catch (_) { terminateParentChannel('CHANNEL_DISPATCH_FAILED'); }
+};
+
 const onPortMessage = (event: MessageEvent): void => {
   if (parentChannelTerminal) return;
   if (event.ports.length !== 0) { terminateParentChannel('CHANNEL_TRANSFER_FORBIDDEN'); return; }
@@ -1021,20 +1052,12 @@ const onPortMessage = (event: MessageEvent): void => {
   const messageBytes = safeSizeOf(raw);
   if (messageBytes > MAX_MESSAGE_BYTES) { terminateParentChannel('CHANNEL_MESSAGE_TOO_LARGE'); return; }
   if (!isPlainRecord(raw)) { terminateParentChannel('CHANNEL_ENVELOPE_INVALID'); return; }
-  const message = raw as PortMessage & {state?: unknown; role?: unknown; online?: unknown; revision?: unknown; result?: unknown};
+  const message = raw as ControllerMessage;
   if (message.channel !== 'smallframe-controller' || message.protocol !== 1 || typeof message.type !== 'string' || !Number.isSafeInteger(message.sequence)) { terminateParentChannel('CHANNEL_ENVELOPE_INVALID'); return; }
   if (message.session !== sessionId) { terminateParentChannel('CHANNEL_SESSION_INVALID'); return; }
   if (message.sequence !== incomingSequence) { terminateParentChannel('CHANNEL_SEQUENCE_REPLAY'); return; }
   const baseKeys = ['channel', 'protocol', 'session', 'sequence', 'type'];
-  if (message.type === 'sf.controller.snapshot') {
-    if (!exactKeys(message, [...baseKeys, 'state', 'role', 'online', 'revision']) || !isPlainRecord(message.state) || (message.role !== 'editor' && message.role !== 'viewer') || typeof message.online !== 'boolean' || !Number.isSafeInteger(message.revision) || Number(message.revision) < 0) { terminateParentChannel('CHANNEL_MESSAGE_SCHEMA'); return; }
-    try {
-      const nextState = structuredClone(message.state);
-      sendWorker('snapshot', {state: nextState, role: message.role, online: message.online, revision: message.revision});
-      currentState = nextState;
-      incomingSequence += 1;
-    } catch (_) { terminateParentChannel('CHANNEL_DISPATCH_FAILED'); }
-  }
+  if (message.type === 'sf.controller.snapshot') acceptSnapshot(message, baseKeys);
   else if (message.type === 'sf.controller.result') {
     if (!exactKeys(message, [...baseKeys, 'result']) || !isPlainRecord(message.result)) { terminateParentChannel('CHANNEL_MESSAGE_SCHEMA'); return; }
     try {
@@ -1042,15 +1065,45 @@ const onPortMessage = (event: MessageEvent): void => {
       incomingSequence += 1;
     } catch (_) { terminateParentChannel('CHANNEL_DISPATCH_FAILED'); }
   }
+  else if (message.type === 'sf.controller.approval') acceptApproval(message, baseKeys);
   else terminateParentChannel('CHANNEL_MESSAGE_SCHEMA');
+};
+
+const validInitEvent = (event: MessageEvent, transferredPort: MessagePort | undefined, challenge: unknown, initKeys: string[]): boolean => {
+  if (event.source !== window.parent || event.origin !== CONTROLLER_ORIGIN) return false;
+  if (!isPlainRecord(event.data) || event.data.type !== 'sf.renderer.init' || event.data.protocol !== 1 || challenge !== nonce) return false;
+  if (!transferredPort) return false;
+  if (!IS_CANDIDATE_U) return true;
+  if (!exactKeys(event.data, initKeys) || event.ports.length !== 1 || !(transferredPort instanceof MessagePort)) return false;
+  if (safeSizeOf(event.data) > MAX_MESSAGE_BYTES || typeof event.data.sessionId !== 'string' || !/^[A-Za-z0-9_-]{22}$/u.test(event.data.sessionId)) return false;
+  return isPlainRecord(event.data.state) && (event.data.role === 'editor' || event.data.role === 'viewer');
+};
+
+const acceptPreparedPackage = (data: Record<string, unknown>): void => {
+  if (!(data.packageBytes instanceof Uint8Array) || data.packageBytes.byteLength > 1_310_720 || typeof data.expectedPackageDigest !== 'string' || typeof data.expectedPublisherKeyId !== 'string') throw new Error('PACKAGE_INIT_INVALID');
+  const prepared = preparePhase2Package(data.packageBytes, data.expectedPackageDigest, data.expectedPublisherKeyId);
+  const manifest = prepared.manifest;
+  const publisher = manifest.publisher;
+  const state = manifest.state;
+  if (!isPlainRecord(publisher) || !isPlainRecord(state)) throw new Error('PACKAGE_MANIFEST_RUNTIME_INVALID');
+  const textFields = [manifest.name, manifest.version, manifest.description, publisher.displayName, publisher.publicKey];
+  if (!textFields.every((value) => typeof value === 'string') || publisher.keyId !== prepared.publisherKeyId) throw new Error('PACKAGE_MANIFEST_RUNTIME_INVALID');
+  if (!Array.isArray(manifest.capabilities) || !manifest.capabilities.every((value) => typeof value === 'string')) throw new Error('PACKAGE_MANIFEST_RUNTIME_INVALID');
+  if (!isPlainRecord(state.publicTemplate ?? {}) || !Number.isSafeInteger(state.maxPlaintextBytes) || (state.mode !== 'personal' && state.mode !== 'shared')) throw new Error('PACKAGE_MANIFEST_RUNTIME_INVALID');
+  preparedModuleSource = prepared.moduleSource;
+  packageApprovalPending = true;
+  sendParent('sf.renderer.package-verified', {packageDigest: prepared.packageDigest, artifactDigest: prepared.artifactDigest, publisherKeyId: prepared.publisherKeyId, publisherPublicKey: publisher.publicKey, publisherDisplayName: publisher.displayName, appName: manifest.name, appVersion: manifest.version, description: manifest.description, capabilities: manifest.capabilities, publicTemplate: state.publicTemplate ?? {}, maxPlaintextBytes: state.maxPlaintextBytes, declaredMode: state.mode});
 };
 
 const receiveInit = (event: MessageEvent): void => {
   if (initAccepted) return;
   const transferredPort = event.ports[0];
   const challenge = ARCHITECTURE_CANDIDATE === 'A' ? event.data?.challenge : event.data?.nonce;
-  const initKeys = ARCHITECTURE_CANDIDATE === 'A' ? ['type', 'protocol', 'challenge', 'sessionId', ...(USES_CLASSIC_WORKER ? [] : ['appModule']), 'state', 'role'] : ['type', 'protocol', 'nonce', 'sessionId', ...(USES_CLASSIC_WORKER ? [] : ['appModule']), 'state', 'role'];
-  if (event.source !== window.parent || event.origin !== CONTROLLER_ORIGIN || event.data?.type !== 'sf.renderer.init' || event.data?.protocol !== 1 || challenge !== nonce || (IS_CANDIDATE_U && (!exactKeys(event.data, initKeys) || event.ports.length !== 1 || !(transferredPort instanceof MessagePort) || safeSizeOf(event.data) > MAX_MESSAGE_BYTES || typeof event.data.sessionId !== 'string' || !/^[A-Za-z0-9_-]{22}$/u.test(event.data.sessionId) || !isPlainRecord(event.data.state) || (event.data.role !== 'editor' && event.data.role !== 'viewer'))) || !transferredPort) return;
+  const hasPackage = IS_CANDIDATE_U && Object.prototype.hasOwnProperty.call(event.data ?? {}, 'packageBytes');
+  const packageKeys = hasPackage ? ['packageBytes', 'expectedPackageDigest', 'expectedPublisherKeyId'] : [];
+  const initKeys = ARCHITECTURE_CANDIDATE === 'A' ? ['type', 'protocol', 'challenge', 'sessionId', ...(USES_CLASSIC_WORKER ? [] : ['appModule']), 'state', 'role', ...packageKeys] : ['type', 'protocol', 'nonce', 'sessionId', ...(USES_CLASSIC_WORKER ? [] : ['appModule']), 'state', 'role', ...packageKeys];
+  if (!validInitEvent(event, transferredPort, challenge, initKeys)) return;
+  if (!transferredPort) return;
   initAccepted = true;
   window.removeEventListener('message', receiveInit);
   port = transferredPort;
@@ -1067,8 +1120,16 @@ const receiveInit = (event: MessageEvent): void => {
   classicWorkerRestartCount = 0;
   classicWorkerLastReason = '';
   classicWorkerTerminal = false;
+  preparedModuleSource = '';
+  packageApprovalPending = false;
   nonce = '';
   port.start();
+  if (hasPackage) {
+    try {
+      acceptPreparedPackage(event.data as Record<string, unknown>);
+    } catch (error) { terminateParentChannel(error instanceof Error ? error.message : 'PACKAGE_VERIFY_FAILED'); }
+    return;
+  }
   bootApp(typeof event.data.appModule === 'string' ? event.data.appModule : '');
 };
 

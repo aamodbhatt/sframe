@@ -50,7 +50,7 @@ const phase1Glue = phase1GlueRaw
 if (/^\s*(?:import|export)\s/mu.test(phase1Glue) || /^\s*\{[^\n]*\bas\s+(?:default|[A-Za-z_$])/mu.test(phase1Glue)) {
   throw new Error('PHASE1_WASM_GLUE_MODULE_SYNTAX');
 }
-const phase1GluePrelude = `{\n${phase1Glue}\nglobalThis.__smallframePhase1Verifier = Object.freeze({initSync, wasm_sha256_hex, wasm_verifier_self_test, wasm_verifier_version, wasm_verify_package});\n}\n`;
+const phase1GluePrelude = `{\n${phase1Glue}\nglobalThis.__smallframePhase1Verifier = Object.freeze({initSync, wasm_prepare_package, wasm_sha256_hex, wasm_verifier_self_test, wasm_verifier_version, wasm_verify_package});\n}\n`;
 const phase0WasmCsp = process.env.SMALLFRAME_U_WASM_CSP ?? 'allow';
 if (!['allow', 'deny'].includes(phase0WasmCsp) || (candidate !== 'U' && phase0WasmCsp !== 'allow')) throw new Error('SMALLFRAME_U_WASM_CSP requires Candidate U and allow|deny');
 const wasmEvalSource = phase0WasmCsp === 'allow' ? " 'wasm-unsafe-eval'" : '';
@@ -58,6 +58,7 @@ const wasmEvalSource = phase0WasmCsp === 'allow' ? " 'wasm-unsafe-eval'" : '';
 const controller = join(dist, 'controller');
 mkdirSync(join(controller, 'runtime', 'renderer'), {recursive: true});
 cpSync(join(root, 'apps/controller/public/index.html'), join(controller, 'index.html'));
+cpSync(join(root, 'apps/controller/public/controller.css'), join(controller, 'controller.css'));
 cpSync(join(root, 'apps/controller/public/manifest.webmanifest'), join(controller, 'manifest.webmanifest'));
 cpSync(join(root, 'apps/controller/public/icon.svg'), join(controller, 'icon.svg'));
 cpSync(join(root, 'apps/controller/public/fixture-module.js'), join(controller, 'fixture-module.js'));
@@ -122,6 +123,16 @@ sw = sw.replaceAll('__RENDERER_DIGEST__', rendererDigest)
   .replaceAll('__RENDERER_WASM_EVAL_SOURCE__', wasmEvalSource);
 writeFileSync(swPath, sw);
 const mainPath = join(controller, 'main.js');
+const configuredPackage = process.env.SMALLFRAME_DEV_PACKAGE;
+const phase2DefaultPackagePath = join(root, 'packages/protocol/vectors/phase2-decision-board-v1.zip.b64');
+const phase2DefaultPackageMetadata = JSON.parse(readFileSync(join(root, 'packages/protocol/vectors/phase2-decision-board-v1.json'), 'utf8'));
+const phase2Package = configuredPackage
+  ? readFileSync(configuredPackage)
+  : Buffer.from(readFileSync(phase2DefaultPackagePath, 'utf8').trim(), 'base64');
+if (phase2Package.byteLength < 1 || phase2Package.byteLength > 1_310_720) throw new Error('PHASE2_PACKAGE_SIZE_INVALID');
+const phase2Default = process.env.SMALLFRAME_PHASE2_DEFAULT === '1';
+const phase2ExpectedDigest = configuredPackage ? (process.env.SMALLFRAME_DEV_PACKAGE_DIGEST ?? '') : phase2DefaultPackageMetadata.packageDigest;
+const phase2ExpectedKeyId = configuredPackage ? (process.env.SMALLFRAME_DEV_PUBLISHER_KEY_ID ?? '') : phase2DefaultPackageMetadata.publisherKeyId;
 let main = readFileSync(mainPath, 'utf8').replace(/\nexport \{\};\s*$/u, '').replaceAll('__RENDERER_DIGEST__', rendererDigest)
   .replaceAll('__RENDERER_BOOTSTRAP_HASH__', rendererBootstrapHash)
   .replaceAll('__RENDERER_CSS_HASH__', rendererCssHash)
@@ -129,7 +140,15 @@ let main = readFileSync(mainPath, 'utf8').replace(/\nexport \{\};\s*$/u, '').rep
   .replaceAll('__PHASE0_WASM_BYTES__', String(phase0Wasm.byteLength))
   .replaceAll('__PHASE1_WASM_BYTES__', String(phase1Wasm.byteLength))
   .replaceAll('__CHANNEL_TEST_FIXTURE__', candidateUChannelFixture)
+  .replaceAll('__PHASE2_PACKAGE_BASE64__', phase2Package.toString('base64'))
+  .replaceAll('__PHASE2_DEFAULT_FLAG__', phase2Default ? '1' : '0')
+  .replaceAll('__PHASE2_EXPECTED_DIGEST__', phase2ExpectedDigest)
+  .replaceAll('__PHASE2_EXPECTED_KEY_ID__', phase2ExpectedKeyId)
   .replaceAll('__ARCHITECTURE_CANDIDATE__', candidate);
 writeFileSync(mainPath, main);
+for (const helper of ['personal-store.js', 'personal-runtime.js']) {
+  const helperPath = join(controller, helper);
+  writeFileSync(helperPath, readFileSync(helperPath, 'utf8').replace(/\nexport \{\};\s*$/u, '\n'));
+}
 writeFileSync(join(dist, 'renderer', 'renderer.js'), rendererSource);
-console.log(JSON.stringify({candidate, fixture: fixture || 'valid', channelFixture: candidateUChannelFixture || 'valid', rendererDigest, rendererBytes: Buffer.byteLength(rendererHtml), rendererBootstrapHash, rendererCssHash, phase0WasmBytes: phase0Wasm.byteLength, phase0WasmDigest, phase1WasmBytes: phase1Wasm.byteLength, phase1WasmDigest, phase0WasmCsp, candidateFactory: candidateFactoryPath, candidateFactoryBytes: Buffer.byteLength(candidateFactorySource), candidateFactoryDigest: createHash('sha256').update(candidateFactorySource).digest('hex')}, null, 2));
+console.log(JSON.stringify({candidate, fixture: fixture || 'valid', channelFixture: candidateUChannelFixture || 'valid', rendererDigest, rendererBytes: Buffer.byteLength(rendererHtml), rendererBootstrapHash, rendererCssHash, phase0WasmBytes: phase0Wasm.byteLength, phase0WasmDigest, phase1WasmBytes: phase1Wasm.byteLength, phase1WasmDigest, phase2PackageBytes: phase2Package.byteLength, phase2PackageArtifactDigest: createHash('sha256').update(phase2Package).digest('hex'), phase2Default, phase0WasmCsp, candidateFactory: candidateFactoryPath, candidateFactoryBytes: Buffer.byteLength(candidateFactorySource), candidateFactoryDigest: createHash('sha256').update(candidateFactorySource).digest('hex')}, null, 2));

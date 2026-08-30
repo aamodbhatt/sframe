@@ -19,7 +19,7 @@ pub use dsse::{
 pub use error::{CoreError, ErrorCode, Result};
 pub use json::{canonical_json, canonical_json_bytes, parse_strict_json};
 pub use manifest::{ValidatedManifest, validate_manifest};
-pub use module_source::validate_module_source;
+pub use module_source::{prepare_classic_module_source, validate_module_source};
 pub use package::{
     ValidatedSource, VerifiedPackage, artifact_digest, build_signed_package, hex_digest, key_id,
     package_digest, sha256, validate_source_files, verify_package_archive, verify_package_files,

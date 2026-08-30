@@ -28,7 +28,7 @@ const controllerHeaders = {
 };
 const PROVENANCE_HEADER = 'X-Smallframe-Response-Provenance';
 const serviceWorkerHeaders = {
-  'Content-Security-Policy': "default-src 'none'; script-src 'self'; connect-src http://app.localhost:4173/runtime/renderer/; worker-src 'none'; child-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; navigate-to 'none'; frame-ancestors 'none'",
+  'Content-Security-Policy': "default-src 'none'; script-src 'self'; connect-src http://app.localhost:4173/runtime/renderer/ http://app.localhost:4173/index.html http://app.localhost:4173/main.js http://app.localhost:4173/personal-store.js http://app.localhost:4173/personal-runtime.js http://app.localhost:4173/fixture-module.js http://app.localhost:4173/controller.css http://app.localhost:4173/manifest.webmanifest http://app.localhost:4173/icon.svg; worker-src 'none'; child-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; navigate-to 'none'; frame-ancestors 'none'",
   'Content-Type': 'text/javascript; charset=utf-8',
   'X-Content-Type-Options': 'nosniff',
   'Cache-Control': 'no-store'
@@ -59,6 +59,14 @@ const resetEvidence = () => {
   rendererFaultTokens.clear();
 };
 const evidenceSnapshot = () => ({...canary, rendererFallback: {...rendererFallback}, rendererMutation: {...rendererMutation}, appNetwork: {...appNetwork}, serviceWorkerRequests: [...serviceWorkerRequests]});
+const validControllerQuery = (url) => {
+  if (!url.search) return true;
+  if (url.pathname !== '/') return false;
+  const allowed = new Set(['personal', 'role']);
+  if ([...url.searchParams.keys()].some((key) => !allowed.has(key))) return false;
+  if (url.searchParams.has('personal') && url.searchParams.get('personal') !== '1') return false;
+  return !url.searchParams.has('role') || ['viewer', 'editor'].includes(url.searchParams.get('role'));
+};
 const staticHandler = (request, response) => {
   const url = new URL(request.url ?? '/', 'http://app.localhost:4173');
   if (url.pathname === '/__test__/evidence/reset' && request.method === 'POST') {
@@ -95,10 +103,11 @@ const staticHandler = (request, response) => {
     return;
   }
   if (url.pathname === '/canary') { canary.http += 1; canary.paths.push(url.pathname + url.search); response.writeHead(204, {'Cache-Control': 'no-store'}).end(); return; }
+  if (url.pathname === '/connectivity' && request.method === 'GET' && !url.search) { response.writeHead(204, {'Cache-Control': 'no-store'}).end(); return; }
   if (url.pathname === '/sw-probe') { response.writeHead(404, {...controllerHeaders, [PROVENANCE_HEADER]: 'network-fallback', 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store'}).end('network-fallback'); return; }
   const relative = url.pathname === '/' ? '/index.html' : url.pathname;
   const file = normalize(join(dist, relative));
-  if (!file.startsWith(dist + sep) || !existsSync(file) || !statSync(file).isFile() || url.search) { response.writeHead(404, {'Content-Type': 'text/plain', ...controllerHeaders}).end('not found'); return; }
+  if (!file.startsWith(dist + sep) || !existsSync(file) || !statSync(file).isFile() || !validControllerQuery(url)) { response.writeHead(404, {'Content-Type': 'text/plain', ...controllerHeaders}).end('not found'); return; }
   if (relative.startsWith('/runtime/renderer/') && request.headers['sec-fetch-dest'] === 'iframe' && hasRendererFault(request)) {
     rendererFallback.count += 1;
     rendererFallback.paths.push(url.pathname);
