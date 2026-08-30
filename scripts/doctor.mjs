@@ -20,6 +20,7 @@ check('npm version', command('npm', ['--version']).status === 0, command('npm', 
 check('Rust toolchain', command('rustc', ['--version']).status === 0, command('rustc', ['--version']).stdout.trim());
 const targets = command('rustup', ['target', 'list', '--installed']);
 check('wasm32 target', targets.stdout.split(/\s+/).includes('wasm32-unknown-unknown'), targets.stdout.trim());
+check('wasm-bindgen CLI', existsSync(join(root, '.tools', 'bin', 'wasm-bindgen')), '.tools/bin/wasm-bindgen 0.2.127');
 check('workspace dependencies', existsSync(join(root, 'node_modules', 'typescript')), 'node_modules/typescript');
 check('Playwright package', existsSync(join(root, 'node_modules', '@playwright', 'test')), '@playwright/test');
 check('built renderer', existsSync(join(root, 'dist', 'controller', 'runtime', 'renderer')), 'run npm run build after bootstrap');

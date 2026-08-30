@@ -5,6 +5,9 @@ const CANDIDATE_FACTORY_SOURCE: string = '__CANDIDATE_FACTORY_SOURCE__';
 const PHASE0_WASM_BASE64 = '__PHASE0_WASM_BASE64__';
 const PHASE0_WASM_SHA256 = '__PHASE0_WASM_SHA256__';
 const PHASE0_WASM_BYTES = Number('__PHASE0_WASM_BYTES__');
+const PHASE1_WASM_BASE64 = '__PHASE1_WASM_BASE64__';
+const PHASE1_WASM_SHA256 = '__PHASE1_WASM_SHA256__';
+const PHASE1_WASM_BYTES = Number('__PHASE1_WASM_BYTES__');
 const USES_CLASSIC_WORKER = ARCHITECTURE_CANDIDATE === 'S' || ARCHITECTURE_CANDIDATE === 'T' || ARCHITECTURE_CANDIDATE === 'U';
 const IS_CANDIDATE_U = ARCHITECTURE_CANDIDATE === 'U';
 type PortMessage = {channel: string; protocol: 1; session: string; sequence: number; type: string; [key: string]: unknown};
@@ -42,6 +45,38 @@ let classicWorkerGeneration = 0;
 let classicWorkerRestartCount = 0;
 let classicWorkerLastReason = '';
 let classicWorkerTerminal = false;
+type Phase1VerifierGlue = {
+  initSync: (options: {module: Uint8Array}) => unknown;
+  wasm_sha256_hex: (input: Uint8Array) => string;
+  wasm_verifier_self_test: () => boolean;
+  wasm_verifier_version: () => number;
+  wasm_verify_package: (archive: Uint8Array, expectedDigest: string, expectedKeyId: string) => string;
+};
+let phase1Verifier: Phase1VerifierGlue | undefined;
+let phase1VerifierStarted = false;
+const startPhase1Verifier = (): boolean => {
+  try {
+    const glue = (globalThis as typeof globalThis & {__smallframePhase1Verifier?: Phase1VerifierGlue}).__smallframePhase1Verifier;
+    if (!glue || PHASE1_WASM_BYTES <= 8 || PHASE1_WASM_BYTES > 2 * 1024 * 1024 || !/^[0-9a-f]{64}$/u.test(PHASE1_WASM_SHA256)) return false;
+    const binary = atob(PHASE1_WASM_BASE64);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+    if (bytes.byteLength !== PHASE1_WASM_BYTES) return false;
+    glue.initSync({module: bytes});
+    if (glue.wasm_verifier_version() !== 1 || !glue.wasm_verifier_self_test()) return false;
+    if (glue.wasm_sha256_hex(bytes) !== PHASE1_WASM_SHA256) return false;
+    phase1Verifier = glue;
+    return true;
+  } catch (_) {
+    phase1Verifier = undefined;
+    return false;
+  }
+};
+const verifyPhase1Package = (archive: Uint8Array, expectedDigest = '', expectedKeyId = ''): unknown => {
+  if (!phase1VerifierStarted || !phase1Verifier) throw new Error('PHASE1_VERIFIER_NOT_READY');
+  return JSON.parse(phase1Verifier.wasm_verify_package(archive, expectedDigest, expectedKeyId));
+};
+void verifyPhase1Package;
 type WorkerTrustedTypesPolicy = {createScriptURL: (url: string) => unknown};
 let workerPolicy: WorkerTrustedTypesPolicy | undefined;
 
@@ -924,7 +959,7 @@ const bootApp = (appModule: string): void => {
           classicWorkerPort.postMessage({channel: 'smallframe-controller', protocol: 1, session: classicWorkerSession, sequence: classicWorkerOutgoingSequence, type: 'snapshot', state: currentState, role: 'editor', online: navigator.onLine, revision: 0});
         }
         if (IS_CANDIDATE_U) publishWorkerLifecycle('running');
-        sendParent('sf.renderer.app-ready', {workerKind: 'classic-blob', blobCount: 1, workerSelfOrigin: message.workerSelfOrigin, workerLocationOrigin: message.workerLocationOrigin, workerLocationHref: message.workerLocationHref, wasmStarted: message.wasmStarted, wasmBytes: message.wasmBytes, wasmProbe: message.wasmProbe, wasmDigest: message.wasmDigest, generation: classicWorkerGeneration, restartCount: classicWorkerRestartCount, lastReason: classicWorkerLastReason});
+        sendParent('sf.renderer.app-ready', {workerKind: 'classic-blob', blobCount: 1, workerSelfOrigin: message.workerSelfOrigin, workerLocationOrigin: message.workerLocationOrigin, workerLocationHref: message.workerLocationHref, wasmStarted: message.wasmStarted, wasmBytes: message.wasmBytes, wasmProbe: message.wasmProbe, wasmDigest: message.wasmDigest, generation: classicWorkerGeneration, restartCount: classicWorkerRestartCount, lastReason: classicWorkerLastReason, ...(IS_CANDIDATE_U ? {verifierStarted: phase1VerifierStarted, verifierBytes: PHASE1_WASM_BYTES, verifierVersion: phase1Verifier?.wasm_verifier_version() ?? 0, verifierDigest: PHASE1_WASM_SHA256} : {})});
       } else if (message.type === 'error') {
         if (IS_CANDIDATE_U && (Object.keys(message).sort().join(',') !== 'channel,error,protocol,sequence,session,type' || typeof message.error !== 'string' || (classicWorkerReady && message.session !== classicWorkerSession))) { stopClassicWorker('WORKER_MESSAGE_SCHEMA'); return; }
         IS_CANDIDATE_U ? stopClassicWorker(message.error ?? 'WORKER_ERROR') : restartClassicWorker(message.error ?? 'WORKER_ERROR');
@@ -1037,6 +1072,10 @@ const receiveInit = (event: MessageEvent): void => {
   bootApp(typeof event.data.appModule === 'string' ? event.data.appModule : '');
 };
 
+if (IS_CANDIDATE_U) {
+  phase1VerifierStarted = startPhase1Verifier();
+  if (!phase1VerifierStarted) throw new Error('PHASE1_VERIFIER_STARTUP_FAILED');
+}
 if (ARCHITECTURE_CANDIDATE === 'A') {
   const bytes = new Uint8Array(16);
   crypto.getRandomValues(bytes);

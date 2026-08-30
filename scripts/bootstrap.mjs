@@ -10,5 +10,8 @@ const run = (command, args) => {
 
 mkdirSync(join(root, '.tools'), {recursive: true});
 run('rustup', ['target', 'add', 'wasm32-unknown-unknown']);
+if (!existsSync(join(root, '.tools', 'bin', 'wasm-bindgen'))) {
+  run('cargo', ['install', '--locked', '--version', '0.2.127', '--root', '.tools', 'wasm-bindgen-cli']);
+}
 run('npm', ['exec', '--', 'playwright', 'install', 'chromium', 'firefox', 'webkit']);
 console.log('Bootstrap complete. Repository-local tools are ready; no cloud credentials were touched.');

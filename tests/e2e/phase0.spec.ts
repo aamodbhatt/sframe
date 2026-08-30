@@ -9,6 +9,9 @@ const usesClassicWorker = candidate === 'S' || candidate === 'T' || candidate ==
 const usesCandidateTFraming = candidate === 'T' || candidate === 'U';
 const phase0WasmArtifact = candidate === 'U' ? readFileSync(join(process.cwd(), 'target', 'wasm32-unknown-unknown', 'release', 'smallframe_phase0_wasm.wasm')) : Buffer.alloc(0);
 const phase0WasmDigest = createHash('sha256').update(phase0WasmArtifact).digest('hex');
+const phase1WasmArtifact = candidate === 'U' ? readFileSync(join(process.cwd(), 'target', 'phase1-wasm', 'smallframe_verifier_bg.wasm')) : Buffer.alloc(0);
+const phase1WasmDigest = createHash('sha256').update(phase1WasmArtifact).digest('hex');
+const phase1PackageVector = candidate === 'U' ? readFileSync(join(process.cwd(), 'packages', 'protocol', 'vectors', 'canonical-package-v1.zip.b64'), 'utf8').trim() : '';
 type PageLike = Parameters<Parameters<typeof test>[1]>[0]['page'];
 
 test.beforeEach(async ({request}) => {
@@ -116,6 +119,34 @@ test('Phase 0 response provenance and verified-cache evidence', async ({page, re
     expect(responseHeaders['x-smallframe-response-provenance']).toBe(candidate === 'R' || usesClassicWorker ? 'service-worker-cache' : 'network-fallback');
     expect(responseHeaders['content-security-policy']).toContain(candidate === 'R' || usesClassicWorker ? 'sandbox allow-scripts' : "frame-ancestors 'none'");
   }
+});
+
+test('Phase 1 production Wasm verifies the native canonical package vector', async ({page}) => {
+  test.skip(candidate !== 'U', 'Phase 1 verifier is Candidate U only');
+  await page.goto('/');
+  await expect(page.locator('#status')).toContainText('App Worker running', {timeout: 8_000});
+  const renderer = page.frames().find((frame) => frame.url().includes('/runtime/renderer/'));
+  expect(renderer).toBeDefined();
+  const results = await renderer!.evaluate(({archiveBase64, packageDigest, publisherKeyId}) => {
+    const glue = (globalThis as typeof globalThis & {__smallframePhase1Verifier?: {wasm_verify_package: (archive: Uint8Array, expectedDigest: string, expectedKeyId: string) => string}}).__smallframePhase1Verifier;
+    if (!glue) throw new Error('PHASE1_VERIFIER_NOT_READY');
+    const archive = Uint8Array.from(atob(archiveBase64), (character) => character.charCodeAt(0));
+    return {
+      valid: JSON.parse(glue.wasm_verify_package(archive, packageDigest, publisherKeyId)) as unknown,
+      wrongPin: JSON.parse(glue.wasm_verify_package(archive, 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', publisherKeyId)) as unknown
+    };
+  }, {
+    archiveBase64: phase1PackageVector,
+    packageDigest: 'xGzOKkefgzfEFU-AFvSM4zHn9bw-XF3xwlHoz-QHJAA',
+    publisherKeyId: 'sha256:_oEsEvOrTOasXbaaw1L5BssbEe9D-zPiUu9_9VImOIk'
+  });
+  expect(results.valid).toEqual({
+    ok: true,
+    packageDigest: 'xGzOKkefgzfEFU-AFvSM4zHn9bw-XF3xwlHoz-QHJAA',
+    artifactDigest: 'O0lEC4tH1tN_ncCX_FalC8uNSyxOpSRvFUU59BLbr5E',
+    publisherKeyId: 'sha256:_oEsEvOrTOasXbaaw1L5BssbEe9D-zPiUu9_9VImOIk'
+  });
+  expect(results.wrongPin).toEqual({ok: false, error: {code: 'PACKAGE_DIGEST_MISMATCH'}});
 });
 
 if (usesCandidateTFraming) {
@@ -513,6 +544,12 @@ if (candidate === 'T' || candidate === 'U') {
       await expect(page.locator('#app-host')).toHaveAttribute('data-worker-wasm-digest', phase0WasmDigest);
       const wasmBytes = Number(await page.locator('#app-host').getAttribute('data-worker-wasm-bytes'));
       expect(wasmBytes).toBe(phase0WasmArtifact.byteLength);
+      await expect(page.locator('#app-host')).toHaveAttribute('data-verifier-started', 'true');
+      await expect(page.locator('#app-host')).toHaveAttribute('data-verifier-version', '1');
+      await expect(page.locator('#app-host')).toHaveAttribute('data-verifier-digest', phase1WasmDigest);
+      const verifierBytes = Number(await page.locator('#app-host').getAttribute('data-verifier-bytes'));
+      expect(verifierBytes).toBe(phase1WasmArtifact.byteLength);
+      expect(verifierBytes).toBeLessThanOrEqual(2 * 1024 * 1024);
     }
     await page.frameLocator('iframe').getByRole('button', {name: 'Add decision'}).click();
     await expect(page.frameLocator('iframe').getByText('Decisions: 1')).toBeVisible();

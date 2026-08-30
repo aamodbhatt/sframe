@@ -5,3 +5,10 @@ members = ["crates/smallframe-core", "crates/smallframe-cli", "crates/smallframe
 [profile.release.package.smallframe-phase0-wasm]
 opt-level = "s"
 strip = true
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "z"
+panic = "abort"
+strip = true

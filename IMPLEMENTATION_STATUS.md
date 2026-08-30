@@ -1,10 +1,10 @@
 # Smallframe implementation status
 
-Updated: 2026-08-27 (Asia/Kolkata)
+Updated: 2026-08-30 (Asia/Kolkata)
 
 ## Executive state
 
-Candidate U has **green local Phase 0 technical evidence** and is now the founder-accepted normative local architecture. It is not a completed MVP. ADR-0005 records the two accepted local specification amendments and the exact scope restriction. Phase 1 is authorized and in progress; Phase 2 has not been started or claimed.
+Candidate U has **green local Phase 0 and Phase 1 technical evidence** and is the founder-accepted normative local architecture. It is not a completed MVP. ADR-0005 records the two accepted local specification amendments and the exact scope restriction. The authorized Phase 1 package/protocol core is complete locally; Phase 2 has not been started or claimed.
 
 This result is meaningful: the browser isolation premise, channel confinement, artifact pinning, bounded watchdog recovery, actual Wasm startup, strict deployment configuration, and a minimal SQLite Durable Object CAS/ticket/fallback spike now work locally. It is not proof that the business will sell, that Cloudflare production will behave identically, or that the system has received independent review.
 
@@ -28,8 +28,8 @@ This result is meaningful: the browser isolation premise, channel confinement, a
 - [x] Minimal local SQLite Durable Object CAS/ticket/budgeted-fallback spike.
 - [x] Phase 0 technical evidence gate locally green.
 - [x] Founder accepted Candidate U's normative sandbox/Worker-loader amendments on 2026-08-27.
-- [ ] Phase 1 — authorized and in progress; completion not claimed.
-- [ ] Phase 1 gate — not started or claimed.
+- [x] Phase 1 package/protocol core — locally complete.
+- [x] Phase 1 local technical gate — green on 2026-08-30.
 - [ ] Phase 2 — not started or claimed.
 - [ ] Phase 2 gate — not started or claimed.
 - [ ] Validation Hold A demand evidence — humans/interviews cannot be fabricated locally.
@@ -48,7 +48,7 @@ Candidate U preserves the content-addressed Service Worker renderer response, ex
 - fatal iframe destruction, one bounded watchdog restart, and final fail-stop;
 - expanded malformed descriptor/result and poisoning fixtures.
 
-Final valid build identity:
+Phase 0 build identity at its accepted checkpoint:
 
 ```text
 renderer: 57e167b0e04b716e51a29c6b1362e3e26789893efce441b6f5da79a7148d4007 (81,092 bytes)
@@ -85,20 +85,43 @@ Wrangler dry-run is green with `ROOMS` (SQLite DO), `DB` (D1), and `PACKAGES` (p
 
 The Miniflare spike proves exact ETag CAS, one winning concurrent write, fixed-size capability hashes, conditional 304 reads, bounded streaming PUT, readable CORS head/error responses, hash-only 30-second tickets, same-room one-use behavior, exact subprotocol selection, held-fetch wake/timeout, flap-resistant client fallback state, and room-expiry alarm transport cleanup.
 
+## Phase 1 delivered
+
+- Strict duplicate-key I-JSON parsing, RFC 8785 JCS canonicalization, NFC/path checks, bounded schema validation, and stable errors.
+- Deterministic STORE-only package archives; Ed25519 DSSE-PAE signing; publisher, file, artifact, and link-pin verification.
+- An Oxc JavaScript parser that rejects imports, re-exports, `importScripts`, and source-map directives.
+- A production Rust/Wasm verifier embedded in the renderer and attested by the controller before readiness.
+- CLI identity creation/recovery with OS credential-store abstraction, AES-256-GCM vaults, Argon2id recovery bundles, create-new output, and deterministic `new`, `validate`, and `pack` flows.
+- Draft 2020-12 schemas, signed-record/package/Automerge golden vectors, parser corpus, and a deterministic decision-board example.
+- A cyclomatic-complexity gate: new TypeScript functions are capped at 20; audited Phase 0 security state machines have frozen baselines that may not increase; Rust Clippy warnings fail the build.
+
+Final Phase 1 build identity:
+
+```text
+renderer: bec664775eb21291db9226c499856235e38a7a652a0207d8e020313eda2db6ea (1,285,425 bytes)
+Phase 1 verifier Wasm: e01b3028a65caaa7d1b22ddf0983fd202fc8c81fb46e01ace39cff722261c239 (893,959 bytes)
+factory: 40d1358fa698a70a2c8bb2eecb2dee695ce8e1c425359ce7cb8e4c2b9baec485 (9,992 bytes)
+```
+
+The verifier Wasm occupies 42.6% of the 2 MiB decoded ceiling. Full evidence: `evidence/phase1/RESULTS.md`.
+
 ## Current verification
 
 | Command | Result |
 |---|---|
 | `npm run typecheck` | PASS |
-| `npm run lint` | PASS — 44 source files |
-| `npm test` | PASS — 62/62 |
+| `npm run lint` | PASS — 60 source files |
+| `npm test` | PASS — 66/66 |
+| `npm run complexity` | PASS — 19 TypeScript files; new functions at or below 20 |
 | `npm run test:phase0:do` | PASS — 13/13 |
 | `cargo fmt --all -- --check` | PASS |
 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | PASS |
-| `cargo test --workspace --all-features` | PASS |
+| `cargo test --locked --workspace --all-features` | PASS — 23 tests |
+| `cargo test --locked -p smallframe-core --no-default-features --features wasm` | PASS — 20 tests |
 | `npm run doctor` | PASS (loopback probes authorized) |
 | `SMALLFRAME_CANDIDATE=U npm run build` | PASS |
-| final Candidate U valid Playwright matrix | PASS — 24/24 |
+| final Candidate U valid Playwright matrix | PASS — 27/27, 9 per browser |
+| clean offline build (`CARGO_NET_OFFLINE=true`, npm offline) | PASS — exact identities above |
 | channel matrix | PASS — 63/63 |
 | hostile/CSP/tamper matrices | PASS — 60/60 browser assertions plus syntax rejection |
 | `npm audit --package-lock-only` | PASS — 0 advisories |
@@ -122,7 +145,7 @@ No `allow-same-origin`, publisher DOM realm, arbitrary network, network renderer
 - The current DO is not the Phase 3 signed/encrypted production relay. It lacks envelope/context/signature validation, recovery, rotation/revocation, checkpoints, full quotas, and sagas.
 - A ticket tried against a different room DO cannot consume the issuing room's ticket row; Phase 3 needs an explicit protocol interpretation/design.
 - Nominal fallback forecast is 28,800 requests/day; worst-case minimum jitter is 36,000/day until the later hard project budget exists.
-- Phase 1's production package verifier and Phase 2's usable personal app flow do not exist yet.
+- Phase 2's usable personal app flow does not exist yet.
 - No interviews, willingness-to-pay evidence, name/license clearance, deployment, external accounts, public release, or fundraising claim has been made.
 
 ## Authorization boundary

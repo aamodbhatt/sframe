@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="220" viewBox="0 0 720 220" role="img" aria-labelledby="title description">
+  <title id="title">Smallframe</title>
+  <desc id="description">A framed amber spark representing a portable private application room.</desc>
+  <defs>
+    <linearGradient id="night" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#101526"/>
+      <stop offset="1" stop-color="#24152d"/>
+    </linearGradient>
+    <linearGradient id="spark" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffdd72"/>
+      <stop offset="1" stop-color="#ff6b57"/>
+    </linearGradient>
+  </defs>
+  <rect width="720" height="220" rx="32" fill="url(#night)"/>
+  <rect x="54" y="42" width="136" height="136" rx="30" fill="none" stroke="#f5efff" stroke-width="8"/>
+  <path d="M86 140V82h72v26h-42v32z" fill="url(#spark)"/>
+  <circle cx="158" cy="140" r="15" fill="#8ae8d2"/>
+  <text x="225" y="116" fill="#f8f5ff" font-family="ui-rounded, system-ui, sans-serif" font-size="58" font-weight="720" letter-spacing="-2">smallframe</text>
+  <text x="230" y="151" fill="#b9b3ca" font-family="ui-monospace, SFMono-Regular, monospace" font-size="16" letter-spacing="2">PRIVATE SOFTWARE · ORDINARY LINKS</text>
+</svg>

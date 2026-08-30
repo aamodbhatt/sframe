@@ -1,16 +1,26 @@
 #![forbid(unsafe_code)]
 
+mod app;
+mod identity;
+
+use app::{new_app, pack, validate_path};
 use clap::{Parser, Subcommand};
+use identity::{IdentityContext, read_passphrase};
+use serde::Serialize;
 use serde_json::json;
-use smallframe_core::{canonical_json, hex_digest, package_digest};
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
-#[command(name = "smallframe", version, about = "Smallframe internal local CLI")]
+#[command(
+    name = "smallframe",
+    version,
+    about = "Build and verify Smallframe packages"
+)]
 struct Cli {
+    #[arg(long, global = true)]
+    json: bool,
+    #[arg(long, global = true, value_name = "DIRECTORY", hide = true)]
+    test_store: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -23,6 +33,8 @@ enum Command {
     },
     New {
         name: String,
+        #[arg(long, default_value = ".")]
+        directory: PathBuf,
     },
     Validate {
         path: PathBuf,
@@ -32,70 +44,143 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
-    Dev {
-        path: Option<PathBuf>,
-    },
 }
 
 #[derive(Debug, Subcommand)]
 enum IdentityCommand {
     Init,
-    Export,
-    Import { path: PathBuf },
+    Export {
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long, value_name = "OWNER_ONLY_FILE")]
+        passphrase_file: Option<PathBuf>,
+    },
+    Import {
+        path: PathBuf,
+        #[arg(long, value_name = "OWNER_ONLY_FILE")]
+        passphrase_file: Option<PathBuf>,
+    },
 }
 
-fn manifest_path(path: &Path) -> PathBuf {
-    if path.is_dir() {
-        path.join("smallframe.json")
-    } else {
-        path.to_path_buf()
+#[derive(Debug)]
+struct CliError {
+    code: String,
+    detail: String,
+    exit: u8,
+}
+
+impl CliError {
+    fn from_message(message: String) -> Self {
+        let code = message
+            .split([':', ' '])
+            .next()
+            .unwrap_or("INTERNAL")
+            .to_owned();
+        let exit = if code.contains("KEY_STORE")
+            || code.contains("VAULT")
+            || code.contains("IDENTITY_NOT")
+        {
+            6
+        } else if code == "INTERNAL" {
+            10
+        } else {
+            2
+        };
+        Self {
+            code,
+            detail: message,
+            exit,
+        }
     }
 }
 
-fn validate(path: &Path) -> Result<(), String> {
-    let manifest = fs::read_to_string(manifest_path(path))
-        .map_err(|error| format!("READ_MANIFEST: {error}"))?;
-    let canonical = canonical_json(&manifest).map_err(|error| format!("MANIFEST_JSON: {error}"))?;
-    let digest = package_digest(&manifest).map_err(|error| format!("PACKAGE_DIGEST: {error}"))?;
-    println!("{}", serde_json::to_string_pretty(&json!({"canonicalManifestBytes": canonical.len(), "packageDigest": hex_digest(&digest)})).map_err(|error| error.to_string())?);
+fn emit<T: Serialize>(value: &T, json_mode: bool) -> Result<(), CliError> {
+    let encoded = if json_mode {
+        serde_json::to_string(value)
+    } else {
+        serde_json::to_string_pretty(value)
+    }
+    .map_err(|_| CliError::from_message("INTERNAL JSON_OUTPUT_FAILED".to_owned()))?;
+    println!("{encoded}");
     Ok(())
+}
+
+fn run(cli: &Cli) -> Result<(), CliError> {
+    match &cli.command {
+        Command::Identity { command } => {
+            let context = IdentityContext::discover(cli.test_store.as_deref())
+                .map_err(CliError::from_message)?;
+            match command {
+                IdentityCommand::Init => {
+                    emit(&context.init().map_err(CliError::from_message)?, cli.json)
+                }
+                IdentityCommand::Export {
+                    output,
+                    passphrase_file,
+                } => {
+                    if !cli.json {
+                        eprintln!(
+                            "Warning: this recovery file can restore your publisher identity."
+                        );
+                        eprintln!(
+                            "Warning: keep it offline; Smallframe cannot recover a lost key."
+                        );
+                    }
+                    let passphrase = read_passphrase(passphrase_file.as_deref(), true)
+                        .map_err(CliError::from_message)?;
+                    emit(
+                        &context
+                            .export(output, &passphrase)
+                            .map_err(CliError::from_message)?,
+                        cli.json,
+                    )
+                }
+                IdentityCommand::Import {
+                    path,
+                    passphrase_file,
+                } => {
+                    let passphrase = read_passphrase(passphrase_file.as_deref(), false)
+                        .map_err(CliError::from_message)?;
+                    emit(
+                        &context
+                            .import(path, &passphrase)
+                            .map_err(CliError::from_message)?,
+                        cli.json,
+                    )
+                }
+            }
+        }
+        Command::New { name, directory } => {
+            let context = IdentityContext::discover(cli.test_store.as_deref())
+                .map_err(CliError::from_message)?;
+            let signing_key = context.signing_key().map_err(CliError::from_message)?;
+            let path = new_app(name, directory, &signing_key).map_err(CliError::from_message)?;
+            emit(&json!({"path": path}), cli.json)
+        }
+        Command::Validate { path } => emit(
+            &validate_path(path).map_err(CliError::from_message)?,
+            cli.json,
+        ),
+        Command::Pack { path, output } => {
+            let context = IdentityContext::discover(cli.test_store.as_deref())
+                .map_err(CliError::from_message)?;
+            let signing_key = context.signing_key().map_err(CliError::from_message)?;
+            emit(
+                &pack(path, output, &signing_key).map_err(CliError::from_message)?,
+                cli.json,
+            )
+        }
+    }
 }
 
 fn main() {
     let cli = Cli::parse();
-    let result = match cli.command {
-        Command::Validate { path } => validate(&path),
-        Command::New { name } => {
-            let target = PathBuf::from("examples").join(&name);
-            if target.exists() {
-                Err("VALIDATION: target exists; refusing to overwrite".to_owned())
-            } else {
-                fs::create_dir_all(target.join("src")).map_err(|error| error.to_string()).and_then(|_| { fs::write(target.join("README.md"), "# Smallframe starter\n\nAdapt this local starter to the SDK contract.\n").map_err(|error| error.to_string()) })
-            }
+    if let Err(error) = run(&cli) {
+        if cli.json {
+            eprintln!("{}", json!({"ok":false,"error":{"code":error.code}}));
+        } else {
+            eprintln!("{}", error.detail);
         }
-        Command::Pack { path, output: _ } => Err(format!(
-            "PACK_NOT_READY: deterministic archive implementation is staged for the Phase 1 package-core slice ({})",
-            path.display()
-        )),
-        Command::Dev { path } => {
-            println!(
-                "local development path: {}",
-                path.unwrap_or_else(|| PathBuf::from("examples/decision-board"))
-                    .display()
-            );
-            Ok(())
-        }
-        Command::Identity { command } => match command {
-            IdentityCommand::Init => Err(
-                "IDENTITY_STORE_NOT_READY: Phase 1 vault implementation is not yet complete"
-                    .to_owned(),
-            ),
-            IdentityCommand::Export => Err("IDENTITY_STORE_NOT_READY".to_owned()),
-            IdentityCommand::Import { path: _ } => Err("IDENTITY_STORE_NOT_READY".to_owned()),
-        },
-    };
-    if let Err(error) = result {
-        eprintln!("{error}");
-        std::process::exit(2);
+        std::process::exit(i32::from(error.exit));
     }
 }

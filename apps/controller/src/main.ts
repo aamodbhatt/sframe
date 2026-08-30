@@ -3,6 +3,7 @@ const CONTROLLER_ORIGIN = 'http://app.localhost:4173';
 const ARCHITECTURE_CANDIDATE: string = '__ARCHITECTURE_CANDIDATE__';
 const CHANNEL_TEST_FIXTURE: string = '__CHANNEL_TEST_FIXTURE__';
 const PHASE0_WASM_BYTES = Number('__PHASE0_WASM_BYTES__');
+const PHASE1_WASM_BYTES = Number('__PHASE1_WASM_BYTES__');
 const USES_CLASSIC_WORKER = ARCHITECTURE_CANDIDATE === 'S' || ARCHITECTURE_CANDIDATE === 'T' || ARCHITECTURE_CANDIDATE === 'U';
 const IS_CANDIDATE_U = ARCHITECTURE_CANDIDATE === 'U';
 const RENDERER_PATH = `/runtime/renderer/${RENDERER_DIGEST}.html`;
@@ -262,7 +263,7 @@ const onPortMessage = (event: MessageEvent): void => {
   const messageBytes = safeMessageBytes(raw);
   if (messageBytes > MAX_MESSAGE_BYTES) { terminateControllerChannel('CHANNEL_MESSAGE_TOO_LARGE', true); return; }
   if (!isPlainRecord(raw)) { terminateControllerChannel('CHANNEL_ENVELOPE_INVALID', true); return; }
-  const message = raw as {channel?: unknown; protocol?: unknown; session?: unknown; sequence?: unknown; type?: unknown; tree?: unknown; error?: unknown; requestId?: unknown; operations?: unknown; workerKind?: unknown; blobCount?: unknown; workerSelfOrigin?: unknown; workerLocationOrigin?: unknown; workerLocationHref?: unknown; wasmStarted?: unknown; wasmBytes?: unknown; wasmProbe?: unknown; wasmDigest?: unknown; state?: unknown; generation?: unknown; restartCount?: unknown; lastReason?: unknown; stopCode?: unknown};
+  const message = raw as {channel?: unknown; protocol?: unknown; session?: unknown; sequence?: unknown; type?: unknown; tree?: unknown; error?: unknown; requestId?: unknown; operations?: unknown; workerKind?: unknown; blobCount?: unknown; workerSelfOrigin?: unknown; workerLocationOrigin?: unknown; workerLocationHref?: unknown; wasmStarted?: unknown; wasmBytes?: unknown; wasmProbe?: unknown; wasmDigest?: unknown; verifierStarted?: unknown; verifierBytes?: unknown; verifierVersion?: unknown; verifierDigest?: unknown; state?: unknown; generation?: unknown; restartCount?: unknown; lastReason?: unknown; stopCode?: unknown};
   if (message.channel !== 'smallframe-renderer' || message.protocol !== 1 || typeof message.type !== 'string' || !Number.isSafeInteger(message.sequence)) { terminateControllerChannel('CHANNEL_ENVELOPE_INVALID', true); return; }
   if (message.session !== activeSessionId) { terminateControllerChannel('CHANNEL_SESSION_INVALID', true); return; }
   if (message.sequence !== expectedPortSequence) { terminateControllerChannel('CHANNEL_SEQUENCE_REPLAY', true); return; }
@@ -270,8 +271,8 @@ const onPortMessage = (event: MessageEvent): void => {
   let schemaValid = false;
   if (message.type === 'sf.renderer.rendered') schemaValid = exactKeys(message, baseKeys) && (!IS_CANDIDATE_U || (workerLifecycleState === 'running' && acceptedAppReadyGeneration === workerLifecycleGeneration));
   else if (message.type === 'sf.renderer.app-ready') {
-    const expected = USES_CLASSIC_WORKER ? [...baseKeys, 'workerKind', 'blobCount', 'workerSelfOrigin', 'workerLocationOrigin', 'workerLocationHref', 'wasmStarted', 'wasmBytes', 'wasmProbe', 'wasmDigest', 'generation', 'restartCount', 'lastReason'] : baseKeys;
-    schemaValid = exactKeys(message, expected) && (!IS_CANDIDATE_U || (message.workerKind === 'classic-blob' && message.blobCount === 1 && message.workerSelfOrigin === 'null' && message.workerLocationOrigin === 'null' && typeof message.workerLocationHref === 'string' && message.workerLocationHref.startsWith('blob:null/') && message.wasmStarted === true && Number.isSafeInteger(message.wasmBytes) && message.wasmBytes === PHASE0_WASM_BYTES && message.wasmProbe === 0xf88bbfb9 && typeof message.wasmDigest === 'string' && /^[0-9a-f]{64}$/u.test(message.wasmDigest) && Number.isSafeInteger(message.generation) && Number(message.generation) >= 1 && Number.isSafeInteger(message.restartCount) && Number(message.restartCount) >= 0 && typeof message.lastReason === 'string' && message.lastReason.length <= 64 && workerLifecycleState === 'running' && message.generation === workerLifecycleGeneration && message.restartCount === workerLifecycleRestartCount && acceptedAppReadyGeneration !== workerLifecycleGeneration));
+    const expected = USES_CLASSIC_WORKER ? [...baseKeys, 'workerKind', 'blobCount', 'workerSelfOrigin', 'workerLocationOrigin', 'workerLocationHref', 'wasmStarted', 'wasmBytes', 'wasmProbe', 'wasmDigest', 'generation', 'restartCount', 'lastReason', ...(IS_CANDIDATE_U ? ['verifierStarted', 'verifierBytes', 'verifierVersion', 'verifierDigest'] : [])] : baseKeys;
+    schemaValid = exactKeys(message, expected) && (!IS_CANDIDATE_U || (message.workerKind === 'classic-blob' && message.blobCount === 1 && message.workerSelfOrigin === 'null' && message.workerLocationOrigin === 'null' && typeof message.workerLocationHref === 'string' && message.workerLocationHref.startsWith('blob:null/') && message.wasmStarted === true && Number.isSafeInteger(message.wasmBytes) && message.wasmBytes === PHASE0_WASM_BYTES && message.wasmProbe === 0xf88bbfb9 && typeof message.wasmDigest === 'string' && /^[0-9a-f]{64}$/u.test(message.wasmDigest) && message.verifierStarted === true && Number.isSafeInteger(message.verifierBytes) && message.verifierBytes === PHASE1_WASM_BYTES && PHASE1_WASM_BYTES <= 2 * 1024 * 1024 && message.verifierVersion === 1 && typeof message.verifierDigest === 'string' && /^[0-9a-f]{64}$/u.test(message.verifierDigest) && Number.isSafeInteger(message.generation) && Number(message.generation) >= 1 && Number.isSafeInteger(message.restartCount) && Number(message.restartCount) >= 0 && typeof message.lastReason === 'string' && message.lastReason.length <= 64 && workerLifecycleState === 'running' && message.generation === workerLifecycleGeneration && message.restartCount === workerLifecycleRestartCount && acceptedAppReadyGeneration !== workerLifecycleGeneration));
   }
   else if (message.type === 'sf.renderer.worker-lifecycle') {
     const hasStopCode = Object.prototype.hasOwnProperty.call(message, 'stopCode');
@@ -318,6 +319,10 @@ const onPortMessage = (event: MessageEvent): void => {
     if (Number.isSafeInteger(message.wasmBytes)) host.dataset.workerWasmBytes = String(message.wasmBytes);
     if (Number.isSafeInteger(message.wasmProbe)) host.dataset.workerWasmProbe = String(message.wasmProbe);
     if (typeof message.wasmDigest === 'string') host.dataset.workerWasmDigest = message.wasmDigest;
+    if (typeof message.verifierStarted === 'boolean') host.dataset.verifierStarted = String(message.verifierStarted);
+    if (Number.isSafeInteger(message.verifierBytes)) host.dataset.verifierBytes = String(message.verifierBytes);
+    if (Number.isSafeInteger(message.verifierVersion)) host.dataset.verifierVersion = String(message.verifierVersion);
+    if (typeof message.verifierDigest === 'string') host.dataset.verifierDigest = message.verifierDigest;
     if (Number.isSafeInteger(message.generation)) host.dataset.workerGeneration = String(message.generation);
     if (Number.isSafeInteger(message.restartCount)) host.dataset.workerRestartCount = String(message.restartCount);
     if (typeof message.lastReason === 'string') host.dataset.workerLastReason = message.lastReason;

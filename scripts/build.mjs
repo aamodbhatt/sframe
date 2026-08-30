@@ -1,5 +1,5 @@
 import {createHash} from 'node:crypto';
-import {cpSync, mkdirSync, readFileSync, rmSync, writeFileSync} from 'node:fs';
+import {cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync} from 'node:fs';
 import {join} from 'node:path';
 import {spawnSync} from 'node:child_process';
 import ts from 'typescript';
@@ -31,6 +31,26 @@ if (phase0ProbeExports.length !== 1 || phase0WasmExports.some((entry) => !['memo
 const phase0WasmInstance = new WebAssembly.Instance(phase0WasmModule);
 if ((phase0WasmInstance.exports.smallframe_phase0_probe(0x13579bdf) >>> 0) !== 0xf88bbfb9) throw new Error('PHASE0_WASM_PROBE_INVALID');
 const phase0WasmDigest = createHash('sha256').update(phase0Wasm).digest('hex');
+const phase1WasmBuild = spawnSync('cargo', ['build', '--locked', '--release', '--target', 'wasm32-unknown-unknown', '-p', 'smallframe-core', '--no-default-features', '--features', 'wasm'], {cwd: root, stdio: 'inherit'});
+if (phase1WasmBuild.status !== 0) process.exit(phase1WasmBuild.status ?? 1);
+const wasmBindgen = join(root, '.tools', 'bin', 'wasm-bindgen');
+if (!existsSync(wasmBindgen)) throw new Error('PHASE1_WASM_BINDGEN_MISSING: run npm run bootstrap');
+const phase1WasmOutput = join(root, 'target', 'phase1-wasm');
+rmSync(phase1WasmOutput, {recursive: true, force: true});
+mkdirSync(phase1WasmOutput, {recursive: true});
+const phase1Bindgen = spawnSync(wasmBindgen, ['--target', 'web', '--no-typescript', '--out-dir', phase1WasmOutput, '--out-name', 'smallframe_verifier', join(root, 'target', 'wasm32-unknown-unknown', 'release', 'smallframe_core.wasm')], {cwd: root, stdio: 'inherit'});
+if (phase1Bindgen.status !== 0) process.exit(phase1Bindgen.status ?? 1);
+const phase1Wasm = readFileSync(join(phase1WasmOutput, 'smallframe_verifier_bg.wasm'));
+if (phase1Wasm.byteLength < 8 || phase1Wasm.byteLength > 2 * 1024 * 1024 || !phase1Wasm.subarray(0, 8).equals(Buffer.from([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]))) throw new Error('PHASE1_WASM_ARTIFACT_INVALID');
+const phase1WasmDigest = createHash('sha256').update(phase1Wasm).digest('hex');
+const phase1GlueRaw = readFileSync(join(phase1WasmOutput, 'smallframe_verifier.js'), 'utf8');
+const phase1Glue = phase1GlueRaw
+  .replace(/^export \{[^\n]+\};?$/gmu, '')
+  .replace(/^export /gmu, '');
+if (/^\s*(?:import|export)\s/mu.test(phase1Glue) || /^\s*\{[^\n]*\bas\s+(?:default|[A-Za-z_$])/mu.test(phase1Glue)) {
+  throw new Error('PHASE1_WASM_GLUE_MODULE_SYNTAX');
+}
+const phase1GluePrelude = `{\n${phase1Glue}\nglobalThis.__smallframePhase1Verifier = Object.freeze({initSync, wasm_sha256_hex, wasm_verifier_self_test, wasm_verifier_version, wasm_verify_package});\n}\n`;
 const phase0WasmCsp = process.env.SMALLFRAME_U_WASM_CSP ?? 'allow';
 if (!['allow', 'deny'].includes(phase0WasmCsp) || (candidate !== 'U' && phase0WasmCsp !== 'allow')) throw new Error('SMALLFRAME_U_WASM_CSP requires Candidate U and allow|deny');
 const wasmEvalSource = phase0WasmCsp === 'allow' ? " 'wasm-unsafe-eval'" : '';
@@ -72,13 +92,17 @@ if (candidate === 'U') {
   }
   candidateFactorySource = ts.createPrinter({newLine: ts.NewLineKind.LineFeed, removeComments: false}).printFile(parsed).trim();
 }
-const rendererSource = readFileSync(join(dist, 'renderer', 'renderer.js'), 'utf8')
+const rendererProgramSource = readFileSync(join(dist, 'renderer', 'renderer.js'), 'utf8')
   .replaceAll('__ARCHITECTURE_CANDIDATE__', candidate)
   .replaceAll('__CHANNEL_TEST_FIXTURE__', candidateUChannelFixture)
   .replaceAll('__PHASE0_WASM_BASE64__', phase0Wasm.toString('base64'))
   .replaceAll('__PHASE0_WASM_SHA256__', phase0WasmDigest)
   .replaceAll('__PHASE0_WASM_BYTES__', String(phase0Wasm.byteLength))
+  .replaceAll('__PHASE1_WASM_BASE64__', phase1Wasm.toString('base64'))
+  .replaceAll('__PHASE1_WASM_SHA256__', phase1WasmDigest)
+  .replaceAll('__PHASE1_WASM_BYTES__', String(phase1Wasm.byteLength))
   .replaceAll("'__CANDIDATE_FACTORY_SOURCE__'", inlineScriptString(candidateFactorySource));
+const rendererSource = `${phase1GluePrelude}${rendererProgramSource}`;
 const rendererCss = readFileSync(join(root, 'apps/renderer/renderer.css'), 'utf8');
 const rendererBootstrapHash = createHash('sha256').update(rendererSource).digest('base64');
 const rendererCssHash = createHash('sha256').update(rendererCss).digest('base64');
@@ -103,8 +127,9 @@ let main = readFileSync(mainPath, 'utf8').replace(/\nexport \{\};\s*$/u, '').rep
   .replaceAll('__RENDERER_CSS_HASH__', rendererCssHash)
   .replaceAll('__RENDERER_WASM_EVAL_SOURCE__', wasmEvalSource)
   .replaceAll('__PHASE0_WASM_BYTES__', String(phase0Wasm.byteLength))
+  .replaceAll('__PHASE1_WASM_BYTES__', String(phase1Wasm.byteLength))
   .replaceAll('__CHANNEL_TEST_FIXTURE__', candidateUChannelFixture)
   .replaceAll('__ARCHITECTURE_CANDIDATE__', candidate);
 writeFileSync(mainPath, main);
 writeFileSync(join(dist, 'renderer', 'renderer.js'), rendererSource);
-console.log(JSON.stringify({candidate, fixture: fixture || 'valid', channelFixture: candidateUChannelFixture || 'valid', rendererDigest, rendererBytes: Buffer.byteLength(rendererHtml), rendererBootstrapHash, rendererCssHash, phase0WasmBytes: phase0Wasm.byteLength, phase0WasmDigest, phase0WasmCsp, candidateFactory: candidateFactoryPath, candidateFactoryBytes: Buffer.byteLength(candidateFactorySource), candidateFactoryDigest: createHash('sha256').update(candidateFactorySource).digest('hex')}, null, 2));
+console.log(JSON.stringify({candidate, fixture: fixture || 'valid', channelFixture: candidateUChannelFixture || 'valid', rendererDigest, rendererBytes: Buffer.byteLength(rendererHtml), rendererBootstrapHash, rendererCssHash, phase0WasmBytes: phase0Wasm.byteLength, phase0WasmDigest, phase1WasmBytes: phase1Wasm.byteLength, phase1WasmDigest, phase0WasmCsp, candidateFactory: candidateFactoryPath, candidateFactoryBytes: Buffer.byteLength(candidateFactorySource), candidateFactoryDigest: createHash('sha256').update(candidateFactorySource).digest('hex')}, null, 2));
