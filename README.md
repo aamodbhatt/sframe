@@ -83,6 +83,23 @@ npm run cli -- pack ./my-small-app --output ./my-small-app.smallframe \
 
 Recovery export/import accepts an owner-only passphrase file for automation or a no-echo prompt interactively. Output files are create-new and identity recovery bundles are mode `0600` on Unix.
 
+Run the built-in signed Decision Board locally with the production Candidate U boundary:
+
+```bash
+npm run cli -- dev
+```
+
+The command rebuilds exact artifacts and serves only on local loopback at `http://app.localhost:4173/`. It creates no account, room, deployment, or share link. Press `Ctrl-C` to stop.
+
+To run an adapted source directory, initialize a disposable publisher identity and pass the same test store to `dev`:
+
+```bash
+npm run cli -- identity init --test-store /path/to/disposable-store
+npm run cli -- dev ./examples/decision-board/package --test-store /path/to/disposable-store
+```
+
+The source is validated, signed into a temporary package, verified again inside the browser Wasm boundary, and deleted from the temporary directory when the server exits. Validation failures use stable error codes and do not start the runtime.
+
 ## Architecture principles
 
 | Principle | Consequence |
