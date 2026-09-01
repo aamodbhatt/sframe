@@ -1,5 +1,6 @@
 {
   "extends": "../../tsconfig.base.json",
-  "compilerOptions": {"composite": true, "rootDir": "src", "outDir": "../../dist/controller", "types": ["node"]},
-  "include": ["src/**/*.ts"]
+  "compilerOptions": {"composite": true, "rootDir": "src", "outDir": "../../dist/controller", "tsBuildInfoFile": "../../dist/controller.tsbuildinfo", "types": ["node"]},
+  "include": ["src/**/*.ts"],
+  "references": [{"path": "../../packages/protocol"}]
 }

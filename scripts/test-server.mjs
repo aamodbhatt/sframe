@@ -28,7 +28,7 @@ const controllerHeaders = {
 };
 const PROVENANCE_HEADER = 'X-Smallframe-Response-Provenance';
 const serviceWorkerHeaders = {
-  'Content-Security-Policy': "default-src 'none'; script-src 'self'; connect-src http://app.localhost:4173/runtime/renderer/ http://app.localhost:4173/index.html http://app.localhost:4173/main.js http://app.localhost:4173/personal-store.js http://app.localhost:4173/personal-runtime.js http://app.localhost:4173/fixture-module.js http://app.localhost:4173/controller.css http://app.localhost:4173/manifest.webmanifest http://app.localhost:4173/icon.svg http://app.localhost:4173/release.json; worker-src 'none'; child-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; navigate-to 'none'; frame-ancestors 'none'",
+  'Content-Security-Policy': "default-src 'none'; script-src 'self'; connect-src http://app.localhost:4173/runtime/renderer/ http://app.localhost:4173/index.html http://app.localhost:4173/main.js http://app.localhost:4173/personal-store.js http://app.localhost:4173/personal-runtime.js http://app.localhost:4173/shared-store.js http://app.localhost:4173/shared-runtime.js http://app.localhost:4173/fixture-module.js http://app.localhost:4173/controller.css http://app.localhost:4173/manifest.webmanifest http://app.localhost:4173/icon.svg http://app.localhost:4173/release.json; worker-src 'none'; child-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; navigate-to 'none'; frame-ancestors 'none'",
   'Content-Type': 'text/javascript; charset=utf-8',
   'X-Content-Type-Options': 'nosniff',
   'Cache-Control': 'no-store'

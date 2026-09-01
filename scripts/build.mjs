@@ -12,8 +12,9 @@ if (!['original', 'R', 'A', 'S', 'T', 'U'].includes(candidate)) throw new Error(
 const dist = join(root, 'dist');
 rmSync(dist, {recursive: true, force: true});
 mkdirSync(dist, {recursive: true});
+const childEnv = {...process.env, CC: '/usr/bin/cc', PATH: `/usr/bin:/bin:/usr/sbin:/sbin:${process.env.PATH ?? ''}`};
 const run = (args) => {
-  const result = spawnSync('npx', ['tsc', ...args], {cwd: root, stdio: 'inherit'});
+  const result = spawnSync('npx', ['tsc', ...args], {cwd: root, stdio: 'inherit', env: childEnv});
   if (result.status !== 0) process.exit(result.status ?? 1);
 };
 const inlineScriptString = (value) => JSON.stringify(value)
@@ -21,7 +22,7 @@ const inlineScriptString = (value) => JSON.stringify(value)
   .replaceAll('\u2028', '\\u2028')
   .replaceAll('\u2029', '\\u2029');
 run(['-b', 'tsconfig.json']);
-const wasmBuild = spawnSync('cargo', ['build', '--locked', '--release', '--target', 'wasm32-unknown-unknown', '-p', 'smallframe-phase0-wasm'], {cwd: root, stdio: 'inherit'});
+const wasmBuild = spawnSync('cargo', ['build', '--locked', '--release', '--target', 'wasm32-unknown-unknown', '-p', 'smallframe-phase0-wasm'], {cwd: root, stdio: 'inherit', env: childEnv});
 if (wasmBuild.status !== 0) process.exit(wasmBuild.status ?? 1);
 const phase0Wasm = readFileSync(join(root, 'target', 'wasm32-unknown-unknown', 'release', 'smallframe_phase0_wasm.wasm'));
 if (phase0Wasm.byteLength < 8 || phase0Wasm.byteLength > 65_536 || !phase0Wasm.subarray(0, 8).equals(Buffer.from([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]))) throw new Error('PHASE0_WASM_ARTIFACT_INVALID');
@@ -33,14 +34,14 @@ if (phase0ProbeExports.length !== 1 || phase0WasmExports.some((entry) => !['memo
 const phase0WasmInstance = new WebAssembly.Instance(phase0WasmModule);
 if ((phase0WasmInstance.exports.smallframe_phase0_probe(0x13579bdf) >>> 0) !== 0xf88bbfb9) throw new Error('PHASE0_WASM_PROBE_INVALID');
 const phase0WasmDigest = createHash('sha256').update(phase0Wasm).digest('hex');
-const phase1WasmBuild = spawnSync('cargo', ['build', '--locked', '--release', '--target', 'wasm32-unknown-unknown', '-p', 'smallframe-core', '--no-default-features', '--features', 'wasm'], {cwd: root, stdio: 'inherit'});
+const phase1WasmBuild = spawnSync('cargo', ['build', '--locked', '--release', '--target', 'wasm32-unknown-unknown', '-p', 'smallframe-core', '--no-default-features', '--features', 'wasm'], {cwd: root, stdio: 'inherit', env: childEnv});
 if (phase1WasmBuild.status !== 0) process.exit(phase1WasmBuild.status ?? 1);
 const wasmBindgen = join(root, '.tools', 'bin', 'wasm-bindgen');
 if (!existsSync(wasmBindgen)) throw new Error('PHASE1_WASM_BINDGEN_MISSING: run npm run bootstrap');
 const phase1WasmOutput = join(root, 'target', 'phase1-wasm');
 rmSync(phase1WasmOutput, {recursive: true, force: true});
 mkdirSync(phase1WasmOutput, {recursive: true});
-const phase1Bindgen = spawnSync(wasmBindgen, ['--target', 'web', '--no-typescript', '--out-dir', phase1WasmOutput, '--out-name', 'smallframe_verifier', join(root, 'target', 'wasm32-unknown-unknown', 'release', 'smallframe_core.wasm')], {cwd: root, stdio: 'inherit'});
+const phase1Bindgen = spawnSync(wasmBindgen, ['--target', 'web', '--no-typescript', '--out-dir', phase1WasmOutput, '--out-name', 'smallframe_verifier', join(root, 'target', 'wasm32-unknown-unknown', 'release', 'smallframe_core.wasm')], {cwd: root, stdio: 'inherit', env: childEnv});
 if (phase1Bindgen.status !== 0) process.exit(phase1Bindgen.status ?? 1);
 const phase1Wasm = readFileSync(join(phase1WasmOutput, 'smallframe_verifier_bg.wasm'));
 if (phase1Wasm.byteLength < 8 || phase1Wasm.byteLength > 2 * 1024 * 1024 || !phase1Wasm.subarray(0, 8).equals(Buffer.from([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]))) throw new Error('PHASE1_WASM_ARTIFACT_INVALID');
@@ -148,9 +149,11 @@ let main = readFileSync(mainPath, 'utf8').replace(/\nexport \{\};\s*$/u, '').rep
   .replaceAll('__PHASE2_EXPECTED_KEY_ID__', phase2ExpectedKeyId)
   .replaceAll('__ARCHITECTURE_CANDIDATE__', candidate);
 writeFileSync(mainPath, main);
-for (const helper of ['personal-store.js', 'personal-runtime.js']) {
+for (const helper of ['personal-store.js', 'personal-runtime.js', 'shared-store.js', 'shared-runtime.js']) {
   const helperPath = join(controller, helper);
-  writeFileSync(helperPath, readFileSync(helperPath, 'utf8').replace(/\nexport \{\};\s*$/u, '\n'));
+  if (existsSync(helperPath)) {
+    writeFileSync(helperPath, readFileSync(helperPath, 'utf8').replace(/\nexport \{\};\s*$/u, '\n'));
+  }
 }
 
 const staticPaths = [
@@ -162,6 +165,8 @@ const staticPaths = [
   '/manifest.webmanifest',
   '/personal-runtime.js',
   '/personal-store.js',
+  '/shared-runtime.js',
+  '/shared-store.js',
   `/runtime/renderer/${rendererDigest}.html`
 ].sort();
 const controllerAssetSet = {};

@@ -75,10 +75,12 @@ const problem = (status: number, code: string): Response => new Response(JSON.st
   status,
 }), {status, headers: {'Content-Type': 'application/problem+json; charset=utf-8', 'Cache-Control': 'no-store'}});
 
-const parseRoomRoute = (pathname: string): {roomId: string; action: 'state' | 'events' | 'events-ticket' | 'socket'} | null => {
-  const match = /^\/v1\/rooms\/([A-Za-z0-9_-]{22})\/(state|events|events-ticket|socket)$/u.exec(pathname);
+const parseRoomRoute = (pathname: string): {roomId: string; action: 'meta' | 'state' | 'events' | 'events-ticket' | 'socket' | 'rotate-links' | 'revoke' | 'request-repair' | 'recover'} | null => {
+  const metaMatch = /^\/v1\/rooms\/([A-Za-z0-9_-]{22})$/u.exec(pathname);
+  if (metaMatch && ROOM_ID_RE.test(metaMatch[1]!)) return {roomId: metaMatch[1]!, action: 'meta'};
+  const match = /^\/v1\/rooms\/([A-Za-z0-9_-]{22})\/(state|events|events-ticket|socket|rotate-links|revoke|request-repair|recover)$/u.exec(pathname);
   if (!match || !match[1] || !match[2] || !ROOM_ID_RE.test(match[1])) return null;
-  return {roomId: match[1], action: match[2] as 'state' | 'events' | 'events-ticket' | 'socket'};
+  return {roomId: match[1], action: match[2] as 'meta' | 'state' | 'events' | 'events-ticket' | 'socket' | 'rotate-links' | 'revoke' | 'request-repair' | 'recover'};
 };
 
 const bytesFromSql = (value: ArrayBuffer): Uint8Array => new Uint8Array(value);
@@ -164,8 +166,7 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
     return this.withControllerCors(request, response);
   }
 
-  private async routeRequest(request: Request): Promise<Response> {
-    const url = new URL(request.url);
+  private async dispatchPhase0(url: URL, request: Request): Promise<Response | null> {
     const initMatch = /^\/__phase0\/rooms\/([A-Za-z0-9_-]{22})\/init$/u.exec(url.pathname);
     const initRoomId = initMatch?.[1];
     if (initRoomId && ROOM_ID_RE.test(initRoomId)) return this.initializeForPhase0(initRoomId, request);
@@ -176,6 +177,33 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
       if (!room) return problem(404, 'NOT_FOUND');
       return new Response(JSON.stringify({waiters: this.waiters.size, sockets: this.ctx.getWebSockets().length}), {headers: jsonHeaders});
     }
+    return null;
+  }
+
+  private async dispatchAction(action: string, request: Request, room: RoomRow): Promise<Response> {
+    const method = request.method;
+    if (method === 'GET') {
+      if (action === 'meta') return this.getMetadata(request, room);
+      if (action === 'state') return this.getState(request, room);
+      if (action === 'events') return this.heldEvents(request, room);
+      if (action === 'socket') return this.upgradeSocket(request, room);
+    } else if (method === 'POST') {
+      if (action === 'events-ticket') return this.mintTicket(request, room);
+      if (action === 'rotate-links') return this.rotateLinks(request, room);
+      if (action === 'revoke') return this.revokeRoom(request, room);
+      if (action === 'request-repair') return this.requestRepair(request, room);
+      if (action === 'recover') return this.recoverRoom(request, room);
+    } else if (method === 'PUT' && action === 'state') {
+      return this.putState(request, room);
+    }
+    return problem(405, 'METHOD_NOT_ALLOWED');
+  }
+
+  private async routeRequest(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const phase0 = await this.dispatchPhase0(url, request);
+    if (phase0) return phase0;
+
     const route = parseRoomRoute(url.pathname);
     if (!route) return problem(404, 'NOT_FOUND');
     if (route.action !== 'socket' && request.headers.get('Origin') !== this.controllerOrigin) {
@@ -185,12 +213,96 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
     const room = this.loadRoom(route.roomId);
     if (!room) return problem(404, 'NOT_FOUND');
 
-    if (route.action === 'state' && request.method === 'GET') return this.getState(request, room);
-    if (route.action === 'state' && request.method === 'PUT') return this.putState(request, room);
-    if (route.action === 'events' && request.method === 'GET') return this.heldEvents(request, room);
-    if (route.action === 'events-ticket' && request.method === 'POST') return this.mintTicket(request, room);
-    if (route.action === 'socket' && request.method === 'GET') return this.upgradeSocket(request, room);
-    return problem(405, 'METHOD_NOT_ALLOWED');
+    return this.dispatchAction(route.action, request, room);
+  }
+
+  private async getMetadata(request: Request, room: RoomRow): Promise<Response> {
+    if (!await this.authorize(request, room)) return problem(403, 'ROOM_AUTH_INVALID');
+    return new Response(JSON.stringify({
+      roomId: room.room_id,
+      stateEpoch: room.state_epoch,
+      revision: room.revision,
+      envelopeDigest: room.envelope_digest,
+      etag: room.etag,
+      expiresAtMs: room.expires_at_ms,
+      isRevoked: room.revoked_at_ms !== null,
+    }), {headers: jsonHeaders});
+  }
+
+  private async rotateLinks(request: Request, room: RoomRow): Promise<Response> {
+    if (!await this.authorize(request, room, true)) return problem(403, 'ROOM_AUTH_INVALID');
+    let body: any;
+    try {
+      body = await request.json();
+    } catch {
+      return problem(400, 'BODY_INVALID');
+    }
+    const viewerHash = decodeFixed32(body?.viewerCapHash);
+    const editorHash = decodeFixed32(body?.editorCapHash);
+    if (!viewerHash || !editorHash) return problem(400, 'BODY_INVALID');
+
+    this.ctx.storage.sql.exec(
+      `UPDATE room_state SET viewer_cap_hash = ?, editor_cap_hash = ? WHERE singleton = 1 AND room_id = ?`,
+      exactArrayBuffer(viewerHash),
+      exactArrayBuffer(editorHash),
+      room.room_id
+    ).toArray();
+
+    for (const socket of this.ctx.getWebSockets()) {
+      try { socket.close(1008, 'links rotated'); } catch {}
+    }
+    return new Response(JSON.stringify({ok: true}), {headers: jsonHeaders});
+  }
+
+  private async revokeRoom(request: Request, room: RoomRow): Promise<Response> {
+    if (!await this.authorize(request, room, true)) return problem(403, 'ROOM_AUTH_INVALID');
+    const now = Date.now();
+    this.ctx.storage.sql.exec(
+      `UPDATE room_state SET revoked_at_ms = ? WHERE singleton = 1 AND room_id = ?`,
+      now,
+      room.room_id
+    ).toArray();
+
+    for (const socket of this.ctx.getWebSockets()) {
+      try { socket.close(1008, 'room revoked'); } catch {}
+    }
+    return new Response(JSON.stringify({ok: true, revokedAt: now}), {headers: jsonHeaders});
+  }
+
+  private async requestRepair(request: Request, room: RoomRow): Promise<Response> {
+    if (!await this.authorize(request, room, true)) return problem(403, 'ROOM_AUTH_INVALID');
+    for (const socket of this.ctx.getWebSockets()) {
+      try { socket.close(1008, 'recovery required'); } catch {}
+    }
+    return new Response(JSON.stringify({ok: true, status: 'RECOVERY_REQUIRED'}), {headers: jsonHeaders});
+  }
+
+  private async recoverRoom(request: Request, room: RoomRow): Promise<Response> {
+    if (!await this.authorize(request, room, true)) return problem(403, 'ROOM_AUTH_INVALID');
+    let body: any;
+    try {
+      body = await request.json();
+    } catch {
+      return problem(400, 'BODY_INVALID');
+    }
+    const newEpoch = typeof body?.newEpoch === 'number' ? body.newEpoch : room.state_epoch + 1;
+    const ciphertext = typeof body?.ciphertext === 'string' ? decodeBase64Url(body.ciphertext, MAX_STATE_BYTES) : null;
+    if (!ciphertext) return problem(400, 'BODY_INVALID');
+    const digest = encodeBase64Url(await sha256(ciphertext));
+    const etag = this.etag(newEpoch, 1, digest);
+
+    this.ctx.storage.sql.exec(
+      `UPDATE room_state SET state_epoch = ?, revision = 1, envelope_digest = ?, ciphertext = ?, etag = ? WHERE singleton = 1 AND room_id = ?`,
+      newEpoch,
+      digest,
+      exactArrayBuffer(ciphertext),
+      etag,
+      room.room_id
+    ).toArray();
+
+    const hint: RevisionHint = {type: 'revision', epoch: newEpoch, revision: 1, envelopeDigest: digest};
+    this.publishHint(hint);
+    return new Response(JSON.stringify({ok: true, epoch: newEpoch, revision: 1, etag}), {headers: jsonHeaders});
   }
 
   async initializeForPhase0(roomId: string, request: Request): Promise<Response> {

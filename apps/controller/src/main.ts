@@ -8,12 +8,39 @@ const PHASE2_PACKAGE_BASE64 = '__PHASE2_PACKAGE_BASE64__';
 const PHASE2_DEFAULT = Boolean(Number('__PHASE2_DEFAULT_FLAG__'));
 const PHASE2_EXPECTED_DIGEST = '__PHASE2_EXPECTED_DIGEST__';
 const PHASE2_EXPECTED_KEY_ID = '__PHASE2_EXPECTED_KEY_ID__';
-const PERSONAL_MODE = Boolean(PHASE2_DEFAULT || new URLSearchParams(location.search).get('personal') === '1');
-const USES_CLASSIC_WORKER = ARCHITECTURE_CANDIDATE === 'S' || ARCHITECTURE_CANDIDATE === 'T' || ARCHITECTURE_CANDIDATE === 'U' || PERSONAL_MODE;
-const IS_CANDIDATE_U = ARCHITECTURE_CANDIDATE === 'U' || PERSONAL_MODE;
-const PERSONAL_ROLE: 'viewer' | 'editor' = new URLSearchParams(location.search).get('role') === 'viewer' ? 'viewer' : 'editor';
-const executionRole = (): 'viewer' | 'editor' => PERSONAL_MODE ? PERSONAL_ROLE : 'editor';
-const executionIsReadOnly = (): boolean => PERSONAL_MODE && PERSONAL_ROLE === 'viewer';
+const initialHash = window.location.hash;
+let parsedInvite: any = undefined;
+if (initialHash.includes('v=1&d=') || initialHash.includes('d=')) {
+  try {
+    const rawFragment = initialHash.startsWith('#') ? initialHash.slice(1) : initialHash;
+    const params = new URLSearchParams(rawFragment);
+    const d = params.get('d');
+    const s = params.get('s');
+    const k = params.get('k');
+    const c = params.get('c');
+    const w = params.get('w');
+    if (d && s && k && c) {
+      const descriptorJson = atob(d.replace(/-/g, '+').replace(/_/g, '/'));
+      const descriptor = JSON.parse(descriptorJson);
+      parsedInvite = {
+        version: 1,
+        descriptor,
+        descriptorSignature: Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/')), ch => ch.charCodeAt(0)),
+        roomKey: Uint8Array.from(atob(k.replace(/-/g, '+').replace(/_/g, '/')), ch => ch.charCodeAt(0)),
+        capability: Uint8Array.from(atob(c.replace(/-/g, '+').replace(/_/g, '/')), ch => ch.charCodeAt(0)),
+        writerPrivateSeed: w ? Uint8Array.from(atob(w.replace(/-/g, '+').replace(/_/g, '/')), ch => ch.charCodeAt(0)) : undefined
+      };
+    }
+  } catch (_) {}
+}
+
+const SHARED_MODE = Boolean(parsedInvite || new URLSearchParams(location.search).get('room') === '1');
+const PERSONAL_MODE = Boolean(!SHARED_MODE && (PHASE2_DEFAULT || new URLSearchParams(location.search).get('personal') === '1'));
+const USES_CLASSIC_WORKER = ARCHITECTURE_CANDIDATE === 'S' || ARCHITECTURE_CANDIDATE === 'T' || ARCHITECTURE_CANDIDATE === 'U' || PERSONAL_MODE || SHARED_MODE;
+const IS_CANDIDATE_U = ARCHITECTURE_CANDIDATE === 'U' || PERSONAL_MODE || SHARED_MODE;
+const PERSONAL_ROLE: 'viewer' | 'editor' = (parsedInvite?.descriptor?.role ?? (new URLSearchParams(location.search).get('role') === 'viewer' ? 'viewer' : 'editor')) as 'viewer' | 'editor';
+const executionRole = (): 'viewer' | 'editor' => SHARED_MODE ? (parsedInvite?.descriptor?.role ?? 'editor') : PERSONAL_MODE ? PERSONAL_ROLE : 'editor';
+const executionIsReadOnly = (): boolean => (SHARED_MODE && parsedInvite?.descriptor?.role === 'viewer') || (PERSONAL_MODE && PERSONAL_ROLE === 'viewer');
 const RENDERER_PATH = `/runtime/renderer/${RENDERER_DIGEST}.html`;
 const MAX_RENDERER_BYTES = 2 * 1024 * 1024;
 const REQUIRED_RENDERER_CSP = "default-src 'none'; script-src 'sha256-__RENDERER_BOOTSTRAP_HASH__'__RENDERER_WASM_EVAL_SOURCE__ blob:; style-src 'sha256-__RENDERER_CSS_HASH__'; img-src 'none'; font-src 'none'; connect-src 'none'; worker-src blob:; child-src 'none'; frame-src 'none'; media-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; navigate-to 'none'; frame-ancestors http://app.localhost:4173; sandbox allow-scripts; require-trusted-types-for 'script'; trusted-types smallframe-renderer-worker";
@@ -132,9 +159,11 @@ const readVerifiedRenderer = async (): Promise<string> => {
 };
 
 const phase2InitFields = (): {fields: Record<string, unknown>; packageBytes?: Uint8Array<ArrayBuffer>} => {
-  if (!PERSONAL_MODE) return {fields: {}};
+  if (!PERSONAL_MODE && !SHARED_MODE) return {fields: {}};
   const packageBytes = personalArchive.slice();
-  return {fields: {packageBytes, expectedPackageDigest: PHASE2_EXPECTED_DIGEST, expectedPublisherKeyId: PHASE2_EXPECTED_KEY_ID}, packageBytes};
+  const expectedPackageDigest = parsedInvite?.descriptor?.packageDigest ?? PHASE2_EXPECTED_DIGEST;
+  const expectedPublisherKeyId = parsedInvite?.descriptor?.publisherKeyId ?? PHASE2_EXPECTED_KEY_ID;
+  return {fields: {packageBytes, expectedPackageDigest, expectedPublisherKeyId}, packageBytes};
 };
 
 const postRendererInit = (target: Window | null, init: Record<string, unknown>, channelPort: MessagePort, packageBytes?: Uint8Array<ArrayBuffer>): void => {
@@ -324,7 +353,7 @@ const startFrame = async (rendererHtml?: string): Promise<void> => {
 type RendererMessage = {channel?: unknown; protocol?: unknown; session?: unknown; sequence?: unknown; type?: unknown; tree?: unknown; error?: unknown; requestId?: unknown; operations?: unknown; validationId?: unknown; valid?: unknown; workerKind?: unknown; blobCount?: unknown; workerSelfOrigin?: unknown; workerLocationOrigin?: unknown; workerLocationHref?: unknown; wasmStarted?: unknown; wasmBytes?: unknown; wasmProbe?: unknown; wasmDigest?: unknown; verifierStarted?: unknown; verifierBytes?: unknown; verifierVersion?: unknown; verifierDigest?: unknown; state?: unknown; generation?: unknown; restartCount?: unknown; lastReason?: unknown; stopCode?: unknown; packageDigest?: unknown; artifactDigest?: unknown; publisherKeyId?: unknown; publisherPublicKey?: unknown; publisherDisplayName?: unknown; appName?: unknown; appVersion?: unknown; description?: unknown; capabilities?: unknown; publicTemplate?: unknown; maxPlaintextBytes?: unknown; declaredMode?: unknown};
 
 const validPersonalMetadata = (message: RendererMessage, baseKeys: string[]): boolean => {
-  if (!PERSONAL_MODE || workerLifecycleState !== 'idle') return false;
+  if ((!PERSONAL_MODE && !SHARED_MODE) || workerLifecycleState !== 'idle') return false;
   const fields = ['packageDigest', 'artifactDigest', 'publisherKeyId', 'publisherPublicKey', 'publisherDisplayName', 'appName', 'appVersion', 'description', 'capabilities', 'publicTemplate', 'maxPlaintextBytes', 'declaredMode'];
   if (!exactKeys(message, [...baseKeys, ...fields])) return false;
   const stringFields = fields.slice(0, 8);
@@ -458,7 +487,10 @@ const onPortMessage = (event: MessageEvent): void => {
     const withLifecycle = Object.prototype.hasOwnProperty.call(message, 'generation') || Object.prototype.hasOwnProperty.call(message, 'restartCount');
     schemaValid = exactKeys(message, withLifecycle ? [...baseKeys, 'error', 'generation', 'restartCount'] : [...baseKeys, 'error']) && typeof message.error === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/u.test(message.error) && (!withLifecycle || (Number.isSafeInteger(message.generation) && Number.isSafeInteger(message.restartCount)));
   }
-  if (!schemaValid) { terminateControllerChannel(message.type === 'sf.renderer.worker-lifecycle' ? 'CHANNEL_STATE_TRANSITION_INVALID' : 'CHANNEL_MESSAGE_SCHEMA', true); return; }
+  if (!schemaValid) {
+    terminateControllerChannel(message.type === 'sf.renderer.worker-lifecycle' ? 'CHANNEL_STATE_TRANSITION_INVALID' : 'CHANNEL_MESSAGE_SCHEMA', true);
+    return;
+  }
   window.clearTimeout(rendererInitTimer);
   expectedPortSequence += 1;
   try {
@@ -517,7 +549,22 @@ const onPortMessage = (event: MessageEvent): void => {
 const main = async (): Promise<void> => {
   const module = (window as Window & {SMALLFRAME_APP_MODULE?: string}).SMALLFRAME_APP_MODULE;
   if (!USES_CLASSIC_WORKER && !module) throw new Error('APP_MODULE_MISSING');
-  if (PERSONAL_MODE) {
+  if (SHARED_MODE && parsedInvite) {
+    const binary = atob(PHASE2_PACKAGE_BASE64);
+    personalArchive = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+    const sharedRuntime = (globalThis as typeof globalThis & {SmallframeSharedRuntime?: {createSession: (options: any) => PersonalSession}}).SmallframeSharedRuntime;
+    if (!sharedRuntime) throw new Error('SHARED_RUNTIME_MISSING');
+    personalSession = sharedRuntime.createSession({
+      invite: parsedInvite,
+      archive: personalArchive,
+      apiOrigin: 'http://api.localhost:8787',
+      onApprove: (state: Record<string, unknown>, role: 'viewer' | 'editor') => {
+        localState = structuredClone(state);
+        post('sf.controller.approval', {state: localState, role});
+      },
+      onReplaceState: async (state: Record<string, unknown>) => replaceLocalState(structuredClone(state))
+    });
+  } else if (PERSONAL_MODE) {
     const binary = atob(PHASE2_PACKAGE_BASE64);
     personalArchive = Uint8Array.from(binary, (character) => character.charCodeAt(0));
     const runtime = (globalThis as typeof globalThis & {SmallframePersonalRuntime?: {createSession: (options: {archive: Uint8Array; role: 'viewer' | 'editor'; onApprove: (state: Record<string, unknown>, role: 'viewer' | 'editor') => void; onReplaceState: (state: Record<string, unknown>) => Promise<void>}) => PersonalSession}}).SmallframePersonalRuntime;
@@ -526,7 +573,7 @@ const main = async (): Promise<void> => {
   } else {
     byId<HTMLElement>('runtime-panel').hidden = false;
   }
-  byId('status').textContent = PERSONAL_MODE ? 'Verifying signed package…' : 'Verifying renderer…';
+  byId('status').textContent = (SHARED_MODE || PERSONAL_MODE) ? 'Verifying signed package…' : 'Verifying renderer…';
   const rendererHtml = await setupServiceWorker();
   await startFrame(rendererHtml);
 };
@@ -541,7 +588,7 @@ const reopenRendererForPhase0 = async (): Promise<void> => {
 };
 
 if (IS_CANDIDATE_U) {
-  if (window.location.hash) history.replaceState(null, document.title, `${window.location.pathname}${window.location.search}`);
+  if (initialHash) history.replaceState(null, document.title, `${window.location.pathname}${window.location.search}`);
   Object.defineProperty(window, '__smallframePhase0ReopenRenderer', {value: reopenRendererForPhase0, configurable: false, enumerable: false, writable: false});
 }
 

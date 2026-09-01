@@ -7,12 +7,17 @@ type WorkerEnvironment = RoomEnvironment & {
   ROOMS: DurableObjectNamespace;
 };
 
-const PUBLIC_ROOM_ROUTE = /^\/v1\/rooms\/([A-Za-z0-9_-]{22})\/(state|events|events-ticket|socket)$/u;
-const PREFLIGHT_METHODS = Object.freeze({
+const PUBLIC_ROOM_ROUTE = /^\/v1\/rooms\/([A-Za-z0-9_-]{22})(?:\/(state|events|events-ticket|socket|rotate-links|revoke|request-repair|recover))?$/u;
+const PREFLIGHT_METHODS: Record<string, Set<string>> = Object.freeze({
+  '': new Set(['GET']),
   state: new Set(['GET', 'PUT']),
   events: new Set(['GET']),
   'events-ticket': new Set(['POST']),
   socket: new Set<string>(),
+  'rotate-links': new Set(['POST']),
+  revoke: new Set(['POST']),
+  'request-repair': new Set(['POST']),
+  recover: new Set(['POST']),
 });
 const PREFLIGHT_HEADERS = new Set(['authorization', 'content-type', 'if-match', 'if-none-match', 'sf-known-epoch']);
 
@@ -35,18 +40,19 @@ const worker = {
     if (!roomId || !ROOM_ID_RE.test(roomId)) return respond(problem(404, 'NOT_FOUND'));
     if (request.method === 'OPTIONS') {
       if (request.headers.get('Origin') !== config.cors.allowOrigin) return respond(problem(403, 'ORIGIN_INVALID'));
-      const action = match?.[2] as keyof typeof PREFLIGHT_METHODS;
+      const action = (match?.[2] ?? '') as keyof typeof PREFLIGHT_METHODS;
+      const methods = PREFLIGHT_METHODS[action];
       const requestedMethod = request.headers.get('Access-Control-Request-Method');
       const requestedHeaders = (request.headers.get('Access-Control-Request-Headers') ?? '')
         .split(',')
         .map((header) => header.trim().toLowerCase())
         .filter(Boolean);
-      if (!requestedMethod || !PREFLIGHT_METHODS[action].has(requestedMethod) || requestedHeaders.some((header) => !PREFLIGHT_HEADERS.has(header))) {
+      if (!requestedMethod || !methods || !methods.has(requestedMethod) || requestedHeaders.some((header) => !PREFLIGHT_HEADERS.has(header))) {
         return respond(problem(403, 'PREFLIGHT_INVALID'));
       }
       return respond(new Response(null, {status: 204, headers: {
         'Access-Control-Allow-Origin': config.cors.allowOrigin,
-        'Access-Control-Allow-Methods': [...PREFLIGHT_METHODS[action]].join(', '),
+        'Access-Control-Allow-Methods': [...methods].join(', '),
         'Access-Control-Allow-Headers': [...PREFLIGHT_HEADERS].join(', '),
         'Access-Control-Max-Age': '0',
         'Cache-Control': 'no-store',

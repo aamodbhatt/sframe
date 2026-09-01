@@ -23,7 +23,7 @@
     "test:phase0:u": "node scripts/test-candidate-u.mjs",
     "typecheck": "tsc -b tsconfig.json",
     "lint": "node scripts/lint.mjs",
-    "complexity": "node scripts/check-complexity.mjs && cargo clippy --locked --workspace --all-targets -- -W clippy::cognitive-complexity -D warnings",
+    "complexity": "node scripts/check-complexity.mjs && CC=/usr/bin/cc PATH=\"/usr/bin:/bin:/usr/sbin:/sbin:$PATH\" cargo clippy --locked --workspace --all-targets -- -W clippy::cognitive-complexity -D warnings",
     "check": "npm run doctor && npm run build && npm run complexity && npm test && npm run test:e2e",
     "dev": "node scripts/dev.mjs",
     "cli": "cargo run -q -p smallframe-cli --",
