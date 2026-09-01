@@ -8,7 +8,7 @@ type PersonalStoreApi = {
 };
 type PackageMetadata = {packageDigest: string; artifactDigest: string; publisherKeyId: string; publisherPublicKey: string; publisherDisplayName: string; appName: string; appVersion: string; description: string; capabilities: string[]; publicTemplate: Record<string, unknown>; maxPlaintextBytes: number; declaredMode: 'personal' | 'shared'};
 type PersonalSession = {handleVerified: (metadata: PackageMetadata) => Promise<void>; stateChanged: (state: Record<string, unknown>, revision: number) => Promise<void>};
-type SessionOptions = {archive: Uint8Array; role: 'viewer' | 'editor'; onApprove: (state: Record<string, unknown>, role: 'viewer' | 'editor') => void; onReplaceState: (state: Record<string, unknown>) => void};
+type SessionOptions = {archive: Uint8Array; role: 'viewer' | 'editor'; onApprove: (state: Record<string, unknown>, role: 'viewer' | 'editor') => void; onReplaceState: (state: Record<string, unknown>) => Promise<void>};
 
 const element = <T extends HTMLElement>(id: string): T => {
   const value = document.getElementById(id);
@@ -109,9 +109,10 @@ const createSession = (options: SessionOptions): PersonalSession => {
       if (new TextEncoder().encode(body).byteLength > metadata!.maxPlaintextBytes) throw new Error('STATE_TOO_LARGE');
       const parsed: unknown = JSON.parse(body);
       if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('STATE_INVALID');
-      currentState = structuredClone(parsed as Record<string, unknown>);
+      const nextState = structuredClone(parsed as Record<string, unknown>);
+      await options.onReplaceState(nextState);
+      currentState = nextState;
       revision += 1;
-      options.onReplaceState(structuredClone(currentState));
       await persist();
     }).catch((error: unknown) => { element('status').textContent = `Import rejected: ${error instanceof Error ? error.message : 'STATE_INVALID'}`; }).finally(() => { input.value = ''; });
   });

@@ -3,7 +3,9 @@ use crate::{
     encoding::{decode_base64url_fixed, encode_base64url},
     hex_digest,
     package::sha256,
-    prepare_classic_module_source, verify_package_archive,
+    prepare_classic_module_source,
+    state_schema::validate_state_schema,
+    verify_package_archive,
 };
 use serde_json::json;
 use wasm_bindgen::prelude::*;
@@ -28,6 +30,21 @@ pub fn wasm_canonical_json(input: &str) -> std::result::Result<String, JsValue> 
 #[wasm_bindgen]
 pub fn wasm_sha256_hex(input: &[u8]) -> String {
     hex_digest(&sha256(input))
+}
+
+#[wasm_bindgen]
+pub fn wasm_validate_state(schema_json: &str, state_json: &str, max_bytes: u32) -> String {
+    if state_json.as_bytes().len() > max_bytes as usize || max_bytes > 393_216 {
+        return json!({"ok": false, "error": {"code": "STATE_SIZE_LIMIT"}}).to_string();
+    }
+    let result = crate::parse_strict_json(schema_json.as_bytes()).and_then(|schema| {
+        crate::parse_strict_json(state_json.as_bytes())
+            .and_then(|state| validate_state_schema(&schema, &state))
+    });
+    match result {
+        Ok(()) => json!({"ok": true}).to_string(),
+        Err(_) => json!({"ok": false, "error": {"code": "STATE_SCHEMA_INVALID"}}).to_string(),
+    }
 }
 
 fn expected_digest(value: &str) -> std::result::Result<Option<[u8; 32]>, CoreError> {

@@ -52,11 +52,14 @@ type Phase1VerifierGlue = {
   wasm_verifier_self_test: () => boolean;
   wasm_verifier_version: () => number;
   wasm_verify_package: (archive: Uint8Array, expectedDigest: string, expectedKeyId: string) => string;
+  wasm_validate_state: (schemaJson: string, stateJson: string, maxBytes: number) => string;
 };
 let phase1Verifier: Phase1VerifierGlue | undefined;
 let phase1VerifierStarted = false;
 let preparedModuleSource = '';
 let packageApprovalPending = false;
+let preparedStateSchema: Record<string, unknown> | undefined;
+let preparedStateMaxBytes = 0;
 const startPhase1Verifier = (): boolean => {
   try {
     const glue = (globalThis as typeof globalThis & {__smallframePhase1Verifier?: Phase1VerifierGlue}).__smallframePhase1Verifier;
@@ -87,6 +90,15 @@ const preparePhase2Package = (archive: Uint8Array, expectedDigest: string, expec
   if (result.ok !== true) throw new Error(typeof result.error?.code === 'string' ? result.error.code : 'PACKAGE_VERIFY_FAILED');
   if (!isPlainRecord(result.manifest) || typeof result.moduleSource !== 'string' || result.moduleSource.length > 786432 || typeof result.packageDigest !== 'string' || typeof result.artifactDigest !== 'string' || typeof result.publisherKeyId !== 'string') throw new Error('PACKAGE_VERIFY_RESULT_INVALID');
   return result as PreparedPackage;
+};
+const validatePreparedState = (state: unknown): {ok: boolean; error: string} => {
+  if (!phase1Verifier || !preparedStateSchema || preparedStateMaxBytes < 1) return {ok: false, error: 'STATE_VALIDATOR_NOT_READY'};
+  try {
+    const result = JSON.parse(phase1Verifier.wasm_validate_state(JSON.stringify(preparedStateSchema), JSON.stringify(state), preparedStateMaxBytes)) as {ok?: unknown; error?: {code?: unknown}};
+    return result.ok === true ? {ok: true, error: ''} : {ok: false, error: typeof result.error?.code === 'string' ? result.error.code : 'STATE_SCHEMA_INVALID'};
+  } catch (_) {
+    return {ok: false, error: 'STATE_SCHEMA_INVALID'};
+  }
 };
 type WorkerTrustedTypesPolicy = {createScriptURL: (url: string) => unknown};
 let workerPolicy: WorkerTrustedTypesPolicy | undefined;
@@ -1025,9 +1037,10 @@ const terminateParentChannel = (reason: string): void => {
   port = undefined;
 };
 
-type ControllerMessage = PortMessage & {state?: unknown; role?: unknown; online?: unknown; revision?: unknown; result?: unknown};
+type ControllerMessage = PortMessage & {state?: unknown; role?: unknown; online?: unknown; revision?: unknown; result?: unknown; validationId?: unknown};
 const acceptSnapshot = (message: ControllerMessage, baseKeys: string[]): void => {
   if (!exactKeys(message, [...baseKeys, 'state', 'role', 'online', 'revision']) || !isPlainRecord(message.state) || (message.role !== 'editor' && message.role !== 'viewer') || typeof message.online !== 'boolean' || !Number.isSafeInteger(message.revision) || Number(message.revision) < 0) { terminateParentChannel('CHANNEL_MESSAGE_SCHEMA'); return; }
+  if (preparedStateSchema && !validatePreparedState(message.state).ok) { terminateParentChannel('STATE_SCHEMA_INVALID'); return; }
   try {
     const nextState = structuredClone(message.state);
     sendWorker('snapshot', {state: nextState, role: message.role, online: message.online, revision: message.revision});
@@ -1037,6 +1050,7 @@ const acceptSnapshot = (message: ControllerMessage, baseKeys: string[]): void =>
 };
 const acceptApproval = (message: ControllerMessage, baseKeys: string[]): void => {
   if (!packageApprovalPending || !exactKeys(message, [...baseKeys, 'state', 'role']) || !isPlainRecord(message.state) || (message.role !== 'editor' && message.role !== 'viewer')) { terminateParentChannel('CHANNEL_MESSAGE_SCHEMA'); return; }
+  if (!validatePreparedState(message.state).ok) { terminateParentChannel('STATE_SCHEMA_INVALID'); return; }
   try {
     currentState = structuredClone(message.state);
     packageApprovalPending = false;
@@ -1066,6 +1080,12 @@ const onPortMessage = (event: MessageEvent): void => {
     } catch (_) { terminateParentChannel('CHANNEL_DISPATCH_FAILED'); }
   }
   else if (message.type === 'sf.controller.approval') acceptApproval(message, baseKeys);
+  else if (message.type === 'sf.controller.state.validate') {
+    if (!exactKeys(message, [...baseKeys, 'validationId', 'state']) || typeof message.validationId !== 'string' || !/^[0-9a-f]{32}$/u.test(message.validationId) || !isPlainRecord(message.state)) { terminateParentChannel('CHANNEL_MESSAGE_SCHEMA'); return; }
+    const result = validatePreparedState(message.state);
+    sendParent('sf.renderer.state.validation', {validationId: message.validationId, valid: result.ok, error: result.error});
+    incomingSequence += 1;
+  }
   else terminateParentChannel('CHANNEL_MESSAGE_SCHEMA');
 };
 
@@ -1089,8 +1109,11 @@ const acceptPreparedPackage = (data: Record<string, unknown>): void => {
   const textFields = [manifest.name, manifest.version, manifest.description, publisher.displayName, publisher.publicKey];
   if (!textFields.every((value) => typeof value === 'string') || publisher.keyId !== prepared.publisherKeyId) throw new Error('PACKAGE_MANIFEST_RUNTIME_INVALID');
   if (!Array.isArray(manifest.capabilities) || !manifest.capabilities.every((value) => typeof value === 'string')) throw new Error('PACKAGE_MANIFEST_RUNTIME_INVALID');
-  if (!isPlainRecord(state.publicTemplate ?? {}) || !Number.isSafeInteger(state.maxPlaintextBytes) || (state.mode !== 'personal' && state.mode !== 'shared')) throw new Error('PACKAGE_MANIFEST_RUNTIME_INVALID');
+  if (!isPlainRecord(state.publicTemplate ?? {}) || !isPlainRecord(state.jsonSchema) || !Number.isSafeInteger(state.maxPlaintextBytes) || (state.mode !== 'personal' && state.mode !== 'shared')) throw new Error('PACKAGE_MANIFEST_RUNTIME_INVALID');
   preparedModuleSource = prepared.moduleSource;
+  preparedStateSchema = structuredClone(state.jsonSchema);
+  preparedStateMaxBytes = Number(state.maxPlaintextBytes);
+  if (!validatePreparedState(state.publicTemplate ?? {}).ok) throw new Error('PACKAGE_TEMPLATE_STATE_INVALID');
   packageApprovalPending = true;
   sendParent('sf.renderer.package-verified', {packageDigest: prepared.packageDigest, artifactDigest: prepared.artifactDigest, publisherKeyId: prepared.publisherKeyId, publisherPublicKey: publisher.publicKey, publisherDisplayName: publisher.displayName, appName: manifest.name, appVersion: manifest.version, description: manifest.description, capabilities: manifest.capabilities, publicTemplate: state.publicTemplate ?? {}, maxPlaintextBytes: state.maxPlaintextBytes, declaredMode: state.mode});
 };

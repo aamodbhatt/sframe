@@ -33,6 +33,9 @@ let acceptedAppReadyGeneration = 0;
 let localState: Record<string, unknown> = {decisions: {}};
 let localRevision = 0;
 let personalArchive = new Uint8Array();
+let stateMutationInFlight = false;
+type StateValidation = {resolve: (result: {valid: boolean; error: string}) => void; timer: number};
+const stateValidations = new Map<string, StateValidation>();
 type PersonalPackageMetadata = {packageDigest: string; artifactDigest: string; publisherKeyId: string; publisherPublicKey: string; publisherDisplayName: string; appName: string; appVersion: string; description: string; capabilities: string[]; publicTemplate: Record<string, unknown>; maxPlaintextBytes: number; declaredMode: 'personal' | 'shared'};
 type PersonalSession = {handleVerified: (metadata: PersonalPackageMetadata) => Promise<void>; stateChanged: (state: Record<string, unknown>, revision: number) => Promise<void>};
 let personalSession: PersonalSession | undefined;
@@ -61,6 +64,15 @@ const exactKeys = (value: unknown, expected: readonly string[]): value is Record
   const required = [...expected].sort();
   return sorted.every((key, index) => key === required[index]);
 };
+const isJsonValue = (value: unknown, depth = 0): boolean => {
+  if (depth > 32) return false;
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return true;
+  if (typeof value === 'number') return Number.isFinite(value);
+  if (Array.isArray(value)) return value.length <= 10_000 && value.every((child) => isJsonValue(child, depth + 1));
+  if (!isPlainRecord(value) || Reflect.ownKeys(value).some((key) => typeof key !== 'string')) return false;
+  const entries = Object.entries(value);
+  return entries.length <= 10_000 && entries.every(([key, child]) => key.length <= 256 && !['__proto__', 'prototype', 'constructor'].includes(key) && isJsonValue(child, depth + 1));
+};
 const safeMessageBytes = (value: unknown): number => {
   try { return byteLength(value); } catch (_) { return Number.POSITIVE_INFINITY; }
 };
@@ -82,6 +94,11 @@ const randomBase64Url = (length: number): string => {
   const bytes = new Uint8Array(length);
   crypto.getRandomValues(bytes);
   return btoa(String.fromCharCode(...bytes)).replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '');
+};
+const randomHex = (length: number): string => {
+  const bytes = new Uint8Array(length);
+  crypto.getRandomValues(bytes);
+  return [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
 };
 const post = (type: string, body: Record<string, unknown> = {}): void => {
   if (!port || controllerChannelTerminal || !activeSessionId) throw new Error('CHANNEL_CLOSED');
@@ -285,7 +302,7 @@ const startFrame = async (rendererHtml?: string): Promise<void> => {
   });
 };
 
-type RendererMessage = {channel?: unknown; protocol?: unknown; session?: unknown; sequence?: unknown; type?: unknown; tree?: unknown; error?: unknown; requestId?: unknown; operations?: unknown; workerKind?: unknown; blobCount?: unknown; workerSelfOrigin?: unknown; workerLocationOrigin?: unknown; workerLocationHref?: unknown; wasmStarted?: unknown; wasmBytes?: unknown; wasmProbe?: unknown; wasmDigest?: unknown; verifierStarted?: unknown; verifierBytes?: unknown; verifierVersion?: unknown; verifierDigest?: unknown; state?: unknown; generation?: unknown; restartCount?: unknown; lastReason?: unknown; stopCode?: unknown; packageDigest?: unknown; artifactDigest?: unknown; publisherKeyId?: unknown; publisherPublicKey?: unknown; publisherDisplayName?: unknown; appName?: unknown; appVersion?: unknown; description?: unknown; capabilities?: unknown; publicTemplate?: unknown; maxPlaintextBytes?: unknown; declaredMode?: unknown};
+type RendererMessage = {channel?: unknown; protocol?: unknown; session?: unknown; sequence?: unknown; type?: unknown; tree?: unknown; error?: unknown; requestId?: unknown; operations?: unknown; validationId?: unknown; valid?: unknown; workerKind?: unknown; blobCount?: unknown; workerSelfOrigin?: unknown; workerLocationOrigin?: unknown; workerLocationHref?: unknown; wasmStarted?: unknown; wasmBytes?: unknown; wasmProbe?: unknown; wasmDigest?: unknown; verifierStarted?: unknown; verifierBytes?: unknown; verifierVersion?: unknown; verifierDigest?: unknown; state?: unknown; generation?: unknown; restartCount?: unknown; lastReason?: unknown; stopCode?: unknown; packageDigest?: unknown; artifactDigest?: unknown; publisherKeyId?: unknown; publisherPublicKey?: unknown; publisherDisplayName?: unknown; appName?: unknown; appVersion?: unknown; description?: unknown; capabilities?: unknown; publicTemplate?: unknown; maxPlaintextBytes?: unknown; declaredMode?: unknown};
 
 const validPersonalMetadata = (message: RendererMessage, baseKeys: string[]): boolean => {
   if (!PERSONAL_MODE || workerLifecycleState !== 'idle') return false;
@@ -302,25 +319,77 @@ const rejectStateBatch = (requestId: unknown, code = 'STATE_INVALID', message = 
   post('sf.controller.result', {result: {requestId, kind: 'state', ok: false, error: {code, message}}});
 };
 
-const dispatchStateBatch = (message: RendererMessage): void => {
-  if (executionIsReadOnly()) { rejectStateBatch(message.requestId, 'READ_ONLY', 'Viewer simulation cannot change local state.'); return; }
-  if (!Array.isArray(message.operations) || message.operations.length > 32) { rejectStateBatch(message.requestId); return; }
-  const next = structuredClone(localState);
-  for (const operation of message.operations) {
-    if (typeof operation !== 'object' || operation === null) { rejectStateBatch(message.requestId); return; }
-    const candidate = operation as {op?: unknown; path?: unknown; value?: unknown};
-    if ((candidate.op !== 'set' && candidate.op !== 'delete') || !Array.isArray(candidate.path) || candidate.path.length < 1 || candidate.path.length > 16 || candidate.path.some((part) => typeof part !== 'string' || part.length < 1 || part.length > 64 || ['__proto__', 'prototype', 'constructor'].includes(part))) { rejectStateBatch(message.requestId); return; }
-    let parent = next as Record<string, unknown>;
-    for (const part of candidate.path.slice(0, -1)) { const child = parent[part]; if (typeof child !== 'object' || child === null || Array.isArray(child)) parent[part] = {}; parent = parent[part] as Record<string, unknown>; }
-    const leaf = candidate.path[candidate.path.length - 1] as string;
-    if (candidate.op === 'set') parent[leaf] = structuredClone(candidate.value);
-    else delete parent[leaf];
-  }
-  localState = next;
+const validateState = (state: Record<string, unknown>): Promise<{valid: boolean; error: string}> => new Promise((resolve) => {
+  if (!isJsonValue(state)) { resolve({valid: false, error: 'STATE_JSON_INVALID'}); return; }
+  const validationId = randomHex(16);
+  const timer = window.setTimeout(() => {
+    stateValidations.delete(validationId);
+    resolve({valid: false, error: 'STATE_VALIDATION_TIMEOUT'});
+  }, 2000);
+  stateValidations.set(validationId, {resolve, timer});
+  try { post('sf.controller.state.validate', {validationId, state}); }
+  catch (_) { window.clearTimeout(timer); stateValidations.delete(validationId); resolve({valid: false, error: 'STATE_VALIDATION_UNAVAILABLE'}); }
+});
+
+const commitLocalState = (state: Record<string, unknown>): void => {
+  localState = state;
   localRevision += 1;
   post('sf.controller.snapshot', {state: localState, role: PERSONAL_MODE ? PERSONAL_ROLE : 'editor', online: navigator.onLine, revision: localRevision});
-  post('sf.controller.result', {result: {requestId: message.requestId, kind: 'state', ok: true}});
-  if (personalSession) void personalSession.stateChanged(localState, localRevision).catch(() => { byId<HTMLElement>('status').textContent = 'Local save failed; export before leaving.'; });
+};
+const replaceLocalState = async (state: Record<string, unknown>): Promise<void> => {
+  if (stateMutationInFlight) throw new Error('STATE_BUSY');
+  stateMutationInFlight = true;
+  try {
+    const result = await validateState(state);
+    if (!result.valid) throw new Error(result.error);
+    commitLocalState(state);
+  } finally {
+    stateMutationInFlight = false;
+  }
+};
+
+type StateOperation = {op: 'set' | 'delete'; path: string[]; value?: unknown};
+const validStatePath = (value: unknown): value is string[] => Array.isArray(value) && value.length >= 1 && value.length <= 16 && value.every((part) => typeof part === 'string' && part.length >= 1 && part.length <= 64 && !['__proto__', 'prototype', 'constructor'].includes(part));
+const validStateOperation = (value: unknown): value is StateOperation => {
+  if (!isPlainRecord(value) || (value.op !== 'set' && value.op !== 'delete') || !validStatePath(value.path)) return false;
+  if (value.op === 'set') return exactKeys(value, ['op', 'path', 'value']) && isJsonValue(value.value);
+  return exactKeys(value, ['op', 'path']);
+};
+const applyStateOperations = (state: Record<string, unknown>, operations: unknown[]): Record<string, unknown> | undefined => {
+  const next = structuredClone(state);
+  for (const operation of operations) {
+    if (!validStateOperation(operation)) return undefined;
+    let parent = next;
+    for (const part of operation.path.slice(0, -1)) {
+      const child = parent[part];
+      if (!isPlainRecord(child)) parent[part] = {};
+      parent = parent[part] as Record<string, unknown>;
+    }
+    const leaf = operation.path.at(-1) as string;
+    if (operation.op === 'set') parent[leaf] = structuredClone(operation.value);
+    else delete parent[leaf];
+  }
+  return next;
+};
+
+const dispatchStateBatch = (message: RendererMessage): void => {
+  if (executionIsReadOnly()) { rejectStateBatch(message.requestId, 'READ_ONLY', 'Viewer simulation cannot change local state.'); return; }
+  if (stateMutationInFlight) { rejectStateBatch(message.requestId, 'STATE_BUSY', 'Wait for the current local state validation.'); return; }
+  if (!Array.isArray(message.operations) || message.operations.length < 1 || message.operations.length > 32) { rejectStateBatch(message.requestId); return; }
+  const next = applyStateOperations(localState, message.operations);
+  if (!next) { rejectStateBatch(message.requestId); return; }
+  if (!PERSONAL_MODE) {
+    commitLocalState(next);
+    post('sf.controller.result', {result: {requestId: message.requestId, kind: 'state', ok: true}});
+    return;
+  }
+  stateMutationInFlight = true;
+  void validateState(next).then((result) => {
+    if (!result.valid) { rejectStateBatch(message.requestId, result.error, 'The proposed state violates the signed package schema.'); return; }
+    commitLocalState(next);
+    post('sf.controller.result', {result: {requestId: message.requestId, kind: 'state', ok: true}});
+    if (personalSession) void personalSession.stateChanged(localState, localRevision).catch(() => { byId<HTMLElement>('status').textContent = 'Local save failed; export before leaving.'; });
+  }).finally(() => { stateMutationInFlight = false; });
 };
 
 const onPortMessage = (event: MessageEvent): void => {
@@ -364,6 +433,7 @@ const onPortMessage = (event: MessageEvent): void => {
     }
   }
   else if (message.type === 'sf.renderer.state.batch') schemaValid = exactKeys(message, [...baseKeys, 'requestId', 'operations']) && typeof message.requestId === 'string' && /^[0-9a-f]{32}$/u.test(message.requestId) && (!IS_CANDIDATE_U || (workerLifecycleState === 'running' && acceptedAppReadyGeneration === workerLifecycleGeneration));
+  else if (message.type === 'sf.renderer.state.validation') schemaValid = exactKeys(message, [...baseKeys, 'validationId', 'valid', 'error']) && typeof message.validationId === 'string' && /^[0-9a-f]{32}$/u.test(message.validationId) && typeof message.valid === 'boolean' && typeof message.error === 'string' && message.error.length <= 64;
   else if (message.type === 'sf.renderer.package-verified') schemaValid = validPersonalMetadata(message, baseKeys);
   else if (message.type === 'sf.renderer.error') {
     const withLifecycle = Object.prototype.hasOwnProperty.call(message, 'generation') || Object.prototype.hasOwnProperty.call(message, 'restartCount');
@@ -411,6 +481,12 @@ const onPortMessage = (event: MessageEvent): void => {
     void personalSession.handleVerified(metadata).catch((error: unknown) => terminateControllerChannel(error instanceof Error ? error.message : 'PERSONAL_SETUP_FAILED', true));
   } else if (message.type === 'sf.renderer.state.batch') {
     dispatchStateBatch(message);
+  } else if (message.type === 'sf.renderer.state.validation') {
+    const validation = stateValidations.get(message.validationId as string);
+    if (!validation) { terminateControllerChannel('STATE_VALIDATION_UNEXPECTED', true); return; }
+    window.clearTimeout(validation.timer);
+    stateValidations.delete(message.validationId as string);
+    validation.resolve({valid: message.valid as boolean, error: message.error as string});
   } else if (message.type === 'sf.renderer.error') {
     terminateControllerChannel(message.error as string);
   }
@@ -425,9 +501,9 @@ const main = async (): Promise<void> => {
   if (PERSONAL_MODE) {
     const binary = atob(PHASE2_PACKAGE_BASE64);
     personalArchive = Uint8Array.from(binary, (character) => character.charCodeAt(0));
-    const runtime = (globalThis as typeof globalThis & {SmallframePersonalRuntime?: {createSession: (options: {archive: Uint8Array; role: 'viewer' | 'editor'; onApprove: (state: Record<string, unknown>, role: 'viewer' | 'editor') => void; onReplaceState: (state: Record<string, unknown>) => void}) => PersonalSession}}).SmallframePersonalRuntime;
+    const runtime = (globalThis as typeof globalThis & {SmallframePersonalRuntime?: {createSession: (options: {archive: Uint8Array; role: 'viewer' | 'editor'; onApprove: (state: Record<string, unknown>, role: 'viewer' | 'editor') => void; onReplaceState: (state: Record<string, unknown>) => Promise<void>}) => PersonalSession}}).SmallframePersonalRuntime;
     if (!runtime) throw new Error('PERSONAL_RUNTIME_MISSING');
-    personalSession = runtime.createSession({archive: personalArchive, role: PERSONAL_ROLE, onApprove: (state, role) => { localState = structuredClone(state); post('sf.controller.approval', {state: localState, role}); }, onReplaceState: (state) => { localState = structuredClone(state); localRevision += 1; post('sf.controller.snapshot', {state: localState, role: PERSONAL_ROLE, online: navigator.onLine, revision: localRevision}); }});
+    personalSession = runtime.createSession({archive: personalArchive, role: PERSONAL_ROLE, onApprove: (state, role) => { localState = structuredClone(state); post('sf.controller.approval', {state: localState, role}); }, onReplaceState: async (state) => replaceLocalState(structuredClone(state))});
   } else {
     byId<HTMLElement>('runtime-panel').hidden = false;
   }

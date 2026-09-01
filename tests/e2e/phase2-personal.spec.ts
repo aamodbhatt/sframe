@@ -28,6 +28,14 @@ test.describe('Phase 2 signed personal workspace', () => {
     await page.locator('#import-file').setInputFiles({name: 'state.json', mimeType: 'application/json', buffer: Buffer.from('{"decisions":{"a":{"title":"A"},"b":{"title":"B"}}}')});
     await expect(app.getByText('2 decisions')).toBeVisible();
 
+    await page.locator('#import-file').setInputFiles({name: 'invalid-state.json', mimeType: 'application/json', buffer: Buffer.from('{"decisions":{"bad":{"title":5}}}')});
+    await expect(page.locator('#status')).toContainText('Import rejected: STATE_SCHEMA_INVALID');
+    await expect(app.getByText('2 decisions')).toBeVisible();
+
+    await page.locator('#import-file').setInputFiles({name: 'extra-state.json', mimeType: 'application/json', buffer: Buffer.from('{"decisions":{},"unexpected":true}')});
+    await expect(page.locator('#status')).toContainText('Import rejected: STATE_SCHEMA_INVALID');
+    await expect(app.getByText('2 decisions')).toBeVisible();
+
     await page.reload();
     await expect(app.getByText('2 decisions')).toBeVisible();
     const networkControl = 'http://127.0.0.1:8787/__test__/controller-network';

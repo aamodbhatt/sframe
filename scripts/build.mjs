@@ -50,7 +50,7 @@ const phase1Glue = phase1GlueRaw
 if (/^\s*(?:import|export)\s/mu.test(phase1Glue) || /^\s*\{[^\n]*\bas\s+(?:default|[A-Za-z_$])/mu.test(phase1Glue)) {
   throw new Error('PHASE1_WASM_GLUE_MODULE_SYNTAX');
 }
-const phase1GluePrelude = `{\n${phase1Glue}\nglobalThis.__smallframePhase1Verifier = Object.freeze({initSync, wasm_prepare_package, wasm_sha256_hex, wasm_verifier_self_test, wasm_verifier_version, wasm_verify_package});\n}\n`;
+const phase1GluePrelude = `{\n${phase1Glue}\nglobalThis.__smallframePhase1Verifier = Object.freeze({initSync, wasm_prepare_package, wasm_sha256_hex, wasm_validate_state, wasm_verifier_self_test, wasm_verifier_version, wasm_verify_package});\n}\n`;
 const phase0WasmCsp = process.env.SMALLFRAME_U_WASM_CSP ?? 'allow';
 if (!['allow', 'deny'].includes(phase0WasmCsp) || (candidate !== 'U' && phase0WasmCsp !== 'allow')) throw new Error('SMALLFRAME_U_WASM_CSP requires Candidate U and allow|deny');
 const wasmEvalSource = phase0WasmCsp === 'allow' ? " 'wasm-unsafe-eval'" : '';
