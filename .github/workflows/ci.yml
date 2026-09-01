@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a # v4.2.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@439cf607258077187679211f12aa6f19af4a0af7 # master
+        with:
+          toolchain: 1.95.0
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Bootstrap toolchain
+        run: npm run bootstrap
+
+      - name: Doctor check
+        run: npm run doctor
+
+      - name: Typecheck and lint
+        run: npm run typecheck && npm run lint
+
+      - name: Cyclomatic complexity gate
+        run: npm run complexity
+
+      - name: Unit & integration tests
+        run: npm test
+
+      - name: Cargo tests
+        run: cargo test --workspace --all-features
+
+      - name: Cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Build packages & apps
+        run: npm run build
+
+      - name: Multi-browser Playwright E2E tests
+        run: npm run test:e2e
