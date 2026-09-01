@@ -8,9 +8,9 @@ const PHASE2_PACKAGE_BASE64 = '__PHASE2_PACKAGE_BASE64__';
 const PHASE2_DEFAULT = Boolean(Number('__PHASE2_DEFAULT_FLAG__'));
 const PHASE2_EXPECTED_DIGEST = '__PHASE2_EXPECTED_DIGEST__';
 const PHASE2_EXPECTED_KEY_ID = '__PHASE2_EXPECTED_KEY_ID__';
-const USES_CLASSIC_WORKER = ARCHITECTURE_CANDIDATE === 'S' || ARCHITECTURE_CANDIDATE === 'T' || ARCHITECTURE_CANDIDATE === 'U';
-const IS_CANDIDATE_U = ARCHITECTURE_CANDIDATE === 'U';
-const PERSONAL_MODE = IS_CANDIDATE_U && (PHASE2_DEFAULT || new URLSearchParams(location.search).get('personal') === '1');
+const PERSONAL_MODE = Boolean(PHASE2_DEFAULT || new URLSearchParams(location.search).get('personal') === '1');
+const USES_CLASSIC_WORKER = ARCHITECTURE_CANDIDATE === 'S' || ARCHITECTURE_CANDIDATE === 'T' || ARCHITECTURE_CANDIDATE === 'U' || PERSONAL_MODE;
+const IS_CANDIDATE_U = ARCHITECTURE_CANDIDATE === 'U' || PERSONAL_MODE;
 const PERSONAL_ROLE: 'viewer' | 'editor' = new URLSearchParams(location.search).get('role') === 'viewer' ? 'viewer' : 'editor';
 const executionRole = (): 'viewer' | 'editor' => PERSONAL_MODE ? PERSONAL_ROLE : 'editor';
 const executionIsReadOnly = (): boolean => PERSONAL_MODE && PERSONAL_ROLE === 'viewer';
@@ -37,7 +37,7 @@ let stateMutationInFlight = false;
 type StateValidation = {resolve: (result: {valid: boolean; error: string}) => void; timer: number};
 const stateValidations = new Map<string, StateValidation>();
 type PersonalPackageMetadata = {packageDigest: string; artifactDigest: string; publisherKeyId: string; publisherPublicKey: string; publisherDisplayName: string; appName: string; appVersion: string; description: string; capabilities: string[]; publicTemplate: Record<string, unknown>; maxPlaintextBytes: number; declaredMode: 'personal' | 'shared'};
-type PersonalSession = {handleVerified: (metadata: PersonalPackageMetadata) => Promise<void>; stateChanged: (state: Record<string, unknown>, revision: number) => Promise<void>};
+type PersonalSession = {handleVerified: (metadata: PersonalPackageMetadata) => Promise<void>; stateChanged: (state: Record<string, unknown>, revision: number) => Promise<void>; setBuildId?: (buildId: string) => void; showUpdateBanner?: (waitingWorker: ServiceWorker) => void};
 let personalSession: PersonalSession | undefined;
 
 const text = (value: string): Text => document.createTextNode(value);
@@ -178,19 +178,38 @@ const setupServiceWorker = async (): Promise<string | undefined> => {
   const controller = navigator.serviceWorker.controller;
   if (!controller) throw new Error('SERVICE_WORKER_NOT_CONTROLLING');
   const channel = new MessageChannel();
-  const result = new Promise<{digest: string; csp: string}>((resolve, reject) => {
+  const result = new Promise<{digest: string; csp: string; buildId?: string | undefined}>((resolve, reject) => {
     const timeout = window.setTimeout(() => reject(new Error('SERVICE_WORKER_ATTEST_TIMEOUT')), 2000);
     channel.port1.onmessage = (event: MessageEvent) => {
       window.clearTimeout(timeout);
       if (event.data?.type !== 'sf.attest.result' || event.data.digest !== RENDERER_DIGEST || event.data.cachePresent !== true || event.data.responseDigest !== RENDERER_DIGEST || event.data.provenance !== 'service-worker-cache' || event.data.contentSecurityPolicy !== REQUIRED_RENDERER_CSP) reject(new Error('SERVICE_WORKER_ATTEST_MISMATCH'));
-      else resolve({digest: event.data.digest as string, csp: event.data.contentSecurityPolicy as string});
+      else resolve({digest: event.data.digest as string, csp: event.data.contentSecurityPolicy as string, buildId: typeof event.data.buildId === 'string' ? event.data.buildId : undefined});
     };
   });
   controller.postMessage({type: 'sf.attest'}, [channel.port2]);
-  await result;
-  byId<HTMLElement>('build').textContent = `Verified renderer ${RENDERER_DIGEST.slice(0, 16)}…`;
-  void registration;
+  const attest = await result;
+  if (attest.buildId && personalSession?.setBuildId) personalSession.setBuildId(attest.buildId);
+  byId<HTMLElement>('build').textContent = attest.buildId ? `Verified renderer ${RENDERER_DIGEST.slice(0, 16)}… · Build ${attest.buildId.slice(0, 16)}…` : `Verified renderer ${RENDERER_DIGEST.slice(0, 16)}…`;
+  setupUpdateListener(registration);
   return ARCHITECTURE_CANDIDATE === 'A' ? await readVerifiedRenderer() : undefined;
+};
+
+const setupUpdateListener = (registration: ServiceWorkerRegistration): void => {
+  const checkWaiting = (): void => {
+    const waiting = registration.waiting;
+    if (!waiting) return;
+    if (personalSession?.showUpdateBanner) personalSession.showUpdateBanner(waiting);
+  };
+  registration.addEventListener('updatefound', () => {
+    const installing = registration.installing;
+    if (!installing) return;
+    installing.addEventListener('statechange', () => {
+      if (installing.state === 'installed' && navigator.serviceWorker.controller) {
+        checkWaiting();
+      }
+    });
+  });
+  if (registration.waiting) checkWaiting();
 };
 
 const renderControllerError = (error: unknown): void => {

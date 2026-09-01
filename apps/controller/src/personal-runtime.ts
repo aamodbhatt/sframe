@@ -1,13 +1,13 @@
 type PersonalStoreApi = {
   workspaceIdFor: (packageDigest: string) => Promise<string>;
-  loadWorkspace: (workspaceId: string) => Promise<{workspaceId: string; packageDigest: string; state: Record<string, unknown>; revision: number; updatedAt: number} | undefined>;
-  saveWorkspace: (workspace: {workspaceId: string; packageDigest: string; state: Record<string, unknown>; revision: number; updatedAt: number}) => Promise<void>;
+  loadWorkspace: (workspaceId: string) => Promise<{workspaceId: string; packageDigest: string; buildId?: string; releaseDigest?: string; state: Record<string, unknown>; revision: number; updatedAt: number} | undefined>;
+  saveWorkspace: (workspace: {workspaceId: string; packageDigest: string; buildId?: string; releaseDigest?: string; state: Record<string, unknown>; revision: number; updatedAt: number}) => Promise<void>;
   forgetWorkspace: (workspaceId: string) => Promise<void>;
   loadApproval: (approvalId: string) => Promise<unknown>;
   saveApproval: (approval: {approvalId: string; packageDigest: string; publisherKeyId: string; capabilityHash: string; approvedAt: number}) => Promise<void>;
 };
 type PackageMetadata = {packageDigest: string; artifactDigest: string; publisherKeyId: string; publisherPublicKey: string; publisherDisplayName: string; appName: string; appVersion: string; description: string; capabilities: string[]; publicTemplate: Record<string, unknown>; maxPlaintextBytes: number; declaredMode: 'personal' | 'shared'};
-type PersonalSession = {handleVerified: (metadata: PackageMetadata) => Promise<void>; stateChanged: (state: Record<string, unknown>, revision: number) => Promise<void>};
+type PersonalSession = {handleVerified: (metadata: PackageMetadata) => Promise<void>; stateChanged: (state: Record<string, unknown>, revision: number) => Promise<void>; setBuildId: (buildId: string) => void; showUpdateBanner: (waitingWorker: ServiceWorker) => void};
 type SessionOptions = {archive: Uint8Array; role: 'viewer' | 'editor'; onApprove: (state: Record<string, unknown>, role: 'viewer' | 'editor') => void; onReplaceState: (state: Record<string, unknown>) => Promise<void>};
 
 const element = <T extends HTMLElement>(id: string): T => {
@@ -47,6 +47,7 @@ const createSession = (options: SessionOptions): PersonalSession => {
   let workspaceId = '';
   let currentState: Record<string, unknown> = {};
   let revision = 0;
+  let currentBuildId = '';
   const menu = element<HTMLButtonElement>('chrome-menu');
   const actions = element<HTMLElement>('workspace-actions');
   menu.addEventListener('click', () => {
@@ -84,7 +85,7 @@ const createSession = (options: SessionOptions): PersonalSession => {
 
   const persist = async (): Promise<void> => {
     if (!metadata || !workspaceId) return;
-    await store().saveWorkspace({workspaceId, packageDigest: metadata.packageDigest, state: structuredClone(currentState), revision, updatedAt: Date.now()});
+    await store().saveWorkspace({workspaceId, packageDigest: metadata.packageDigest, buildId: currentBuildId, state: structuredClone(currentState), revision, updatedAt: Date.now()});
     element('last-sync').textContent = `Saved locally: ${new Date().toLocaleTimeString()}`;
   };
   const approve = async (): Promise<void> => {
@@ -118,8 +119,28 @@ const createSession = (options: SessionOptions): PersonalSession => {
   });
   element('forget-workspace').addEventListener('click', () => { if (workspaceId && window.confirm('Forget this local workspace after exporting anything you need?')) void store().forgetWorkspace(workspaceId).then(() => location.reload()); });
   element('leave-package').addEventListener('click', () => { location.href = 'about:blank'; });
+  element('dismiss-update').addEventListener('click', () => { element('update-banner').hidden = true; });
 
   return Object.freeze({
+    setBuildId: (buildId: string) => { currentBuildId = buildId; },
+    showUpdateBanner: (waitingWorker: ServiceWorker) => {
+      const banner = document.getElementById('update-banner');
+      if (!banner) return;
+      banner.hidden = false;
+      const applyButton = document.getElementById('apply-update');
+      if (applyButton) {
+        applyButton.onclick = () => {
+          void persist().then(() => {
+            waitingWorker.postMessage({type: 'sf.release.skipWaiting'});
+            navigator.serviceWorker.addEventListener('controllerchange', () => { location.reload(); });
+          });
+        };
+      }
+      const dismissButton = document.getElementById('dismiss-update');
+      if (dismissButton) {
+        dismissButton.onclick = () => { banner.hidden = true; };
+      }
+    },
     handleVerified: async (verified) => {
       metadata = verified;
       workspaceId = await store().workspaceIdFor(verified.packageDigest);
@@ -135,7 +156,8 @@ const createSession = (options: SessionOptions): PersonalSession => {
       element('trust-title').textContent = verified.appName;
       element('trust-description').textContent = verified.description;
       element('trust-publisher').textContent = `${verified.publisherDisplayName} · ${short(verified.publisherKeyId)} · cryptographic key—not verified legal identity`;
-      element('trust-package').textContent = `${verified.appVersion} · ${short(verified.packageDigest)}${saved ? ' · used before on this device' : ''}`;
+      const updateTag = saved?.buildId && currentBuildId && saved.buildId !== currentBuildId ? ` · updated from build ${short(saved.buildId)}` : (saved ? ' · used before on this device' : '');
+      element('trust-package').textContent = `${verified.appVersion} · ${short(verified.packageDigest)}${updateTag}`;
       element('trust-context').textContent = `Signed personal ${options.role}${verified.declaredMode === 'shared' ? ' · private local copy of a shared package' : ''}`;
       element('trust-capabilities').textContent = verified.capabilities.length ? verified.capabilities.join(', ') : 'No optional capabilities';
       const hash = await capabilityHash(verified.capabilities);
@@ -149,3 +171,4 @@ const createSession = (options: SessionOptions): PersonalSession => {
 
 Object.defineProperty(globalThis, 'SmallframePersonalRuntime', {value: Object.freeze({createSession}), enumerable: false, configurable: false, writable: false});
 export {};
+

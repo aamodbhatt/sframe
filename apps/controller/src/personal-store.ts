@@ -1,4 +1,4 @@
-type StoredWorkspace = {workspaceId: string; packageDigest: string; state: Record<string, unknown>; revision: number; updatedAt: number};
+type StoredWorkspace = {workspaceId: string; packageDigest: string; buildId?: string; releaseDigest?: string; state: Record<string, unknown>; revision: number; updatedAt: number};
 type StoredApproval = {approvalId: string; packageDigest: string; publisherKeyId: string; capabilityHash: string; approvedAt: number};
 type StoredPointer = {packageDigest: string; workspaceId: string};
 type StoreApi = {workspaceIdFor: (packageDigest: string) => Promise<string>; loadWorkspace: (workspaceId: string) => Promise<StoredWorkspace | undefined>; saveWorkspace: (workspace: StoredWorkspace) => Promise<void>; forgetWorkspace: (workspaceId: string) => Promise<void>; loadApproval: (approvalId: string) => Promise<StoredApproval | undefined>; saveApproval: (approval: StoredApproval) => Promise<void>};

@@ -6,7 +6,7 @@ import {WebSocketServer} from 'ws';
 
 const root = process.cwd();
 const dist = join(root, 'dist', 'controller');
-const candidate = process.env.SMALLFRAME_CANDIDATE ?? 'original';
+const candidate = process.env.SMALLFRAME_CANDIDATE ?? 'U';
 const canary = {http: 0, ws: 0, paths: []};
 const appNetwork = {count: 0, paths: []};
 const serviceWorkerRequests = [];
@@ -28,12 +28,12 @@ const controllerHeaders = {
 };
 const PROVENANCE_HEADER = 'X-Smallframe-Response-Provenance';
 const serviceWorkerHeaders = {
-  'Content-Security-Policy': "default-src 'none'; script-src 'self'; connect-src http://app.localhost:4173/runtime/renderer/ http://app.localhost:4173/index.html http://app.localhost:4173/main.js http://app.localhost:4173/personal-store.js http://app.localhost:4173/personal-runtime.js http://app.localhost:4173/fixture-module.js http://app.localhost:4173/controller.css http://app.localhost:4173/manifest.webmanifest http://app.localhost:4173/icon.svg; worker-src 'none'; child-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; navigate-to 'none'; frame-ancestors 'none'",
+  'Content-Security-Policy': "default-src 'none'; script-src 'self'; connect-src http://app.localhost:4173/runtime/renderer/ http://app.localhost:4173/index.html http://app.localhost:4173/main.js http://app.localhost:4173/personal-store.js http://app.localhost:4173/personal-runtime.js http://app.localhost:4173/fixture-module.js http://app.localhost:4173/controller.css http://app.localhost:4173/manifest.webmanifest http://app.localhost:4173/icon.svg http://app.localhost:4173/release.json; worker-src 'none'; child-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; navigate-to 'none'; frame-ancestors 'none'",
   'Content-Type': 'text/javascript; charset=utf-8',
   'X-Content-Type-Options': 'nosniff',
   'Cache-Control': 'no-store'
 };
-const contentType = (path) => ({'.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/manifest+json', '.svg': 'image/svg+xml'}[extname(path)] ?? 'application/octet-stream');
+const contentType = (path) => ({'.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json; charset=utf-8', '.webmanifest': 'application/manifest+json', '.svg': 'image/svg+xml'}[extname(path)] ?? 'application/octet-stream');
 const bodyJson = (request, limit = 4096) => new Promise((resolve, reject) => {
   let body = '';
   request.setEncoding('utf8');

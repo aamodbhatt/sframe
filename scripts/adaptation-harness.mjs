@@ -7,7 +7,8 @@ import canonicalize from 'canonicalize';
 const fixtures = new Set(['tracker', 'calculator', 'decision-board']);
 const fail = (code, detail) => { console.error(JSON.stringify({ok: false, error: {code, detail}})); process.exit(2); };
 const validate = (source) => {
-  const result = spawnSync('npm', ['run', 'cli', '--', '--json', 'validate', source], {encoding: 'utf8'});
+  const env = {...process.env, CC: process.env.CC ?? '/usr/bin/cc', PATH: `/usr/bin:/bin:/usr/sbin:/sbin:${process.env.PATH ?? ''}`};
+  const result = spawnSync('npm', ['run', 'cli', '--', '--json', 'validate', source], {encoding: 'utf8', env});
   const lines = `${result.stdout}\n${result.stderr}`.split('\n').map((line) => line.trim()).filter((line) => line.startsWith('{'));
   const diagnostic = lines.at(-1) ?? JSON.stringify({ok: false, error: {code: 'VALIDATOR_OUTPUT_MISSING'}});
   if (result.status !== 0) fail('ADAPTATION_REJECTED', diagnostic);

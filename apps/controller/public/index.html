@@ -35,6 +35,13 @@
       <p class="warning compact">Exports leave Smallframe’s local protection. Package exports contain executable bundled code.</p>
     </aside>
     <main>
+      <section id="update-banner" class="update-banner" hidden role="region" aria-label="Software update">
+        <div><strong>Update available</strong>: <span id="update-details" class="mono">A newer verified build is ready.</span></div>
+        <div class="update-actions">
+          <button id="apply-update" type="button">Update now</button>
+          <button id="dismiss-update" class="quiet" type="button">Later</button>
+        </div>
+      </section>
       <section id="trust-panel" class="trust-panel" aria-labelledby="trust-title" hidden>
         <p class="eyebrow">Review exact version</p>
         <h2 id="trust-title">Verify before opening</h2>

@@ -3,9 +3,11 @@ import {cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync} from
 import {join} from 'node:path';
 import {spawnSync} from 'node:child_process';
 import ts from 'typescript';
+import {signAsync} from '@noble/ed25519';
+import canonicalize from 'canonicalize';
 
 const root = process.cwd();
-const candidate = process.env.SMALLFRAME_CANDIDATE ?? 'original';
+const candidate = process.env.SMALLFRAME_CANDIDATE ?? 'U';
 if (!['original', 'R', 'A', 'S', 'T', 'U'].includes(candidate)) throw new Error(`Unsupported SMALLFRAME_CANDIDATE=${candidate}`);
 const dist = join(root, 'dist');
 rmSync(dist, {recursive: true, force: true});
@@ -150,5 +152,85 @@ for (const helper of ['personal-store.js', 'personal-runtime.js']) {
   const helperPath = join(controller, helper);
   writeFileSync(helperPath, readFileSync(helperPath, 'utf8').replace(/\nexport \{\};\s*$/u, '\n'));
 }
+
+const staticPaths = [
+  '/controller.css',
+  '/fixture-module.js',
+  '/icon.svg',
+  '/index.html',
+  '/main.js',
+  '/manifest.webmanifest',
+  '/personal-runtime.js',
+  '/personal-store.js',
+  `/runtime/renderer/${rendererDigest}.html`
+].sort();
+const controllerAssetSet = {};
+for (const p of staticPaths) {
+  const filePath = p.startsWith('/runtime/renderer/')
+    ? join(controller, 'runtime', 'renderer', `${rendererDigest}.html`)
+    : join(controller, p.slice(1));
+  const content = readFileSync(filePath);
+  controllerAssetSet[p] = {
+    bytes: content.byteLength,
+    sha256: createHash('sha256').update(content).digest('base64url')
+  };
+}
+const controllerAssetSetDigest = createHash('sha256').update(Buffer.from(canonicalize(controllerAssetSet))).digest('base64url');
+const controllerShellDigest = controllerAssetSet['/index.html'].sha256;
+const rendererDigestB64 = controllerAssetSet[`/runtime/renderer/${rendererDigest}.html`].sha256;
+const verifierDigestB64 = createHash('sha256').update(phase1Wasm).digest('base64url');
+const serviceWorkerDigestB64 = createHash('sha256').update(readFileSync(swPath)).digest('base64url');
+let gitCommit = '0123456789abcdef0123456789abcdef01234567';
+try {
+  const gitProc = spawnSync('git', ['rev-parse', 'HEAD'], {cwd: root, encoding: 'utf8'});
+  if (gitProc.status === 0 && /^[0-9a-f]{40}$/i.test(gitProc.stdout.trim())) {
+    gitCommit = gitProc.stdout.trim().toLowerCase();
+  }
+} catch (_) {}
+const createdAt = process.env.SMALLFRAME_DETERMINISTIC_RELEASE === '1' ? 1780000000000 : Date.now();
+const recordWithoutBuildId = {
+  schemaVersion: 1,
+  gitCommit,
+  createdAt,
+  controllerShellDigest,
+  controllerAssetSetDigest,
+  serviceWorkerDigest: serviceWorkerDigestB64,
+  rendererDigest: rendererDigestB64,
+  verifierDigest: verifierDigestB64,
+  protocolMin: process.env.SMALLFRAME_RELEASE_PROTOCOL_INCOMPATIBLE === '1' ? 2 : 1,
+  protocolMax: process.env.SMALLFRAME_RELEASE_PROTOCOL_INCOMPATIBLE === '1' ? 2 : 1
+};
+const prefix = Buffer.from('smallframe/controller-release/v1\0');
+const canonicalWithout = Buffer.from(canonicalize(recordWithoutBuildId));
+let buildId = createHash('sha256').update(prefix).update(canonicalWithout).digest('base64url');
+if (process.env.SMALLFRAME_RELEASE_CORRUPT_BUILD_ID === '1') {
+  buildId = 'CorruptedBuildId_' + buildId.slice(17);
+}
+const fullRecord = {...recordWithoutBuildId, buildId};
+const payloadType = 'application/vnd.smallframe.controller-release.v1+json';
+const canonicalFull = Buffer.from(canonicalize(fullRecord));
+const paePrefix = Buffer.from(`DSSEv1 ${payloadType.length} ${payloadType} ${canonicalFull.byteLength} `);
+const pae = Buffer.concat([paePrefix, canonicalFull]);
+const rootPriv = Buffer.alloc(32, 0x52);
+let sigBytes = await signAsync(pae, rootPriv);
+if (process.env.SMALLFRAME_RELEASE_CORRUPT_SIG === '1') {
+  sigBytes = Uint8Array.from(sigBytes);
+  sigBytes[0] ^= 1;
+}
+const signature = Buffer.from(sigBytes).toString('base64url');
+if (process.env.SMALLFRAME_RELEASE_CORRUPT_ASSET === '1') {
+  controllerAssetSet['/controller.css'].sha256 = 'CorruptedAssetSha256_______________________';
+}
+const releaseEnvelope = {
+  schemaVersion: 1,
+  payloadType,
+  payload: canonicalFull.toString('base64url'),
+  signatures: [{keyId: 'sha256:h-5zg31LoCDgdHkLQnZ6NPQ16O9g8tTJ2qdzt8QlGkA', sig: signature}],
+  record: fullRecord,
+  assetSet: controllerAssetSet
+};
+writeFileSync(join(controller, 'release.json'), JSON.stringify(releaseEnvelope, null, 2) + '\n');
+
 writeFileSync(join(dist, 'renderer', 'renderer.js'), rendererSource);
-console.log(JSON.stringify({candidate, fixture: fixture || 'valid', channelFixture: candidateUChannelFixture || 'valid', rendererDigest, rendererBytes: Buffer.byteLength(rendererHtml), rendererBootstrapHash, rendererCssHash, phase0WasmBytes: phase0Wasm.byteLength, phase0WasmDigest, phase1WasmBytes: phase1Wasm.byteLength, phase1WasmDigest, phase2PackageBytes: phase2Package.byteLength, phase2PackageArtifactDigest: createHash('sha256').update(phase2Package).digest('hex'), phase2Default, phase0WasmCsp, candidateFactory: candidateFactoryPath, candidateFactoryBytes: Buffer.byteLength(candidateFactorySource), candidateFactoryDigest: createHash('sha256').update(candidateFactorySource).digest('hex')}, null, 2));
+console.log(JSON.stringify({candidate, fixture: fixture || 'valid', channelFixture: candidateUChannelFixture || 'valid', rendererDigest, rendererBytes: Buffer.byteLength(rendererHtml), rendererBootstrapHash, rendererCssHash, phase0WasmBytes: phase0Wasm.byteLength, phase0WasmDigest, phase1WasmBytes: phase1Wasm.byteLength, phase1WasmDigest, phase2PackageBytes: phase2Package.byteLength, phase2PackageArtifactDigest: createHash('sha256').update(phase2Package).digest('hex'), phase2Default, phase0WasmCsp, candidateFactory: candidateFactoryPath, candidateFactoryBytes: Buffer.byteLength(candidateFactorySource), candidateFactoryDigest: createHash('sha256').update(candidateFactorySource).digest('hex'), buildId}, null, 2));
+
