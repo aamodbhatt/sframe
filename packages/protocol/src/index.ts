@@ -3,6 +3,7 @@ import canonicalize from 'canonicalize';
 export * from './runtime-config.js';
 export * from './crypto-envelope.js';
 export * from './room-descriptor.js';
+export * from './enrollment.js';
 
 export const PROTOCOL_VERSION = 1 as const;
 export const CAPABILITIES = ['clipboard.write', 'export.download'] as const;

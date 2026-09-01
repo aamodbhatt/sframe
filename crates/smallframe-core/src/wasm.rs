@@ -34,7 +34,7 @@ pub fn wasm_sha256_hex(input: &[u8]) -> String {
 
 #[wasm_bindgen]
 pub fn wasm_validate_state(schema_json: &str, state_json: &str, max_bytes: u32) -> String {
-    if state_json.as_bytes().len() > max_bytes as usize || max_bytes > 393_216 {
+    if state_json.len() > max_bytes as usize || max_bytes > 393_216 {
         return json!({"ok": false, "error": {"code": "STATE_SIZE_LIMIT"}}).to_string();
     }
     let result = crate::parse_strict_json(schema_json.as_bytes()).and_then(|schema| {

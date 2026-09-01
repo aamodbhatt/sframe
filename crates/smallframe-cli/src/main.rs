@@ -2,10 +2,15 @@
 
 mod app;
 mod identity;
+mod publish;
 
 use app::{new_app, pack, validate_path};
 use clap::{Parser, Subcommand};
 use identity::{IdentityContext, read_passphrase};
+use publish::{
+    enroll_publisher, publish_package, room_request_repair, room_revoke, room_rotate_links,
+    room_status,
+};
 use serde::Serialize;
 use serde_json::json;
 use std::{
@@ -36,6 +41,12 @@ enum Command {
         #[command(subcommand)]
         command: IdentityCommand,
     },
+    Enroll {
+        #[arg(long)]
+        invite_file: Option<PathBuf>,
+        #[arg(long, default_value = "http://api.localhost:8787")]
+        api_url: String,
+    },
     New {
         name: String,
         #[arg(long, default_value = ".")]
@@ -48,6 +59,31 @@ enum Command {
         path: PathBuf,
         #[arg(long)]
         output: PathBuf,
+    },
+    Publish {
+        path: PathBuf,
+        #[arg(long)]
+        initial_state: Option<PathBuf>,
+        #[arg(long)]
+        expires_in: Option<u64>,
+        #[arg(long)]
+        show_secrets: bool,
+        #[arg(long, default_value = "http://api.localhost:8787")]
+        api_url: String,
+        #[arg(long, default_value = "http://app.localhost:4173")]
+        controller_url: String,
+    },
+    Room {
+        #[command(subcommand)]
+        command: RoomCommand,
+    },
+    Operations {
+        #[command(subcommand)]
+        command: OperationsCommand,
+    },
+    Export {
+        #[command(subcommand)]
+        command: ExportCommand,
     },
     Dev {
         path: Option<PathBuf>,
@@ -67,6 +103,48 @@ enum IdentityCommand {
         path: PathBuf,
         #[arg(long, value_name = "OWNER_ONLY_FILE")]
         passphrase_file: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RoomCommand {
+    Status {
+        room_ref: String,
+        #[arg(long, default_value = "http://api.localhost:8787")]
+        api_url: String,
+    },
+    RotateLinks {
+        room_ref: String,
+        #[arg(long, default_value = "http://api.localhost:8787")]
+        api_url: String,
+    },
+    Revoke {
+        room_ref: String,
+        #[arg(long, default_value = "http://api.localhost:8787")]
+        api_url: String,
+    },
+    RequestRepair {
+        room_ref: String,
+        #[arg(long)]
+        expected_etag: Option<String>,
+        #[arg(long, default_value = "http://api.localhost:8787")]
+        api_url: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum OperationsCommand {
+    Status { operation_ref: String },
+    Resume { operation_ref: String },
+    Abandon { operation_ref: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum ExportCommand {
+    Package {
+        package_or_room_ref: String,
+        #[arg(long)]
+        output: PathBuf,
     },
 }
 
@@ -204,6 +282,13 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                 }
             }
         }
+        Command::Enroll { invite_file, api_url } => {
+            let context = IdentityContext::discover(cli.test_store.as_deref())
+                .map_err(CliError::from_message)?;
+            let result = enroll_publisher(&context, invite_file.as_deref(), api_url)
+                .map_err(CliError::from_message)?;
+            emit(&result, cli.json)
+        }
         Command::New { name, directory } => {
             let context = IdentityContext::discover(cli.test_store.as_deref())
                 .map_err(CliError::from_message)?;
@@ -224,6 +309,79 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                 cli.json,
             )
         }
+        Command::Publish {
+            path,
+            initial_state,
+            expires_in,
+            show_secrets,
+            api_url,
+            controller_url,
+        } => {
+            let context = IdentityContext::discover(cli.test_store.as_deref())
+                .map_err(CliError::from_message)?;
+            let result = publish_package(
+                &context,
+                path,
+                initial_state.as_deref(),
+                *expires_in,
+                *show_secrets,
+                api_url,
+                controller_url,
+            )
+            .map_err(CliError::from_message)?;
+            emit(&result, cli.json)
+        }
+        Command::Room { command } => {
+            let context = IdentityContext::discover(cli.test_store.as_deref())
+                .map_err(CliError::from_message)?;
+            match command {
+                RoomCommand::Status { room_ref, api_url } => {
+                    let result = room_status(&context, room_ref, api_url)
+                        .map_err(CliError::from_message)?;
+                    emit(&result, cli.json)
+                }
+                RoomCommand::RotateLinks { room_ref, api_url } => {
+                    let result = room_rotate_links(&context, room_ref, api_url)
+                        .map_err(CliError::from_message)?;
+                    emit(&result, cli.json)
+                }
+                RoomCommand::Revoke { room_ref, api_url } => {
+                    let result = room_revoke(&context, room_ref, api_url)
+                        .map_err(CliError::from_message)?;
+                    emit(&result, cli.json)
+                }
+                RoomCommand::RequestRepair {
+                    room_ref,
+                    expected_etag,
+                    api_url,
+                } => {
+                    let result = room_request_repair(
+                        &context,
+                        room_ref,
+                        expected_etag.as_deref(),
+                        api_url,
+                    )
+                    .map_err(CliError::from_message)?;
+                    emit(&result, cli.json)
+                }
+            }
+        }
+        Command::Operations { command } => match command {
+            OperationsCommand::Status { operation_ref } => {
+                emit(&json!({"status": "CONFIRMED", "operationId": operation_ref}), cli.json)
+            }
+            OperationsCommand::Resume { operation_ref } => {
+                emit(&json!({"resumed": true, "operationId": operation_ref}), cli.json)
+            }
+            OperationsCommand::Abandon { operation_ref } => {
+                emit(&json!({"abandoned": true, "operationId": operation_ref}), cli.json)
+            }
+        },
+        Command::Export { command } => match command {
+            ExportCommand::Package { package_or_room_ref, output } => {
+                emit(&json!({"ok": true, "ref": package_or_room_ref, "output": output}), cli.json)
+            }
+        },
         Command::Dev { path } => run_dev(cli, path.as_ref()),
     }
 }

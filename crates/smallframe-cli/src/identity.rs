@@ -256,6 +256,29 @@ impl IdentityContext {
         }
         Ok(summary(&signing_key))
     }
+
+    pub fn save_api_token(&self, token: &str) -> Result<(), String> {
+        let path = self.root.join("api-token.txt");
+        write_new_private(&path, token.as_bytes())
+    }
+
+    pub fn load_api_token(&self) -> Result<String, String> {
+        let path = self.root.join("api-token.txt");
+        let bytes = fs::read(&path).map_err(|_| "API_TOKEN_NOT_FOUND".to_owned())?;
+        String::from_utf8(bytes).map_err(|_| "API_TOKEN_INVALID".to_owned())
+    }
+
+    pub fn save_room_record(&self, room_id: &str, record: &serde_json::Value) -> Result<(), String> {
+        let path = self.root.join(format!("room-{}.json", room_id));
+        let jcs_bytes = jcs(record)?;
+        write_new_private(&path, &jcs_bytes)
+    }
+
+    pub fn load_room_record(&self, room_id: &str) -> Result<serde_json::Value, String> {
+        let path = self.root.join(format!("room-{}.json", room_id));
+        let bytes = fs::read(&path).map_err(|_| "ROOM_NOT_FOUND".to_owned())?;
+        serde_json::from_slice(&bytes).map_err(|_| "ROOM_RECORD_INVALID".to_owned())
+    }
 }
 
 #[derive(Debug, Serialize)]
