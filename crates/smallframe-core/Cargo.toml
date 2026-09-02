@@ -21,7 +21,7 @@ oxc_allocator = "=0.143.0"
 oxc_ast = "=0.143.0"
 oxc_ast_visit = "=0.143.0"
 oxc_parser = "=0.143.0"
-oxc_span = "=0.143.0"
+oxc_span = "=0.147.0"
 semver = "=1.0.28"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_jcs = "=0.2.0"
