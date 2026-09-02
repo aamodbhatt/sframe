@@ -1,7 +1,7 @@
 const sw = globalThis as unknown as ServiceWorkerGlobalScope;
 const RENDERER_DIGEST = '__RENDERER_DIGEST__';
 const RENDERER_PATH = `/runtime/renderer/${RENDERER_DIGEST}.html`;
-const MAX_RENDERER_BYTES = 2 * 1024 * 1024;
+const MAX_RENDERER_BYTES = 4 * 1024 * 1024;
 const RENDERER_CSP = "default-src 'none'; script-src 'sha256-__RENDERER_BOOTSTRAP_HASH__'__RENDERER_WASM_EVAL_SOURCE__ blob:; style-src 'sha256-__RENDERER_CSS_HASH__'; img-src 'none'; font-src 'none'; connect-src 'none'; worker-src blob:; child-src 'none'; frame-src 'none'; media-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; navigate-to 'none'; frame-ancestors http://app.localhost:4173; sandbox allow-scripts; require-trusted-types-for 'script'; trusted-types smallframe-renderer-worker";
 const PROVENANCE_HEADER = 'X-Smallframe-Response-Provenance';
 const RELEASE_ROOT_KEY_ID = 'sha256:h-5zg31LoCDgdHkLQnZ6NPQ16O9g8tTJ2qdzt8QlGkA';
@@ -173,7 +173,10 @@ const installRelease = async (): Promise<void> => {
 };
 
 sw.addEventListener('install', (event) => {
-  event.waitUntil(installRelease());
+  event.waitUntil(installRelease().catch((err: unknown) => {
+    console.error('SW INSTALL ERROR:', err);
+    throw err;
+  }));
 });
 
 sw.addEventListener('activate', (event) => {

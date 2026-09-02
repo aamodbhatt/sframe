@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod archive;
+pub mod crdt;
 mod dsse;
 mod encoding;
 mod error;

@@ -5,7 +5,7 @@
     role: 'viewer' | 'editor';
     roomKey: string;
     capability: string;
-    writerPrivateSeed?: string;
+    writerPrivateSeed?: string | undefined;
     state: Record<string, unknown>;
     stateEpoch: number;
     revision: number;
@@ -13,6 +13,7 @@
     etag: string;
     dirty: boolean;
     actorId: string;
+    automergeBase64?: string | undefined;
     updatedAt: number;
   };
 
@@ -84,6 +85,97 @@
     onReplaceState: (state: Record<string, unknown>) => Promise<void>;
   };
 
+  type StateWorkerResponse = {
+    id: number;
+    ok: boolean;
+    error?: string;
+    bytes?: Uint8Array;
+    projectedState?: Record<string, unknown>;
+    envelope?: unknown;
+    envelopeDigest?: string;
+    etag?: string;
+  };
+
+  class StateWorkerClient {
+    private readonly worker: Worker;
+    private nextId = 1;
+    private readonly pending = new Map<number, {resolve: (res: any) => void; reject: (err: any) => void; timer: number}>();
+    private stopped = false;
+
+    constructor() {
+      const helper = (globalThis as typeof globalThis & {__smallframeScriptUrl?: (url: string) => unknown}).__smallframeScriptUrl;
+      const script = helper ? helper('/state-worker.js') as string : '/state-worker.js';
+      this.worker = new Worker(script);
+      this.worker.onmessage = (event: MessageEvent<StateWorkerResponse>) => {
+        const {id, ok, error, ...data} = event.data;
+        const entry = this.pending.get(id);
+        if (!entry) return;
+        window.clearTimeout(entry.timer);
+        this.pending.delete(id);
+        if (ok) entry.resolve(data);
+        else entry.reject(new Error(typeof error === 'string' && /^[A-Z_]{1,64}$/u.test(error) ? error : 'STATE_WORKER_REJECTED'));
+      };
+      this.worker.onerror = () => this.failClosed();
+      this.worker.onmessageerror = () => this.failClosed();
+    }
+
+    private failClosed(): void {
+      this.stopped = true;
+      this.worker.terminate();
+      for (const entry of this.pending.values()) {
+        window.clearTimeout(entry.timer);
+        entry.reject(new Error('STATE_WORKER_STOPPED'));
+      }
+      this.pending.clear();
+    }
+
+    async genesis(initialJson: string, actorIdHex: string): Promise<{bytes: Uint8Array; projectedState: Record<string, unknown>}> {
+      return this.call('genesis', {initialJson, actorIdHex});
+    }
+
+    async applyPatch(docBytes: Uint8Array, patchJson: string, actorIdHex: string): Promise<{bytes: Uint8Array; projectedState: Record<string, unknown>}> {
+      return this.call('apply_patch', {docBytes, patchJson, actorIdHex});
+    }
+
+    async merge(localBytes: Uint8Array, remoteBytes: Uint8Array): Promise<{bytes: Uint8Array; projectedState: Record<string, unknown>}> {
+      return this.call('merge', {localBytes, remoteBytes});
+    }
+
+    async encrypt(params: {
+      roomKey: Uint8Array;
+      writerPrivateKey: Uint8Array;
+      roomId: string;
+      appId?: string;
+      packageDigest: string;
+      stateEpoch: number;
+      proposedRevision: number;
+      previousEnvelopeDigest: string;
+      automergeBytes: Uint8Array;
+    }): Promise<{envelope: unknown; envelopeDigest: string; etag: string}> {
+      return this.call('encrypt', params);
+    }
+
+    async decrypt(params: {
+      roomKey: Uint8Array;
+      expectedWriterPublicKey?: Uint8Array | undefined;
+      roomId: string;
+      packageDigest: string;
+      envelope: unknown;
+    }): Promise<{automergeBytes: Uint8Array; projectedState: Record<string, unknown>; envelopeDigest: string; etag: string}> {
+      return this.call('decrypt', params);
+    }
+
+    private call<T>(type: string, args: Record<string, unknown>): Promise<T> {
+      return new Promise<T>((resolve, reject) => {
+        if (this.stopped) { reject(new Error('STATE_WORKER_STOPPED')); return; }
+        const id = this.nextId++;
+        const timer = window.setTimeout(() => this.failClosed(), 1000);
+        this.pending.set(id, {resolve, reject, timer});
+        this.worker.postMessage({id, type, ...args});
+      });
+    }
+  }
+
   const element = <T extends HTMLElement>(id: string): T => {
     const value = document.getElementById(id);
     if (!(value instanceof HTMLElement)) throw new Error(`SHARED_UI_MISSING_${id}`);
@@ -98,9 +190,7 @@
 
   const encodeBase64Url = (bytes: Uint8Array): string => {
     let binary = '';
-    for (let i = 0; i < bytes.byteLength; i += 1) {
-      binary += String.fromCharCode(bytes[i]!);
-    }
+    for (let i = 0; i < bytes.byteLength; i += 1) binary += String.fromCharCode(bytes[i]!);
     return btoa(binary).replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '');
   };
 
@@ -109,9 +199,7 @@
     const padded = base64.padEnd(base64.length + (4 - (base64.length % 4)) % 4, '=');
     const binary = atob(padded);
     const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i += 1) {
-      bytes[i] = binary.charCodeAt(i);
-    }
+    for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
     return bytes;
   };
 
@@ -144,11 +232,22 @@
   const safeFilename = (name: string, suffix: string): string =>
     `${name.toLowerCase().replace(/[^a-z0-9]+/gu, '-').replace(/^-|-$/gu, '').slice(0, 40) || 'smallframe'}${suffix}`;
 
+  const randomActorIdHex = (): string => {
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    let hex = '';
+    for (let i = 0; i < bytes.byteLength; i += 1) hex += bytes[i]!.toString(16).padStart(2, '0');
+    return hex;
+  };
+
   const createSession = (options: SharedSessionOptions): SharedSession => {
     const {invite, apiOrigin} = options;
     const {descriptor} = invite;
     let metadata: PackageMetadata | undefined;
     let currentState: Record<string, unknown> = {};
+    let currentAppId: string | undefined;
+    let localDocBytes: Uint8Array | undefined;
+    let actorIdHex = randomActorIdHex();
     let currentEpoch = 0;
     let currentRevision = 1;
     let currentDigest = encodeBase64Url(new Uint8Array(32));
@@ -156,7 +255,17 @@
     let isEditorHoldingLock = false;
     let activeSocket: WebSocket | undefined;
     let pollTimer = 0;
+    let dirty = false;
+    let remembered = false;
+    let approved = false;
+    let queue: Promise<unknown> = Promise.resolve();
+    const serialized = <T>(action: () => Promise<T>): Promise<T> => {
+      const result = queue.then(action);
+      queue = result.catch(() => undefined);
+      return result;
+    };
 
+    const worker = new StateWorkerClient();
     const role = descriptor.role;
     const capHeader = `SF-Cap ${encodeBase64Url(invite.capability)}`;
 
@@ -187,47 +296,124 @@
 
     const updateRoleBadge = (): void => {
       const roleBadge = element('role');
-      roleBadge.textContent = role;
+      if (role === 'editor' && !isEditorHoldingLock) {
+        roleBadge.textContent = 'editor (read-only lease)';
+      } else {
+        roleBadge.textContent = role;
+      }
+    };
+
+    const persistRoom = async (dirty: boolean): Promise<void> => {
+      if (!remembered || !isEditorHoldingLock) return;
+        await store().saveRoom({
+          roomId: descriptor.roomId,
+          packageDigest: descriptor.packageDigest,
+          role,
+          roomKey: encodeBase64Url(invite.roomKey),
+          capability: encodeBase64Url(invite.capability),
+          writerPrivateSeed: invite.writerPrivateSeed ? encodeBase64Url(invite.writerPrivateSeed) : undefined,
+          state: currentState,
+          stateEpoch: currentEpoch,
+          revision: currentRevision,
+          envelopeDigest: currentDigest,
+          etag: currentEtag,
+          dirty,
+          actorId: actorIdHex,
+          automergeBase64: localDocBytes ? encodeBase64Url(localDocBytes) : undefined,
+          updatedAt: Date.now()
+        });
+        element('last-sync').textContent = `Saved locally: ${new Date().toLocaleTimeString()}`;
     };
 
     const fetchRemoteState = async (): Promise<void> => {
       try {
         const res = await fetch(`${apiOrigin}/v1/rooms/${descriptor.roomId}/state`, {
-          headers: {Authorization: capHeader, Origin: window.location.origin}
+          headers: {
+            Authorization: capHeader,
+            Accept: 'application/json',
+            Origin: window.location.origin
+          }
         });
-        if (res.status === 304) {
+        if (res.status === 304) return;
+        if (res.status === 503) {
+          setStatus('Recovery required');
+          throw new Error('RECOVERY_REQUIRED');
+        }
+        if (res.status === 200) {
+          const contentType = res.headers.get('Content-Type') ?? '';
+          if (contentType.includes('application/json')) {
+            const wireEnvelope = await res.json();
+            const decrypted = await worker.decrypt({
+              roomKey: invite.roomKey,
+              expectedWriterPublicKey: descriptor.writerPublicKey ? decodeBase64Url(descriptor.writerPublicKey) : undefined,
+              roomId: descriptor.roomId,
+              packageDigest: descriptor.packageDigest,
+              envelope: wireEnvelope
+            });
+
+            if (localDocBytes) {
+              if (wireEnvelope.stateEpoch !== currentEpoch) throw new Error('RECOVERY_TRANSITION_REQUIRED');
+              if (wireEnvelope.proposedRevision < currentRevision) throw new Error('REMOTE_ROLLBACK');
+              if (wireEnvelope.proposedRevision === currentRevision && decrypted.envelopeDigest !== currentDigest) throw new Error('REMOTE_EQUIVOCATION');
+              if (wireEnvelope.proposedRevision === currentRevision + 1 && wireEnvelope.previousEnvelopeDigest !== currentDigest) throw new Error('PREDECESSOR_MISMATCH');
+              const merged = await worker.merge(localDocBytes, decrypted.automergeBytes);
+              if (approved) await options.onReplaceState(structuredClone(merged.projectedState));
+              localDocBytes = merged.bytes;
+              currentState = merged.projectedState;
+            } else {
+              localDocBytes = decrypted.automergeBytes;
+              currentState = decrypted.projectedState;
+            }
+
+            currentEpoch = wireEnvelope.stateEpoch;
+            currentAppId = wireEnvelope.aad.appId;
+            currentRevision = wireEnvelope.proposedRevision;
+            currentDigest = decrypted.envelopeDigest;
+            currentEtag = res.headers.get('ETag') ?? decrypted.etag;
+          } else {
+            throw new Error('SIGNED_ENVELOPE_REQUIRED');
+          }
+
+          setStatus(dirty ? 'Saved locally · pending sync' : 'Synced');
+          await persistRoom(dirty);
+        } else {
+          throw new Error('RELAY_UNAVAILABLE');
+        }
+      } catch (error) {
+        setStatus('Sync paused · local copy retained');
+        throw error;
+      }
+    };
+
+    const syncRoom = async (): Promise<void> => {
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        await fetchRemoteState();
+        if (!dirty || !isEditorHoldingLock || !invite.writerPrivateSeed || !localDocBytes) return;
+        const encrypted = await worker.encrypt({roomKey: invite.roomKey, writerPrivateKey: invite.writerPrivateSeed,
+          roomId: descriptor.roomId, ...(currentAppId ? {appId: currentAppId} : {}), packageDigest: descriptor.packageDigest, stateEpoch: currentEpoch,
+          proposedRevision: currentRevision + 1, previousEnvelopeDigest: currentDigest, automergeBytes: localDocBytes});
+        const res = await fetch(`${apiOrigin}/v1/rooms/${descriptor.roomId}/state`, {method: 'PUT',
+          headers: {Authorization: capHeader, 'Content-Type': 'application/json', 'If-Match': currentEtag},
+          body: JSON.stringify(encrypted.envelope)});
+        if (res.ok) {
+          currentRevision += 1;
+          currentDigest = encrypted.envelopeDigest;
+          currentEtag = encrypted.etag;
+          dirty = false;
+          await persistRoom(false);
           setStatus('Synced');
           return;
         }
-        if (res.status === 200) {
-          const etag = res.headers.get('ETag') ?? currentEtag;
-          const epoch = Number(res.headers.get('X-Smallframe-State-Epoch') ?? currentEpoch);
-          const rev = Number(res.headers.get('X-Smallframe-Revision') ?? currentRevision);
-          const digest = res.headers.get('X-Smallframe-Envelope-Digest') ?? currentDigest;
-
-          const buf = await res.arrayBuffer();
-          let newState: Record<string, unknown> = {};
-          try {
-            newState = JSON.parse(new TextDecoder().decode(buf)) as Record<string, unknown>;
-          } catch {
-            newState = {};
-          }
-
-          currentState = newState;
-          currentEpoch = epoch;
-          currentRevision = rev;
-          currentDigest = digest;
-          currentEtag = etag;
-
-          setStatus('Synced');
-          await options.onReplaceState(structuredClone(currentState));
-        } else if (res.status === 503) {
-          setStatus('Recovery required');
-        }
-      } catch {
-        setStatus('Offline · on this device');
+        if (res.status !== 409) throw new Error('RELAY_WRITE_REJECTED');
+        await new Promise((resolve) => window.setTimeout(resolve, Math.random() * 50 * 2 ** attempt));
       }
+      setStatus('Saved locally · pending sync');
     };
+    const requestSync = (): void => {
+      void serialized(syncRoom).catch(() => setStatus('Sync paused · local copy retained'));
+    };
+    window.addEventListener('online', requestSync);
+    window.addEventListener('focus', () => { if (approved) requestSync(); });
 
     const connectRealtime = async (): Promise<void> => {
       if (typeof WebSocket === 'undefined') return;
@@ -241,18 +427,14 @@
         const wsUrl = `${apiOrigin.replace(/^http/u, 'ws')}/v1/rooms/${descriptor.roomId}/socket`;
         const ws = new WebSocket(wsUrl, ['smallframe.v1', `sf-ticket.${ticket}`]);
 
-        ws.onopen = () => {
-          setStatus('Synced');
-        };
+        ws.onopen = () => { setStatus('Synced'); };
         ws.onmessage = (event) => {
           try {
             const msg = JSON.parse(event.data as string) as {type: string; epoch: number; revision: number};
             if (msg.type === 'revision') {
-              void fetchRemoteState();
+              requestSync();
             }
-          } catch {
-            // ignore
-          }
+          } catch {}
         };
         ws.onclose = () => {
           window.setTimeout(() => { void connectRealtime(); }, 3000);
@@ -262,27 +444,45 @@
         };
         activeSocket = ws;
       } catch {
-        // fallback to periodic poll
         if (!pollTimer) {
-          pollTimer = window.setInterval(() => { void fetchRemoteState(); }, 5000);
+          pollTimer = window.setInterval(() => { if (!document.hidden && navigator.onLine) requestSync(); }, 600_000);
         }
       }
     };
 
+    let resolveLease: (() => void) | undefined;
+    const leasePromise = new Promise<void>((resolve) => { resolveLease = resolve; });
+
     // Web Locks API
-    if (role === 'editor' && navigator.locks) {
-      void navigator.locks.request(`smallframe:room:${descriptor.roomId}`, async (lock) => {
+    if (role === 'editor' && typeof navigator !== 'undefined' && navigator.locks) {
+      void navigator.locks.request(`smallframe:room:${descriptor.roomId}`, {ifAvailable: true}, async (lock) => {
+        if (!lock) {
+          isEditorHoldingLock = false;
+          updateRoleBadge();
+          resolveLease?.();
+          return;
+        }
         isEditorHoldingLock = true;
-        await new Promise<void>(() => {
-          // hold lock for session lifetime
-        });
+        updateRoleBadge();
+        resolveLease?.();
+        await new Promise<void>(() => {});
       }).catch(() => {
         isEditorHoldingLock = false;
+        updateRoleBadge();
+        resolveLease?.();
       });
+    } else {
+      resolveLease?.();
     }
 
     const approve = async (): Promise<void> => {
+      await leasePromise;
       if (!metadata) throw new Error('SHARED_APPROVAL_NOT_READY');
+
+      remembered = element<HTMLInputElement>('remember-approval').checked;
+      try { await serialized(fetchRemoteState); }
+      catch (error) { if (!localDocBytes) throw error; }
+      if (!localDocBytes) throw new Error('VERIFIED_GENESIS_UNAVAILABLE');
 
       if (element<HTMLInputElement>('remember-approval').checked) {
         await store().saveApproval({
@@ -299,12 +499,11 @@
       element('trust-panel').hidden = true;
       element('runtime-panel').hidden = false;
       updateRoleBadge();
-      options.onApprove(structuredClone(currentState), role);
+      approved = true;
+      options.onApprove(structuredClone(currentState), role === 'editor' && isEditorHoldingLock ? 'editor' : 'viewer');
 
-      // Start background sync
-      void fetchRemoteState().then(() => {
-        void connectRealtime();
-      });
+      void connectRealtime();
+      if (dirty) window.setTimeout(requestSync, 0);
     };
 
     element('approve-package').addEventListener('click', () => {
@@ -356,8 +555,22 @@
         element('trust-description').textContent = meta.description || 'No description provided.';
         updateRoleBadge();
 
-        // Initial state from template
-        currentState = meta.publicTemplate ? structuredClone(meta.publicTemplate) : {};
+        const storedRoom = await store().loadRoom(descriptor.roomId);
+        if (storedRoom) {
+          actorIdHex = storedRoom.actorId;
+          currentEpoch = storedRoom.stateEpoch;
+          currentRevision = storedRoom.revision;
+          currentDigest = storedRoom.envelopeDigest;
+          currentEtag = storedRoom.etag;
+          currentState = storedRoom.state;
+          dirty = storedRoom.dirty;
+          if (storedRoom.automergeBase64) {
+            localDocBytes = decodeBase64Url(storedRoom.automergeBase64);
+          }
+        } else {
+          currentState = meta.publicTemplate ? structuredClone(meta.publicTemplate) : {};
+          // Shared replicas must load publisher-created history from the relay.
+        }
 
         const approval = await store().loadApproval(`${descriptor.roomId}:${descriptor.packageDigest}:${descriptor.role}`);
         if (approval) {
@@ -368,40 +581,25 @@
         }
       },
 
-      stateChanged: async (state, _rev) => {
-        if (role !== 'editor') return;
+      stateChanged: async (state, _rev) => serialized(async () => {
+        await leasePromise;
+        if (role !== 'editor' || !isEditorHoldingLock || !invite.writerPrivateSeed || !localDocBytes) throw new Error('READ_ONLY');
         currentState = structuredClone(state);
         setStatus('Syncing…');
 
         try {
-          const nextRev = currentRevision + 1;
-          const payloadBytes = new TextEncoder().encode(JSON.stringify(currentState));
+          const patchRes = await worker.applyPatch(localDocBytes, JSON.stringify(currentState), actorIdHex);
+          localDocBytes = patchRes.bytes;
+          currentState = patchRes.projectedState;
 
-          const res = await fetch(`${apiOrigin}/v1/rooms/${descriptor.roomId}/state`, {
-            method: 'PUT',
-            headers: {
-              Authorization: capHeader,
-              'Content-Type': 'application/octet-stream',
-              'If-Match': currentEtag,
-              Origin: window.location.origin
-            },
-            body: payloadBytes
-          });
-
-          if (res.status === 204 || res.status === 200) {
-            currentRevision = nextRev;
-            currentEtag = res.headers.get('ETag') ?? currentEtag;
-            setStatus('Synced');
-          } else if (res.status === 409) {
-            // Conflict: refetch and merge
-            await fetchRemoteState();
-          } else {
-            setStatus('On this device');
-          }
+          dirty = true;
+          await persistRoom(true);
+          window.setTimeout(requestSync, 0);
         } catch {
-          setStatus('Offline · on this device');
+          setStatus('Local save failed');
+          throw new Error('LOCAL_COMMIT_FAILED');
         }
-      },
+      }),
 
       setBuildId: (buildId) => {
         element('build').textContent = `Verified renderer ${short(metadata?.packageDigest ?? '')} · Build ${short(buildId)}`;

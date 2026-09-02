@@ -44,7 +44,11 @@ This is a product and security hypothesis, not a validated market claim.
 
 ## Current state
 
-The repository has passed its **local Phase 1 protocol and package-core gate**. Candidate U is the accepted local browser architecture, and Phase 2 personal-runtime implementation is in progress.
+Candidate U is the accepted local browser architecture. The signed personal-app slice is implemented; **Phase 3 encrypted collaboration is under active repair and verification**. This is a local prototype, not a production-ready or independently reviewed service.
+
+The shared-room tests now use the actual SQLite Durable Object relay with a test-only, publisher-created encrypted genesis. They exercise encrypted snapshots, concurrent offline edits, viewer enforcement, local device-key wrapping, and consent. Production publisher enrollment/storage, signed recovery, complete hostile-state limits, and release readiness remain unfinished. Do not use real secrets or deploy this checkpoint.
+
+The renderer's local byte ceiling was raised from 2 MiB to 4 MiB while the inherited combined verifier/CRDT Wasm build is being evaluated. Splitting the state engine and restoring a measured lightweight budget remains open. A passing test suite does not close the full Phase 3–5 specification gates.
 
 Working locally today:
 

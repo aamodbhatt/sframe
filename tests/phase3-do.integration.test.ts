@@ -1,4 +1,5 @@
-import {createHash} from 'node:crypto';
+import {createHash, randomBytes} from 'node:crypto';
+import {encryptSnapshot} from '../packages/protocol/src/crypto-envelope.js';
 import {mkdir, mkdtemp, rm} from 'node:fs/promises';
 import {join, resolve} from 'node:path';
 import {Miniflare} from 'miniflare';
@@ -42,6 +43,39 @@ const initializeRoom = async (
 );
 
 describe('SQLite Durable Object Phase 3 Protocol & Lifecycle', () => {
+  it('pins encrypted genesis and rejects raw downgrade, wrong writer/package, viewer writes, forged signatures and legacy recovery', async () => {
+    const room = base64url(randomBytes(16));
+    const viewer = base64url(randomBytes(32));
+    const editor = base64url(randomBytes(32));
+    const params = {roomKey: new Uint8Array(randomBytes(32)), writerPrivateKey: new Uint8Array(randomBytes(32)),
+      roomId: room, appId: 'test.room', packageDigest: base64url(randomBytes(32)), stateEpoch: 0,
+      proposedRevision: 1, previousEnvelopeDigest: base64url(new Uint8Array(32)), automergeBytes: Uint8Array.of(1, 2, 3)};
+    const genesis = await encryptSnapshot(params);
+    const init = await fetch(`${apiOrigin}/__phase0/rooms/${room}/init-envelope`, {method: 'POST', body: JSON.stringify({
+      viewerCapHash: capabilityHash(viewer), editorCapHash: capabilityHash(editor), expiresAtMs: Date.now() + 60_000, envelope: genesis.envelope
+    })});
+    expect(init.status).toBe(201);
+    const nextParams = {...params, proposedRevision: 2, previousEnvelopeDigest: base64url(genesis.envelopeDigest)};
+    const next = await encryptSnapshot(nextParams);
+    const put = (body: unknown, cap = editor, contentType = 'application/json') => fetch(`${apiOrigin}/v1/rooms/${room}/state`, {
+      method: 'PUT', headers: {Origin: CONTROLLER_ORIGIN, Authorization: authorization(cap), 'If-Match': genesis.etag, 'Content-Type': contentType},
+      body: JSON.stringify(body)
+    });
+    expect((await put({untrusted: true}, editor, 'application/octet-stream')).status).toBe(400);
+    expect((await put({version: 1})).status).toBe(400);
+    expect((await put(next.envelope, viewer)).status).toBe(403);
+    const forged = {...next.envelope, writerSignature: base64url(randomBytes(64))};
+    expect((await put(forged)).status).toBe(400);
+    const wrongWriter = await encryptSnapshot({...nextParams, writerPrivateKey: new Uint8Array(randomBytes(32))});
+    expect((await put(wrongWriter.envelope)).status).toBe(403);
+    const wrongPackage = await encryptSnapshot({...nextParams, packageDigest: base64url(randomBytes(32))});
+    expect((await put(wrongPackage.envelope)).status).toBe(403);
+    const winners = await Promise.all([put(next.envelope), put(next.envelope)]);
+    expect(winners.map((r) => r.status).sort()).toEqual([204, 409]);
+    const recovery = await fetch(`${apiOrigin}/v1/rooms/${room}/recover`, {method: 'POST',
+      headers: {Origin: CONTROLLER_ORIGIN, Authorization: authorization(editor)}, body: '{}'});
+    expect(recovery.status).toBe(503);
+  });
   beforeAll(async () => {
     const testRoot = join(ROOT, '.wrangler');
     await mkdir(testRoot, {recursive: true});

@@ -120,3 +120,57 @@ pub fn wasm_prepare_package(
         Err(error) => json!({"ok": false, "error": {"code": error.code().as_str()}}).to_string(),
     }
 }
+
+fn decode_hex_actor(s: &str) -> std::result::Result<Vec<u8>, JsValue> {
+    if s.len() != 32 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(JsValue::from_str("ACTOR_ID_HEX_INVALID"));
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&s[i..i + 2], 16)
+                .map_err(|_| JsValue::from_str("ACTOR_ID_HEX_INVALID"))
+        })
+        .collect()
+}
+
+#[wasm_bindgen]
+pub fn wasm_automerge_genesis(
+    initial_json: &str,
+    actor_id_hex: &str,
+) -> std::result::Result<Vec<u8>, JsValue> {
+    let actor = decode_hex_actor(actor_id_hex)?;
+    crate::crdt::create_genesis_document(initial_json, &actor).map_err(|e| JsValue::from_str(&e))
+}
+
+#[wasm_bindgen]
+pub fn wasm_automerge_apply_patch(
+    doc_bytes: &[u8],
+    patch_json: &str,
+    actor_id_hex: &str,
+) -> std::result::Result<Vec<u8>, JsValue> {
+    let actor = decode_hex_actor(actor_id_hex)?;
+    crate::crdt::apply_patch_to_document(doc_bytes, patch_json, &actor)
+        .map_err(|e| JsValue::from_str(&e))
+}
+
+#[wasm_bindgen]
+pub fn wasm_automerge_merge(
+    local_bytes: &[u8],
+    remote_bytes: &[u8],
+) -> std::result::Result<Vec<u8>, JsValue> {
+    crate::crdt::merge_documents(local_bytes, remote_bytes).map_err(|e| JsValue::from_str(&e))
+}
+
+#[wasm_bindgen]
+pub fn wasm_automerge_project(doc_bytes: &[u8]) -> std::result::Result<String, JsValue> {
+    crate::crdt::project_document_to_json(doc_bytes).map_err(|e| JsValue::from_str(&e))
+}
+
+#[wasm_bindgen]
+pub fn wasm_automerge_validate(doc_bytes: &[u8], max_bytes: u32) -> String {
+    match crate::crdt::validate_document(doc_bytes, max_bytes as usize) {
+        Ok(()) => json!({"ok": true}).to_string(),
+        Err(e) => json!({"ok": false, "error": {"code": e}}).to_string(),
+    }
+}

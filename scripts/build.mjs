@@ -5,6 +5,7 @@ import {spawnSync} from 'node:child_process';
 import ts from 'typescript';
 import {signAsync} from '@noble/ed25519';
 import canonicalize from 'canonicalize';
+import {pathToFileURL} from 'node:url';
 
 const root = process.cwd();
 const candidate = process.env.SMALLFRAME_CANDIDATE ?? 'U';
@@ -46,14 +47,20 @@ if (phase1Bindgen.status !== 0) process.exit(phase1Bindgen.status ?? 1);
 const phase1Wasm = readFileSync(join(phase1WasmOutput, 'smallframe_verifier_bg.wasm'));
 if (phase1Wasm.byteLength < 8 || phase1Wasm.byteLength > 2 * 1024 * 1024 || !phase1Wasm.subarray(0, 8).equals(Buffer.from([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]))) throw new Error('PHASE1_WASM_ARTIFACT_INVALID');
 const phase1WasmDigest = createHash('sha256').update(phase1Wasm).digest('hex');
+// Public test template only. Each test publisher encrypts these exact shared
+// genesis bytes before its local relay initialization; recipients never recreate them.
+const genesisVerifier = await import(pathToFileURL(join(phase1WasmOutput, 'smallframe_verifier.js')).href);
+genesisVerifier.initSync({module: phase1Wasm});
+writeFileSync(join(phase1WasmOutput, 'phase3-genesis.bin'), genesisVerifier.wasm_automerge_genesis('{"decisions":{}}', '01'.repeat(16)));
 const phase1GlueRaw = readFileSync(join(phase1WasmOutput, 'smallframe_verifier.js'), 'utf8');
 const phase1Glue = phase1GlueRaw
   .replace(/^export \{[^\n]+\};?$/gmu, '')
-  .replace(/^export /gmu, '');
+  .replace(/^export /gmu, '')
+  .replace(/import\.meta\.url/gu, "''");
 if (/^\s*(?:import|export)\s/mu.test(phase1Glue) || /^\s*\{[^\n]*\bas\s+(?:default|[A-Za-z_$])/mu.test(phase1Glue)) {
   throw new Error('PHASE1_WASM_GLUE_MODULE_SYNTAX');
 }
-const phase1GluePrelude = `{\n${phase1Glue}\nglobalThis.__smallframePhase1Verifier = Object.freeze({initSync, wasm_prepare_package, wasm_sha256_hex, wasm_validate_state, wasm_verifier_self_test, wasm_verifier_version, wasm_verify_package});\n}\n`;
+const phase1GluePrelude = `{\n${phase1Glue}\nglobalThis.__smallframePhase1Verifier = Object.freeze({initSync, wasm_prepare_package, wasm_sha256_hex, wasm_validate_state, wasm_verifier_self_test, wasm_verifier_version, wasm_verify_package, wasm_automerge_genesis, wasm_automerge_apply_patch, wasm_automerge_merge, wasm_automerge_project, wasm_automerge_validate});\n}\n`;
 const phase0WasmCsp = process.env.SMALLFRAME_U_WASM_CSP ?? 'allow';
 if (!['allow', 'deny'].includes(phase0WasmCsp) || (candidate !== 'U' && phase0WasmCsp !== 'allow')) throw new Error('SMALLFRAME_U_WASM_CSP requires Candidate U and allow|deny');
 const wasmEvalSource = phase0WasmCsp === 'allow' ? " 'wasm-unsafe-eval'" : '';
@@ -65,6 +72,270 @@ cpSync(join(root, 'apps/controller/public/controller.css'), join(controller, 'co
 cpSync(join(root, 'apps/controller/public/manifest.webmanifest'), join(controller, 'manifest.webmanifest'));
 cpSync(join(root, 'apps/controller/public/icon.svg'), join(controller, 'icon.svg'));
 cpSync(join(root, 'apps/controller/public/fixture-module.js'), join(controller, 'fixture-module.js'));
+
+const nobleEd25519Raw = readFileSync(join(root, 'node_modules/@noble/ed25519/index.js'), 'utf8')
+  .replace(/^export \{/mu, 'const ed25519_exports = {')
+  .replace('Point as ExtendedPoint', 'ExtendedPoint: Point');
+const canonicalizeRaw = readFileSync(join(root, 'node_modules/canonicalize/lib/canonicalize.js'), 'utf8')
+  .replace(/module\.exports\s*=\s*/mu, 'const canonicalize = ');
+
+const stateWorkerSource = `const PHASE1_WASM_BASE64 = ${inlineScriptString(phase1Wasm.toString('base64'))};
+${phase1Glue}
+${canonicalizeRaw}
+${nobleEd25519Raw}
+
+const STATE_CIPHERTEXT_LIMIT = 524288;
+const PADDING_BUCKET_BYTES = 4096;
+
+const encodeBase64Url = (bytes) => {
+  let binary = '';
+  for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary).replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '');
+};
+
+const decodeBase64Url = (str) => {
+  let base64 = str.replaceAll('-', '+').replaceAll('_', '/');
+  while (base64.length % 4 !== 0) base64 += '=';
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+};
+
+const uint32be = (value) => {
+  const buf = new Uint8Array(4);
+  new DataView(buf.buffer, buf.byteOffset, buf.byteLength).setUint32(0, value, false);
+  return buf;
+};
+
+const uint64be = (value) => {
+  const buf = new Uint8Array(8);
+  new DataView(buf.buffer, buf.byteOffset, buf.byteLength).setBigUint64(0, BigInt(value), false);
+  return buf;
+};
+
+const concatBytes = (...arrays) => {
+  const total = arrays.reduce((acc, a) => acc + a.byteLength, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const a of arrays) {
+    out.set(a, offset);
+    offset += a.byteLength;
+  }
+  return out;
+};
+
+const sha256 = async (data) => {
+  const digest = await crypto.subtle.digest('SHA-256', data);
+  return new Uint8Array(digest);
+};
+
+const deriveEnvelopeKey = async (roomKey, rawRoomId, envelopeSalt, stateEpoch, proposedRevision) => {
+  const saltPrefix = new TextEncoder().encode('smallframe/state/salt/v1\\0');
+  const hkdfSalt = await sha256(concatBytes(saltPrefix, rawRoomId, envelopeSalt));
+  const infoPrefix = new TextEncoder().encode('smallframe/state/key/v1\\0');
+  const hkdfInfo = concatBytes(infoPrefix, uint64be(stateEpoch), uint64be(proposedRevision));
+  const keyMaterial = await crypto.subtle.importKey('raw', roomKey, 'HKDF', false, ['deriveKey']);
+  return crypto.subtle.deriveKey(
+    {name: 'HKDF', hash: 'SHA-256', salt: hkdfSalt, info: hkdfInfo},
+    keyMaterial,
+    {name: 'AES-GCM', length: 256},
+    false,
+    ['encrypt', 'decrypt']
+  );
+};
+
+const padPlaintext = (automergeBytes) => {
+  const unpaddedLength = 4 + automergeBytes.byteLength;
+  const bucketCount = Math.ceil(unpaddedLength / PADDING_BUCKET_BYTES);
+  const totalLength = Math.max(PADDING_BUCKET_BYTES, bucketCount * PADDING_BUCKET_BYTES);
+  const paddingLength = totalLength - unpaddedLength;
+  const lenPrefix = uint32be(automergeBytes.byteLength);
+  const padding = new Uint8Array(paddingLength);
+  if (paddingLength > 0) crypto.getRandomValues(padding);
+  return concatBytes(lenPrefix, automergeBytes, padding);
+};
+
+const unpadPlaintext = (padded) => {
+  if (padded.byteLength < 4 || padded.byteLength % PADDING_BUCKET_BYTES !== 0) throw new Error('INVALID_PADDING_LENGTH');
+  const view = new DataView(padded.buffer, padded.byteOffset, padded.byteLength);
+  const declaredLength = view.getUint32(0, false);
+  if (declaredLength > padded.byteLength - 4) throw new Error('DECLARED_LENGTH_EXCEEDS_PLAINTEXT');
+  const expectedTotal = Math.max(PADDING_BUCKET_BYTES, Math.ceil((4 + declaredLength) / PADDING_BUCKET_BYTES) * PADDING_BUCKET_BYTES);
+  if (padded.byteLength !== expectedTotal) throw new Error('NON_CANONICAL_PADDING_BUCKET');
+  return padded.slice(4, 4 + declaredLength);
+};
+
+const computeWriteMessage = async (rawRoomId, rawPackageDigest, stateEpoch, proposedRevision, rawPreviousEnvelopeDigest, envelopeSalt, aadBytes, ciphertextBytes) => {
+  const prefix = new TextEncoder().encode('smallframe-room-snapshot-v1\\0');
+  const aadHash = await sha256(aadBytes);
+  const cipherHash = await sha256(ciphertextBytes);
+  return sha256(concatBytes(prefix, rawRoomId, rawPackageDigest, uint64be(stateEpoch), uint64be(proposedRevision), rawPreviousEnvelopeDigest, envelopeSalt, aadHash, cipherHash));
+};
+
+const computeEnvelopeDigest = async (envelopeWithoutSignature, writerSignature) => {
+  const prefix = new TextEncoder().encode('smallframe/envelope-digest/v1\\0');
+  const unsignedJcs = new TextEncoder().encode(canonicalize(envelopeWithoutSignature));
+  return sha256(concatBytes(prefix, uint64be(unsignedJcs.byteLength), unsignedJcs, writerSignature));
+};
+
+const computeEtag = (stateEpoch, proposedRevision, envelopeDigest) => {
+  return \`"sf1.\${stateEpoch}.\${proposedRevision}.\${encodeBase64Url(envelopeDigest)}"\`;
+};
+
+const encryptSnapshot = async (params) => {
+  const rawRoomId = decodeBase64Url(params.roomId);
+  const rawPackageDigest = decodeBase64Url(params.packageDigest);
+  const rawPreviousDigest = decodeBase64Url(params.previousEnvelopeDigest);
+  const envelopeSalt = new Uint8Array(16);
+  crypto.getRandomValues(envelopeSalt);
+  const derivedKey = await deriveEnvelopeKey(params.roomKey, rawRoomId, envelopeSalt, params.stateEpoch, params.proposedRevision);
+
+  const aad = {
+    protocolVersion: 1,
+    appId: params.appId || params.roomId,
+    roomId: params.roomId,
+    packageDigest: params.packageDigest,
+    stateEpoch: params.stateEpoch,
+    proposedRevision: params.proposedRevision,
+    previousEnvelopeDigest: params.previousEnvelopeDigest
+  };
+  const aadBytes = new TextEncoder().encode(canonicalize(aad));
+  const paddedPlaintext = padPlaintext(params.automergeBytes);
+  const nonce = new Uint8Array(12);
+
+  const encryptedBuffer = await crypto.subtle.encrypt(
+    {name: 'AES-GCM', iv: nonce, additionalData: aadBytes, tagLength: 128},
+    derivedKey,
+    paddedPlaintext
+  );
+  const ciphertextBytes = new Uint8Array(encryptedBuffer);
+  if (ciphertextBytes.byteLength > STATE_CIPHERTEXT_LIMIT) throw new Error('STATE_CIPHERTEXT_LIMIT_EXCEEDED');
+
+  const writeMessage = await computeWriteMessage(rawRoomId, rawPackageDigest, params.stateEpoch, params.proposedRevision, rawPreviousDigest, envelopeSalt, aadBytes, ciphertextBytes);
+  const writerSignature = await signAsync(writeMessage, params.writerPrivateKey);
+  const writerPublicKey = await getPublicKeyAsync(params.writerPrivateKey);
+
+  const envelopeWithoutSig = {
+    version: 1,
+    stateEpoch: params.stateEpoch,
+    proposedRevision: params.proposedRevision,
+    envelopeSalt: encodeBase64Url(envelopeSalt),
+    previousEnvelopeDigest: params.previousEnvelopeDigest,
+    ciphertext: encodeBase64Url(ciphertextBytes),
+    writerPublicKey: encodeBase64Url(writerPublicKey),
+    aad
+  };
+  const envelopeDigest = await computeEnvelopeDigest(envelopeWithoutSig, writerSignature);
+  const etag = computeEtag(params.stateEpoch, params.proposedRevision, envelopeDigest);
+  const envelope = {
+    ...envelopeWithoutSig,
+    writerSignature: encodeBase64Url(writerSignature)
+  };
+  return {envelope, envelopeDigest: encodeBase64Url(envelopeDigest), etag};
+};
+
+const decryptSnapshot = async (params) => {
+  const {envelope} = params;
+  if (envelope.version !== 1) throw new Error('UNSUPPORTED_ENVELOPE_VERSION');
+  if (envelope.aad.roomId !== params.roomId) throw new Error('ROOM_ID_AAD_MISMATCH');
+  if (envelope.aad.packageDigest !== params.packageDigest) throw new Error('PACKAGE_DIGEST_AAD_MISMATCH');
+  if (envelope.aad.stateEpoch !== envelope.stateEpoch || envelope.aad.proposedRevision !== envelope.proposedRevision) throw new Error('EPOCH_REVISION_AAD_MISMATCH');
+
+  const rawRoomId = decodeBase64Url(params.roomId);
+  const rawPackageDigest = decodeBase64Url(params.packageDigest);
+  const rawPreviousDigest = decodeBase64Url(envelope.previousEnvelopeDigest);
+  const envelopeSalt = decodeBase64Url(envelope.envelopeSalt);
+  const ciphertextBytes = decodeBase64Url(envelope.ciphertext);
+  const writerPublicKey = decodeBase64Url(envelope.writerPublicKey);
+  const writerSignature = decodeBase64Url(envelope.writerSignature);
+
+  if (ciphertextBytes.byteLength > STATE_CIPHERTEXT_LIMIT) throw new Error('STATE_CIPHERTEXT_LIMIT_EXCEEDED');
+  if (params.expectedWriterPublicKey) {
+    if (writerPublicKey.byteLength !== 32 || params.expectedWriterPublicKey.byteLength !== 32) throw new Error('WRITER_KEY_LENGTH_MISMATCH');
+    for (let i = 0; i < 32; i++) {
+      if (writerPublicKey[i] !== params.expectedWriterPublicKey[i]) throw new Error('WRITER_PUBLIC_KEY_MISMATCH');
+    }
+  }
+
+  const aadBytes = new TextEncoder().encode(canonicalize(envelope.aad));
+  const writeMessage = await computeWriteMessage(rawRoomId, rawPackageDigest, envelope.stateEpoch, envelope.proposedRevision, rawPreviousDigest, envelopeSalt, aadBytes, ciphertextBytes);
+  const validSig = await verifyAsync(writerSignature, writeMessage, writerPublicKey);
+  if (!validSig) throw new Error('WRITER_SIGNATURE_INVALID');
+
+  const unsignedEnvelope = {
+    version: 1,
+    stateEpoch: envelope.stateEpoch,
+    proposedRevision: envelope.proposedRevision,
+    envelopeSalt: envelope.envelopeSalt,
+    previousEnvelopeDigest: envelope.previousEnvelopeDigest,
+    ciphertext: envelope.ciphertext,
+    writerPublicKey: envelope.writerPublicKey,
+    aad: envelope.aad
+  };
+  const envelopeDigest = await computeEnvelopeDigest(unsignedEnvelope, writerSignature);
+  const etag = computeEtag(envelope.stateEpoch, envelope.proposedRevision, envelopeDigest);
+
+  const derivedKey = await deriveEnvelopeKey(params.roomKey, rawRoomId, envelopeSalt, envelope.stateEpoch, envelope.proposedRevision);
+  const nonce = new Uint8Array(12);
+  const decryptedBuffer = await crypto.subtle.decrypt(
+    {name: 'AES-GCM', iv: nonce, additionalData: aadBytes, tagLength: 128},
+    derivedKey,
+    ciphertextBytes
+  );
+  const automergeBytes = unpadPlaintext(new Uint8Array(decryptedBuffer));
+  const val = JSON.parse(wasm_automerge_validate(automergeBytes, 475136));
+  if (!val.ok) throw new Error(val.error?.code || 'REMOTE_STATE_INVALID');
+  const projected = wasm_automerge_project(automergeBytes);
+  return {automergeBytes, projectedState: JSON.parse(projected), envelopeDigest: encodeBase64Url(envelopeDigest), etag};
+};
+
+let initialized = false;
+function ensureWasm() {
+  if (initialized) return;
+  const binary = atob(PHASE1_WASM_BASE64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  initSync({module: bytes});
+  initialized = true;
+}
+
+self.onmessage = async (event) => {
+  const {id, type} = event.data;
+  try {
+    ensureWasm();
+    if (type === 'genesis') {
+      const {initialJson, actorIdHex} = event.data;
+      const bytes = wasm_automerge_genesis(initialJson, actorIdHex);
+      const projected = wasm_automerge_project(bytes);
+      self.postMessage({id, ok: true, bytes, projectedState: JSON.parse(projected)});
+    } else if (type === 'apply_patch') {
+      const {docBytes, patchJson, actorIdHex} = event.data;
+      const bytes = wasm_automerge_apply_patch(docBytes, patchJson, actorIdHex);
+      const projected = wasm_automerge_project(bytes);
+      self.postMessage({id, ok: true, bytes, projectedState: JSON.parse(projected)});
+    } else if (type === 'merge') {
+      const {localBytes, remoteBytes} = event.data;
+      const val = JSON.parse(wasm_automerge_validate(remoteBytes, 475136));
+      if (!val.ok) throw new Error(val.error?.code || 'REMOTE_STATE_INVALID');
+      const bytes = wasm_automerge_merge(localBytes, remoteBytes);
+      const projected = wasm_automerge_project(bytes);
+      self.postMessage({id, ok: true, bytes, projectedState: JSON.parse(projected)});
+    } else if (type === 'encrypt') {
+      const result = await encryptSnapshot(event.data);
+      self.postMessage({id, ok: true, ...result});
+    } else if (type === 'decrypt') {
+      const result = await decryptSnapshot(event.data);
+      self.postMessage({id, ok: true, ...result});
+    } else {
+      self.postMessage({id, ok: false, error: 'UNKNOWN_COMMAND'});
+    }
+  } catch (err) {
+    self.postMessage({id, ok: false, error: err instanceof Error ? err.message : String(err)});
+  }
+};
+`;
+writeFileSync(join(controller, 'state-worker.js'), stateWorkerSource);
 
 const candidateFactoryPath = candidate === 'U' ? 'candidate-u-factory.js' : candidate === 'T' ? 'candidate-t-factory.js' : 'candidate-s-factory.js';
 const legacyFixture = process.env.SMALLFRAME_T_FIXTURE ?? '';
@@ -167,6 +438,7 @@ const staticPaths = [
   '/personal-store.js',
   '/shared-runtime.js',
   '/shared-store.js',
+  '/state-worker.js',
   `/runtime/renderer/${rendererDigest}.html`
 ].sort();
 const controllerAssetSet = {};
@@ -238,4 +510,3 @@ writeFileSync(join(controller, 'release.json'), JSON.stringify(releaseEnvelope, 
 
 writeFileSync(join(dist, 'renderer', 'renderer.js'), rendererSource);
 console.log(JSON.stringify({candidate, fixture: fixture || 'valid', channelFixture: candidateUChannelFixture || 'valid', rendererDigest, rendererBytes: Buffer.byteLength(rendererHtml), rendererBootstrapHash, rendererCssHash, phase0WasmBytes: phase0Wasm.byteLength, phase0WasmDigest, phase1WasmBytes: phase1Wasm.byteLength, phase1WasmDigest, phase2PackageBytes: phase2Package.byteLength, phase2PackageArtifactDigest: createHash('sha256').update(phase2Package).digest('hex'), phase2Default, phase0WasmCsp, candidateFactory: candidateFactoryPath, candidateFactoryBytes: Buffer.byteLength(candidateFactorySource), candidateFactoryDigest: createHash('sha256').update(candidateFactorySource).digest('hex'), buildId}, null, 2));
-

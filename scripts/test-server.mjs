@@ -1,11 +1,49 @@
 import {createHash} from 'node:crypto';
-import {createReadStream, existsSync, readFileSync, statSync} from 'node:fs';
+import {createReadStream, existsSync, readFileSync, statSync, mkdirSync, mkdtempSync} from 'node:fs';
 import {createServer} from 'node:http';
 import {extname, join, normalize, sep} from 'node:path';
-import {WebSocketServer} from 'ws';
+import {WebSocket, WebSocketServer} from 'ws';
+import {Miniflare} from 'miniflare';
+import {build} from 'vite';
 
 const root = process.cwd();
 const dist = join(root, 'dist', 'controller');
+mkdirSync(join(root, '.wrangler'), {recursive: true});
+const relayDir = mkdtempSync(join(root, '.wrangler', 'e2e-relay-'));
+await build({configFile: false, root, logLevel: 'silent', build: {
+  lib: {entry: join(root, 'apps/api/src/do-test-worker.ts'), formats: ['es'], fileName: () => 'worker.mjs'},
+  outDir: relayDir, target: 'es2022', minify: false,
+  rollupOptions: {external: ['cloudflare:workers']}
+}});
+const relay = new Miniflare({modules: true, scriptPath: join(relayDir, 'worker.mjs'),
+  compatibilityDate: '2026-07-30', host: '127.0.0.1', port: 0,
+  bindings: {CONTROLLER_ORIGIN: 'http://app.localhost:4173', ENVIRONMENT: 'local', BUILD_VERSION: 'local',
+    API_ORIGIN: 'http://api.localhost:8787', WEBSOCKET_ORIGIN: 'ws://api.localhost:8787'},
+  d1Databases: ['DB'], r2Buckets: ['PACKAGES'], durableObjects: {ROOMS: {className: 'RoomDurableObject', useSQLite: true}}
+});
+const relayOrigin = (await relay.ready).origin;
+const relayNetwork = {online: true};
+const forwardRelay = async (request, response) => {
+  if (!relayNetwork.online) { response.writeHead(503).end(); return; }
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of request) {
+    size += chunk.length;
+    if (size > 724992) { response.writeHead(413).end(); return; }
+    chunks.push(chunk);
+  }
+  const headers = {...request.headers};
+  delete headers.host;
+  const upstream = await fetch(relayOrigin + request.url, {
+    method: request.method, headers,
+    body: ['GET', 'HEAD'].includes(request.method) ? undefined : Buffer.concat(chunks)
+  });
+  const responseHeaders = new Headers(upstream.headers);
+  // fetch() has already decompressed the body; do not forward stale framing.
+  for (const name of ['content-encoding', 'content-length', 'transfer-encoding']) responseHeaders.delete(name);
+  response.writeHead(upstream.status, Object.fromEntries(responseHeaders));
+  response.end(Buffer.from(await upstream.arrayBuffer()));
+};
 const candidate = process.env.SMALLFRAME_CANDIDATE ?? 'U';
 const canary = {http: 0, ws: 0, paths: []};
 const appNetwork = {count: 0, paths: []};
@@ -28,7 +66,7 @@ const controllerHeaders = {
 };
 const PROVENANCE_HEADER = 'X-Smallframe-Response-Provenance';
 const serviceWorkerHeaders = {
-  'Content-Security-Policy': "default-src 'none'; script-src 'self'; connect-src http://app.localhost:4173/runtime/renderer/ http://app.localhost:4173/index.html http://app.localhost:4173/main.js http://app.localhost:4173/personal-store.js http://app.localhost:4173/personal-runtime.js http://app.localhost:4173/shared-store.js http://app.localhost:4173/shared-runtime.js http://app.localhost:4173/fixture-module.js http://app.localhost:4173/controller.css http://app.localhost:4173/manifest.webmanifest http://app.localhost:4173/icon.svg http://app.localhost:4173/release.json; worker-src 'none'; child-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; navigate-to 'none'; frame-ancestors 'none'",
+  'Content-Security-Policy': "default-src 'none'; script-src 'self'; connect-src http://app.localhost:4173/runtime/renderer/ http://app.localhost:4173/index.html http://app.localhost:4173/main.js http://app.localhost:4173/personal-store.js http://app.localhost:4173/personal-runtime.js http://app.localhost:4173/shared-store.js http://app.localhost:4173/shared-runtime.js http://app.localhost:4173/state-worker.js http://app.localhost:4173/fixture-module.js http://app.localhost:4173/controller.css http://app.localhost:4173/manifest.webmanifest http://app.localhost:4173/icon.svg http://app.localhost:4173/release.json; worker-src 'none'; child-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; navigate-to 'none'; frame-ancestors 'none'",
   'Content-Type': 'text/javascript; charset=utf-8',
   'X-Content-Type-Options': 'nosniff',
   'Cache-Control': 'no-store'
@@ -57,6 +95,7 @@ const resetEvidence = () => {
   appNetwork.paths.length = 0;
   serviceWorkerRequests.length = 0;
   rendererFaultTokens.clear();
+  relayNetwork.online = true;
 };
 const evidenceSnapshot = () => ({...canary, rendererFallback: {...rendererFallback}, rendererMutation: {...rendererMutation}, appNetwork: {...appNetwork}, serviceWorkerRequests: [...serviceWorkerRequests]});
 const validControllerQuery = (url) => {
@@ -126,7 +165,9 @@ const staticHandler = (request, response) => {
 const apiHandler = (request, response) => {
   const url = new URL(request.url ?? '/', 'http://api.localhost:8787');
   response.setHeader('Access-Control-Allow-Origin', 'http://app.localhost:4173');
+  response.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, POST, PUT, OPTIONS');
   response.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type, If-Match, SF-Known-Epoch');
+  response.setHeader('Access-Control-Expose-Headers', 'ETag, X-Smallframe-State-Epoch, X-Smallframe-Revision, X-Smallframe-Envelope-Digest');
   if (request.method === 'OPTIONS') { response.writeHead(204).end(); return; }
   if (url.pathname === '/__test__/evidence/reset' && request.method === 'POST') {
     resetEvidence();
@@ -146,10 +187,34 @@ const apiHandler = (request, response) => {
     return;
   }
   if (url.pathname === '/healthz') { response.writeHead(200, {'Content-Type': 'application/json'}).end('{"ok":true}'); return; }
+  if (url.pathname === '/__test__/relay-network' && request.method === 'POST') {
+    void bodyJson(request).then((body) => {
+      relayNetwork.online = body.online === true;
+      response.writeHead(204).end();
+    }).catch(() => response.writeHead(400).end());
+    return;
+  }
+  if (url.pathname.startsWith('/v1/') || url.pathname.startsWith('/__phase0/')) {
+    void forwardRelay(request, response).catch(() => response.writeHead(502).end());
+    return;
+  }
   response.writeHead(404, {'Content-Type': 'application/problem+json'}).end('{"type":"about:blank","title":"Not found","status":404}');
 };
 const controllerServer = createServer(staticHandler);
 const apiServer = createServer(apiHandler);
+const relaySockets = new WebSocketServer({noServer: true, handleProtocols: () => 'smallframe.v1'});
+apiServer.on('upgrade', (request, socket, head) => {
+  if (!relayNetwork.online) { socket.destroy(); return; }
+  const protocols = (request.headers['sec-websocket-protocol'] ?? '').split(',').map((s) => s.trim());
+  const upstream = new WebSocket(relayOrigin.replace('http:', 'ws:') + request.url, protocols, {origin: request.headers.origin});
+  upstream.on('error', () => socket.destroy());
+  upstream.on('open', () => relaySockets.handleUpgrade(request, socket, head, (client) => {
+    upstream.on('message', (data) => { if (client.readyState === WebSocket.OPEN) client.send(data.toString()); });
+    client.on('message', (data) => upstream.send(data));
+    client.on('close', () => upstream.close());
+    upstream.on('close', () => client.close());
+  }));
+});
 const setControllerNetwork = (online) => new Promise((resolve, reject) => {
   if (online) {
     if (controllerServer.listening) { resolve(); return; }
@@ -175,6 +240,9 @@ apiServer.listen(8787, '127.0.0.1');
 canaryServer.listen(8790, '127.0.0.1');
 for (const server of [controllerServer, apiServer, canaryServer]) server.on('error', (error) => { console.error('server error', error.message); process.exitCode = 1; });
 process.on('SIGTERM', () => {
+  for (const client of relaySockets.clients) client.terminate();
+  relaySockets.close();
+  void relay.dispose();
   sockets.close();
   if (controllerServer.listening) controllerServer.close();
   if (apiServer.listening) apiServer.close();

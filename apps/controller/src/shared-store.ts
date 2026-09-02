@@ -5,7 +5,7 @@
     role: 'viewer' | 'editor';
     roomKey: string;
     capability: string;
-    writerPrivateSeed?: string;
+    writerPrivateSeed?: string | undefined;
     state: Record<string, unknown>;
     stateEpoch: number;
     revision: number;
@@ -13,6 +13,7 @@
     etag: string;
     dirty: boolean;
     actorId: string;
+    automergeBase64?: string | undefined;
     updatedAt: number;
   };
 
@@ -35,11 +36,12 @@
   };
 
   const openDatabase = async (): Promise<IDBDatabase> => await new Promise((resolve, reject) => {
-    const request = indexedDB.open('smallframe-shared-v1', 1);
+    const request = indexedDB.open('smallframe-shared-v1', 2);
     request.onupgradeneeded = () => {
       const database = request.result;
       if (!database.objectStoreNames.contains('rooms')) database.createObjectStore('rooms', {keyPath: 'roomId'});
       if (!database.objectStoreNames.contains('approvals')) database.createObjectStore('approvals', {keyPath: 'approvalId'});
+      if (!database.objectStoreNames.contains('deviceKeys')) database.createObjectStore('deviceKeys', {keyPath: 'roomId'});
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(new Error('SHARED_STORAGE_OPEN_FAILED'));
@@ -85,9 +87,36 @@
     } finally { database.close(); }
   };
 
+  type WrappedRoom = {version: 1; roomId: string; nonce: Uint8Array<ArrayBuffer>; ciphertext: ArrayBuffer};
+  const deviceKey = async (roomId: string): Promise<CryptoKey> => navigator.locks.request(`smallframe:device-key:${roomId}`, async () => {
+    const saved = await readRecord<{roomId: string; key: CryptoKey}>('deviceKeys', roomId);
+    if (saved) return saved.key;
+    const key = await crypto.subtle.generateKey({name: 'AES-GCM', length: 256}, false, ['encrypt', 'decrypt']);
+    await writeRecord('deviceKeys', {roomId, key});
+    return key;
+  });
+  const roomAad = (roomId: string): Uint8Array<ArrayBuffer> => new TextEncoder().encode(`smallframe/local-room/v1:${roomId}`);
+  const loadWrappedRoom = async (roomId: string): Promise<StoredSharedRoom | undefined> => {
+    const saved = await readRecord<WrappedRoom>('rooms', roomId);
+    if (!saved) return undefined;
+    // Old prototype records are not silently blessed as encrypted storage.
+    if (saved.version !== 1 || !(saved.ciphertext instanceof ArrayBuffer)) throw new Error('LEGACY_ROOM_EXPORT_REQUIRED');
+    const key = await readRecord<{key: CryptoKey}>('deviceKeys', roomId);
+    if (!key) throw new Error('LOCAL_DEVICE_KEY_MISSING');
+    const bytes = await crypto.subtle.decrypt({name: 'AES-GCM', iv: saved.nonce, additionalData: roomAad(roomId)}, key.key, saved.ciphertext);
+    const room = JSON.parse(new TextDecoder().decode(bytes)) as StoredSharedRoom;
+    if (room.roomId !== roomId) throw new Error('LOCAL_ROOM_CONTEXT_INVALID');
+    return room;
+  };
+  const saveWrappedRoom = async (room: StoredSharedRoom): Promise<void> => {
+    const key = await deviceKey(room.roomId);
+    const nonce = crypto.getRandomValues(new Uint8Array(12));
+    const ciphertext = await crypto.subtle.encrypt({name: 'AES-GCM', iv: nonce, additionalData: roomAad(room.roomId)}, key, new TextEncoder().encode(JSON.stringify(room)));
+    await writeRecord('rooms', {version: 1, roomId: room.roomId, nonce, ciphertext});
+  };
   const api: SharedStoreApi = Object.freeze({
-    loadRoom: async (roomId) => await readRecord<StoredSharedRoom>('rooms', roomId),
-    saveRoom: async (room) => await writeRecord('rooms', room),
+    loadRoom: loadWrappedRoom,
+    saveRoom: saveWrappedRoom,
     forgetRoom: async (roomId) => await deleteRecord('rooms', roomId),
     loadApproval: async (approvalId) => await readRecord<StoredSharedApproval>('approvals', approvalId),
     saveApproval: async (approval) => await writeRecord('approvals', approval)

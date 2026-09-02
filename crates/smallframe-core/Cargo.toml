@@ -30,8 +30,10 @@ sha2 = "=0.10.9"
 subtle = "=2.6.1"
 thiserror = "=2.0.20"
 unicode-normalization = "=0.1.25"
+automerge = "=0.11.0"
 wasm-bindgen = { version = "=0.2.127", optional = true }
 zip = { version = "=8.6.0", default-features = false }
 
-[dev-dependencies]
-automerge = "=0.11.0"
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom_04 = { package = "getrandom", version = "0.4.3", features = ["wasm_js"] }
+getrandom_02 = { package = "getrandom", version = "0.2.17", features = ["js"] }

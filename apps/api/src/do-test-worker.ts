@@ -1,7 +1,7 @@
 import productionWorker, {RoomDurableObject, type WorkerEnvironment} from './do-worker.js';
 import {ROOM_ID_RE} from './do-crypto.js';
 
-const TEST_ROUTE = /^\/__phase0\/rooms\/([A-Za-z0-9_-]{22})\/(?:init|status)$/u;
+const TEST_ROUTE = /^\/__phase0\/rooms\/([A-Za-z0-9_-]{22})\/(?:init|init-envelope|status)$/u;
 
 const testWorker = {
   async fetch(request: Request, env: WorkerEnvironment): Promise<Response> {

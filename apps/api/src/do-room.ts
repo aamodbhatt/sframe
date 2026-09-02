@@ -12,6 +12,15 @@ import {
 } from './do-crypto.js';
 import {readApiRuntimeConfig, type ApiEnvironment} from './runtime-config.js';
 
+import {verifyAsync} from '@noble/ed25519';
+import canonicalize from 'canonicalize';
+import {
+  computeWriteMessage,
+  computeEnvelopeDigest,
+  computeEtag,
+  type WireEnvelope
+} from '../../../packages/protocol/src/index.js';
+
 const MAX_STATE_BYTES = 524_288;
 const TICKET_TTL_MS = 30_000;
 const PRODUCTION_HOLD_MS = 25_000;
@@ -36,6 +45,12 @@ type RoomRow = {
   envelope_digest: string;
   ciphertext: ArrayBuffer;
   etag: string;
+  recovery_status?: string | null;
+  previous_envelope_digest?: string | null;
+  writer_public_key?: ArrayBuffer | null;
+  writer_signature?: ArrayBuffer | null;
+  envelope_salt?: string | null;
+  aad_json?: string | null;
 };
 
 type TicketRow = {
@@ -146,7 +161,27 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
         revision INTEGER NOT NULL CHECK (revision >= 1),
         envelope_digest TEXT NOT NULL,
         ciphertext BLOB NOT NULL CHECK (length(ciphertext) <= 524288),
-        etag TEXT NOT NULL UNIQUE
+        etag TEXT NOT NULL UNIQUE,
+        recovery_status TEXT DEFAULT 'ACTIVE',
+        previous_envelope_digest TEXT,
+        writer_public_key BLOB,
+        writer_signature BLOB,
+        envelope_salt TEXT,
+        aad_json TEXT
+      ) STRICT
+    `).toArray();
+    try { this.ctx.storage.sql.exec('ALTER TABLE room_state ADD COLUMN recovery_status TEXT DEFAULT "ACTIVE"'); } catch {}
+    try { this.ctx.storage.sql.exec('ALTER TABLE room_state ADD COLUMN previous_envelope_digest TEXT'); } catch {}
+    try { this.ctx.storage.sql.exec('ALTER TABLE room_state ADD COLUMN writer_public_key BLOB'); } catch {}
+    try { this.ctx.storage.sql.exec('ALTER TABLE room_state ADD COLUMN writer_signature BLOB'); } catch {}
+    try { this.ctx.storage.sql.exec('ALTER TABLE room_state ADD COLUMN envelope_salt TEXT'); } catch {}
+    try { this.ctx.storage.sql.exec('ALTER TABLE room_state ADD COLUMN aad_json TEXT'); } catch {}
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS recovery_transition_log (
+        epoch INTEGER PRIMARY KEY,
+        transition_record TEXT NOT NULL,
+        signature TEXT NOT NULL,
+        created_at_ms INTEGER NOT NULL
       ) STRICT
     `).toArray();
     this.ctx.storage.sql.exec(`
@@ -167,6 +202,8 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
   }
 
   private async dispatchPhase0(url: URL, request: Request): Promise<Response | null> {
+    const envelopeMatch = /^\/__phase0\/rooms\/([A-Za-z0-9_-]{22})\/init-envelope$/u.exec(url.pathname);
+    if (envelopeMatch?.[1]) return this.initializeEncryptedForLocalTest(envelopeMatch[1], request);
     const initMatch = /^\/__phase0\/rooms\/([A-Za-z0-9_-]{22})\/init$/u.exec(url.pathname);
     const initRoomId = initMatch?.[1];
     if (initRoomId && ROOM_ID_RE.test(initRoomId)) return this.initializeForPhase0(initRoomId, request);
@@ -178,6 +215,42 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
       return new Response(JSON.stringify({waiters: this.waiters.size, sockets: this.ctx.getWebSockets().length}), {headers: jsonHeaders});
     }
     return null;
+  }
+
+  // Test-only bootstrap: the production publisher saga must eventually supply this
+  // same pinned genesis atomically. Never expose this route outside local mode.
+  private async initializeEncryptedForLocalTest(roomId: string, request: Request): Promise<Response> {
+    if (this.env.ENVIRONMENT !== 'local' || request.method !== 'POST') return problem(404, 'NOT_FOUND');
+    const bounded = await readBoundedBody(request, 724_992);
+    if (bounded.kind !== 'ok') return problem(400, 'BODY_INVALID');
+    try {
+      const body = JSON.parse(new TextDecoder().decode(bounded.body));
+      const viewer = decodeFixed32(body.viewerCapHash);
+      const editor = decodeFixed32(body.editorCapHash);
+      const envelope = this.parsePutWireEnvelope(new TextEncoder().encode(JSON.stringify(body.envelope)));
+      if (!viewer || !editor || !envelope) return problem(400, 'BODY_INVALID');
+      if (!Number.isSafeInteger(body.expiresAtMs) || body.expiresAtMs <= Date.now()) return problem(400, 'EXPIRY_INVALID');
+      const zero = encodeBase64Url(new Uint8Array(32));
+      const initial = {room_id: roomId, state_epoch: 0, revision: 0, envelope_digest: zero} as RoomRow;
+      const verified = await this.verifyWireEnvelope(envelope, initial);
+      if (!verified.ok) return problem(verified.status, verified.code);
+      const created = this.ctx.storage.transactionSync(() => {
+        if (this.loadRoom(roomId)) return false;
+        this.ctx.storage.sql.exec(`INSERT INTO room_state (
+          singleton, room_id, viewer_cap_hash, editor_cap_hash, expires_at_ms,
+          state_epoch, revision, envelope_digest, ciphertext, etag, recovery_status,
+          previous_envelope_digest, writer_public_key, writer_signature, envelope_salt, aad_json
+        ) VALUES (1, ?, ?, ?, ?, 0, 1, ?, ?, ?, 'ACTIVE', ?, ?, ?, ?, ?)`,
+        roomId, exactArrayBuffer(viewer), exactArrayBuffer(editor), body.expiresAtMs,
+        verified.envelopeDigest, exactArrayBuffer(verified.cipherBytes), verified.etag,
+        zero, exactArrayBuffer(verified.writerPubBytes), exactArrayBuffer(verified.writerSigBytes),
+        envelope.envelopeSalt, JSON.stringify(envelope.aad)).toArray();
+        return true;
+      });
+      return created ? new Response(null, {status: 201}) : problem(409, 'INITIALIZATION_CONFLICT');
+    } catch {
+      return problem(400, 'BODY_INVALID');
+    }
   }
 
   private async dispatchAction(action: string, request: Request, room: RoomRow): Promise<Response> {
@@ -271,6 +344,11 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
 
   private async requestRepair(request: Request, room: RoomRow): Promise<Response> {
     if (!await this.authorize(request, room, true)) return problem(403, 'ROOM_AUTH_INVALID');
+    this.ctx.storage.sql.exec(
+      `UPDATE room_state SET recovery_status = 'RECOVERY_REQUIRED' WHERE singleton = 1 AND room_id = ?`,
+      room.room_id
+    ).toArray();
+
     for (const socket of this.ctx.getWebSockets()) {
       try { socket.close(1008, 'recovery required'); } catch {}
     }
@@ -279,6 +357,9 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
 
   private async recoverRoom(request: Request, room: RoomRow): Promise<Response> {
     if (!await this.authorize(request, room, true)) return problem(403, 'ROOM_AUTH_INVALID');
+    // Signed epoch recovery is not implemented yet. Do not allow the legacy
+    // opaque-byte test hook to reset an encrypted room without its signatures.
+    if (room.aad_json) return problem(503, 'SIGNED_RECOVERY_NOT_IMPLEMENTED');
     let body: any;
     try {
       body = await request.json();
@@ -292,7 +373,7 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
     const etag = this.etag(newEpoch, 1, digest);
 
     this.ctx.storage.sql.exec(
-      `UPDATE room_state SET state_epoch = ?, revision = 1, envelope_digest = ?, ciphertext = ?, etag = ? WHERE singleton = 1 AND room_id = ?`,
+      `UPDATE room_state SET state_epoch = ?, revision = 1, envelope_digest = ?, ciphertext = ?, etag = ?, recovery_status = 'ACTIVE' WHERE singleton = 1 AND room_id = ?`,
       newEpoch,
       digest,
       exactArrayBuffer(ciphertext),
@@ -418,7 +499,9 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
   private loadRoom(roomId: string): RoomRow | null {
     const rows = this.ctx.storage.sql.exec<RoomRow>(
       `SELECT room_id, viewer_cap_hash, editor_cap_hash, expires_at_ms, revoked_at_ms,
-              state_epoch, revision, envelope_digest, ciphertext, etag
+              state_epoch, revision, envelope_digest, ciphertext, etag,
+              recovery_status, previous_envelope_digest, writer_public_key,
+              writer_signature, envelope_salt, aad_json
        FROM room_state WHERE singleton = 1 AND room_id = ?`,
       roomId,
     ).toArray();
@@ -470,34 +553,177 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
 
   private async getState(request: Request, room: RoomRow): Promise<Response> {
     if (!await this.authorize(request, room)) return problem(403, 'ROOM_AUTH_INVALID');
+    if (room.recovery_status === 'RECOVERY_REQUIRED') {
+      return new Response(JSON.stringify({
+        status: 'RECOVERY_REQUIRED',
+        stateEpoch: room.state_epoch,
+        revision: room.revision,
+        etag: room.etag,
+      }), {
+        status: 503,
+        headers: {
+          ...jsonHeaders,
+          ...this.corsHeaders(),
+          ETag: room.etag,
+          'X-Smallframe-State-Epoch': String(room.state_epoch),
+          'X-Smallframe-Revision': String(room.revision),
+          'X-Smallframe-Envelope-Digest': room.envelope_digest,
+        }
+      });
+    }
+
     const headers = {
       ...noStoreHeaders,
       ...this.corsHeaders(),
-      'Content-Type': 'application/octet-stream',
       ETag: room.etag,
       'X-Smallframe-State-Epoch': String(room.state_epoch),
       'X-Smallframe-Revision': String(room.revision),
       'X-Smallframe-Envelope-Digest': room.envelope_digest,
     };
     if (request.headers.get('If-None-Match') === room.etag) return new Response(null, {status: 304, headers});
-    return new Response(room.ciphertext, {headers});
+
+    if (room.aad_json) {
+      const wireEnvelope = {
+        version: 1,
+        stateEpoch: room.state_epoch,
+        proposedRevision: room.revision,
+        envelopeSalt: room.envelope_salt ?? '',
+        previousEnvelopeDigest: room.previous_envelope_digest ?? '',
+        ciphertext: encodeBase64Url(bytesFromSql(room.ciphertext)),
+        writerPublicKey: room.writer_public_key ? encodeBase64Url(bytesFromSql(room.writer_public_key)) : '',
+        writerSignature: room.writer_signature ? encodeBase64Url(bytesFromSql(room.writer_signature)) : '',
+        aad: JSON.parse(room.aad_json)
+      };
+      return new Response(JSON.stringify(wireEnvelope), {
+        headers: {...headers, 'Content-Type': 'application/json; charset=utf-8'}
+      });
+    }
+
+    return new Response(room.ciphertext, {
+      headers: {...headers, 'Content-Type': 'application/octet-stream'}
+    });
   }
 
-  private async putState(request: Request, initialRoom: RoomRow): Promise<Response> {
-    if (!await this.authorize(request, initialRoom, true)) return problem(403, 'ROOM_AUTH_INVALID');
-    if (request.headers.get('Content-Type') !== 'application/octet-stream') return problem(415, 'CONTENT_TYPE_INVALID');
-    const ifMatch = request.headers.get('If-Match');
-    if (!ifMatch) return problem(428, 'IF_MATCH_REQUIRED');
-    const declaredLength = request.headers.get('Content-Length');
-    if (declaredLength && (!/^\d+$/u.test(declaredLength) || Number(declaredLength) > MAX_STATE_BYTES)) return problem(413, 'STATE_TOO_LARGE');
-    const boundedBody = await readBoundedBody(request, MAX_STATE_BYTES);
-    if (boundedBody.kind === 'too-large') return problem(413, 'STATE_TOO_LARGE');
-    if (boundedBody.kind === 'invalid') return problem(400, 'BODY_INVALID');
-    const body = boundedBody.body;
-    if (body.byteLength === 0) return problem(400, 'STATE_EMPTY');
-    const digest = encodeBase64Url(await sha256(body));
+  private parsePutWireEnvelope(body: Uint8Array): WireEnvelope | null {
+    try {
+      const text = new TextDecoder().decode(body);
+      if (!text.trim().startsWith('{')) return null;
+      const parsed = JSON.parse(text);
+      if (this.validEnvelopeShape(parsed)) {
+        return parsed as WireEnvelope;
+      }
+    } catch {}
+    return null;
+  }
 
-    const committed = this.ctx.storage.transactionSync(() => {
+  private validEnvelopeShape(value: any): boolean {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+    const keys = ['version', 'stateEpoch', 'proposedRevision', 'envelopeSalt', 'previousEnvelopeDigest', 'ciphertext', 'writerPublicKey', 'writerSignature', 'aad'];
+    if (Object.keys(value).sort().join() !== [...keys].sort().join() || value.version !== 1) return false;
+    if (![value.stateEpoch, value.proposedRevision].every((n) => Number.isSafeInteger(n) && n >= 0)) return false;
+    if (!keys.slice(3, 8).every((key) => typeof value[key] === 'string')) return false;
+    const aad = value.aad;
+    if (!aad || typeof aad !== 'object' || Array.isArray(aad)) return false;
+    const aadKeys = ['protocolVersion', 'appId', 'roomId', 'packageDigest', 'stateEpoch', 'proposedRevision', 'previousEnvelopeDigest'];
+    if (Object.keys(aad).sort().join() !== aadKeys.sort().join()) return false;
+    return aad.protocolVersion === 1 && ['appId', 'roomId', 'packageDigest', 'previousEnvelopeDigest'].every((key) => typeof aad[key] === 'string');
+  }
+
+  private envelopeContextFailure(wireEnvelope: WireEnvelope, initialRoom: RoomRow) {
+    if (wireEnvelope.version !== 1) return {ok: false as const, status: 400, code: 'ENVELOPE_VERSION_INVALID'};
+    if (wireEnvelope.aad.roomId !== initialRoom.room_id) return {ok: false as const, status: 400, code: 'ROOM_ID_AAD_MISMATCH'};
+    if (wireEnvelope.stateEpoch !== initialRoom.state_epoch) return {ok: false as const, status: 409, code: 'EPOCH_MISMATCH'};
+    if (wireEnvelope.proposedRevision !== initialRoom.revision + 1) return {ok: false as const, status: 409, code: 'REVISION_CONFLICT'};
+    if (wireEnvelope.previousEnvelopeDigest !== initialRoom.envelope_digest) return {ok: false as const, status: 409, code: 'PREDECESSOR_MISMATCH'};
+    const aad = wireEnvelope.aad;
+    if (aad.stateEpoch !== wireEnvelope.stateEpoch || aad.proposedRevision !== wireEnvelope.proposedRevision || aad.previousEnvelopeDigest !== wireEnvelope.previousEnvelopeDigest) {
+      return {ok: false as const, status: 400, code: 'AAD_TUPLE_MISMATCH'};
+    }
+    if (initialRoom.aad_json) {
+      const pinned = JSON.parse(initialRoom.aad_json);
+      if (aad.packageDigest !== pinned.packageDigest || aad.appId !== pinned.appId) return {ok: false as const, status: 403, code: 'PACKAGE_CONTEXT_MISMATCH'};
+    }
+    return null;
+  }
+
+  private async verifyWireEnvelope(wireEnvelope: WireEnvelope, initialRoom: RoomRow) {
+    const contextFailure = this.envelopeContextFailure(wireEnvelope, initialRoom);
+    if (contextFailure) return contextFailure;
+
+    const writerPubBytes = decodeFixed32(wireEnvelope.writerPublicKey);
+    const writerSigBytes = decodeBase64Url(wireEnvelope.writerSignature, 64);
+    const cipherBytes = decodeBase64Url(wireEnvelope.ciphertext, MAX_STATE_BYTES);
+    const saltBytes = decodeBase64Url(wireEnvelope.envelopeSalt, 16);
+    const rawRoomId = decodeBase64Url(wireEnvelope.aad.roomId, 16);
+    const rawPackageDigest = decodeBase64Url(wireEnvelope.aad.packageDigest, 32);
+    const rawPrevDigest = decodeBase64Url(wireEnvelope.previousEnvelopeDigest, 32);
+
+    if (!writerPubBytes || !writerSigBytes || !cipherBytes || !saltBytes || !rawRoomId || !rawPackageDigest || !rawPrevDigest) {
+      return {ok: false as const, status: 400, code: 'ENVELOPE_FIELDS_INVALID'};
+    }
+    if (writerSigBytes.byteLength !== 64 || saltBytes.byteLength !== 16 || rawRoomId.byteLength !== 16 || rawPackageDigest.byteLength !== 32 || rawPrevDigest.byteLength !== 32) {
+      return {ok: false as const, status: 400, code: 'WRITER_SIGNATURE_INVALID'};
+    }
+    if (initialRoom.writer_public_key && !constantTimeEqual32(writerPubBytes, bytesFromSql(initialRoom.writer_public_key))) {
+      return {ok: false as const, status: 403, code: 'WRITER_PUBLIC_KEY_MISMATCH'};
+    }
+
+    const aadBytes = new TextEncoder().encode(canonicalize(wireEnvelope.aad)!);
+    const writeMessage = await computeWriteMessage(
+      rawRoomId, rawPackageDigest, wireEnvelope.stateEpoch, wireEnvelope.proposedRevision,
+      rawPrevDigest, saltBytes, aadBytes, cipherBytes
+    );
+    const validSig = await verifyAsync(writerSigBytes, writeMessage, writerPubBytes);
+    if (!validSig) return {ok: false as const, status: 400, code: 'WRITER_SIGNATURE_INVALID'};
+
+    const unsignedEnvelope = {
+      version: 1, stateEpoch: wireEnvelope.stateEpoch, proposedRevision: wireEnvelope.proposedRevision,
+      envelopeSalt: wireEnvelope.envelopeSalt, previousEnvelopeDigest: wireEnvelope.previousEnvelopeDigest,
+      ciphertext: wireEnvelope.ciphertext, writerPublicKey: wireEnvelope.writerPublicKey, aad: wireEnvelope.aad
+    };
+    const envelopeDigestBytes = await computeEnvelopeDigest(unsignedEnvelope, writerSigBytes);
+    const envelopeDigest = encodeBase64Url(envelopeDigestBytes);
+    const etag = computeEtag(wireEnvelope.stateEpoch, wireEnvelope.proposedRevision, envelopeDigestBytes);
+
+    return {ok: true as const, writerPubBytes, writerSigBytes, cipherBytes, envelopeDigest, etag};
+  }
+
+  private commitWireEnvelope(
+    initialRoom: RoomRow,
+    wireEnvelope: WireEnvelope,
+    verified: {writerPubBytes: Uint8Array; writerSigBytes: Uint8Array; cipherBytes: Uint8Array; envelopeDigest: string; etag: string},
+    ifMatch: string
+  ): {epoch: number; revision: number; digest: string; etag: string} | null | false {
+    return this.ctx.storage.transactionSync(() => {
+      const current = this.loadRoom(initialRoom.room_id);
+      if (!current || !this.isActive(current)) return null;
+      if (current.etag !== ifMatch) return false;
+      if (current.recovery_status === 'RECOVERY_REQUIRED') return null;
+
+      this.ctx.storage.sql.exec(
+        `UPDATE room_state
+         SET revision = ?, envelope_digest = ?, ciphertext = ?, etag = ?,
+             previous_envelope_digest = ?, writer_public_key = ?, writer_signature = ?,
+             envelope_salt = ?, aad_json = ?
+         WHERE singleton = 1 AND room_id = ? AND etag = ?`,
+        wireEnvelope.proposedRevision,
+        verified.envelopeDigest,
+        exactArrayBuffer(verified.cipherBytes),
+        verified.etag,
+        wireEnvelope.previousEnvelopeDigest,
+        exactArrayBuffer(verified.writerPubBytes),
+        exactArrayBuffer(verified.writerSigBytes),
+        wireEnvelope.envelopeSalt,
+        JSON.stringify(wireEnvelope.aad),
+        current.room_id,
+        current.etag,
+      ).toArray();
+      return {epoch: current.state_epoch, revision: wireEnvelope.proposedRevision, digest: verified.envelopeDigest, etag: verified.etag};
+    });
+  }
+
+  private commitRawState(initialRoom: RoomRow, body: Uint8Array, ifMatch: string, digest: string): {epoch: number; revision: number; digest: string; etag: string} | null | false {
+    return this.ctx.storage.transactionSync(() => {
       const current = this.loadRoom(initialRoom.room_id);
       if (!current || !this.isActive(current)) return null;
       if (current.etag !== ifMatch) return false;
@@ -516,7 +742,50 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
       ).toArray();
       return {epoch: current.state_epoch, revision, digest, etag};
     });
+  }
 
+  private async putState(request: Request, initialRoom: RoomRow): Promise<Response> {
+    if (!await this.authorize(request, initialRoom, true)) return problem(403, 'ROOM_AUTH_INVALID');
+    if (initialRoom.recovery_status === 'RECOVERY_REQUIRED') return problem(503, 'RECOVERY_REQUIRED');
+
+    const ifMatch = request.headers.get('If-Match');
+    if (!ifMatch) return problem(428, 'IF_MATCH_REQUIRED');
+
+    const contentType = request.headers.get('Content-Type') ?? '';
+    if (!contentType.includes('application/json') && !contentType.includes('application/octet-stream')) {
+      return problem(415, 'CONTENT_TYPE_INVALID');
+    }
+
+    const maxLimit = contentType.includes('application/json') ? 720_896 : MAX_STATE_BYTES;
+    const declaredLength = request.headers.get('Content-Length');
+    if (declaredLength && (!/^\d+$/u.test(declaredLength) || Number(declaredLength) > maxLimit)) return problem(413, 'STATE_TOO_LARGE');
+
+    const boundedBody = await readBoundedBody(request, maxLimit);
+    if (boundedBody.kind === 'too-large') return problem(413, 'STATE_TOO_LARGE');
+    if (boundedBody.kind === 'invalid') return problem(400, 'BODY_INVALID');
+    const body = boundedBody.body;
+    if (body.byteLength === 0) return problem(400, 'STATE_EMPTY');
+
+    const wireEnvelope = this.parsePutWireEnvelope(body);
+    if (!wireEnvelope && !this.allowLegacyRaw(initialRoom, contentType)) return problem(400, 'SIGNED_ENVELOPE_REQUIRED');
+    if (wireEnvelope) {
+      const verified = await this.verifyWireEnvelope(wireEnvelope, initialRoom);
+      if (!verified.ok) return problem(verified.status, verified.code);
+
+      const committed = this.commitWireEnvelope(initialRoom, wireEnvelope, verified, ifMatch);
+      return this.committedResponse(committed);
+    }
+
+    const digest = encodeBase64Url(await sha256(body));
+    const committed = this.commitRawState(initialRoom, body, ifMatch, digest);
+    return this.committedResponse(committed);
+  }
+
+  private allowLegacyRaw(room: RoomRow, contentType: string): boolean {
+    return this.env.ENVIRONMENT === 'local' && !room.aad_json && contentType === 'application/octet-stream';
+  }
+
+  private committedResponse(committed: {epoch: number; revision: number; digest: string; etag: string} | null | false): Response {
     if (committed === null) return problem(403, 'ROOM_AUTH_INVALID');
     if (committed === false) return problem(409, 'REVISION_CONFLICT');
     const hint: RevisionHint = {type: 'revision', epoch: committed.epoch, revision: committed.revision, envelopeDigest: committed.digest};

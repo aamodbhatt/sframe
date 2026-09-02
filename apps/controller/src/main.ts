@@ -9,6 +9,14 @@ const PHASE2_DEFAULT = Boolean(Number('__PHASE2_DEFAULT_FLAG__'));
 const PHASE2_EXPECTED_DIGEST = '__PHASE2_EXPECTED_DIGEST__';
 const PHASE2_EXPECTED_KEY_ID = '__PHASE2_EXPECTED_KEY_ID__';
 const initialHash = window.location.hash;
+const fromB64Url = (str: string): Uint8Array => {
+  const base64 = str.replaceAll('-', '+').replaceAll('_', '/');
+  const padded = base64.padEnd(base64.length + (4 - (base64.length % 4)) % 4, '=');
+  const binary = atob(padded);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+};
 let parsedInvite: any = undefined;
 if (initialHash.includes('v=1&d=') || initialHash.includes('d=')) {
   try {
@@ -20,15 +28,15 @@ if (initialHash.includes('v=1&d=') || initialHash.includes('d=')) {
     const c = params.get('c');
     const w = params.get('w');
     if (d && s && k && c) {
-      const descriptorJson = atob(d.replace(/-/g, '+').replace(/_/g, '/'));
+      const descriptorJson = new TextDecoder().decode(fromB64Url(d));
       const descriptor = JSON.parse(descriptorJson);
       parsedInvite = {
         version: 1,
         descriptor,
-        descriptorSignature: Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/')), ch => ch.charCodeAt(0)),
-        roomKey: Uint8Array.from(atob(k.replace(/-/g, '+').replace(/_/g, '/')), ch => ch.charCodeAt(0)),
-        capability: Uint8Array.from(atob(c.replace(/-/g, '+').replace(/_/g, '/')), ch => ch.charCodeAt(0)),
-        writerPrivateSeed: w ? Uint8Array.from(atob(w.replace(/-/g, '+').replace(/_/g, '/')), ch => ch.charCodeAt(0)) : undefined
+        descriptorSignature: fromB64Url(s),
+        roomKey: fromB64Url(k),
+        capability: fromB64Url(c),
+        writerPrivateSeed: w ? fromB64Url(w) : undefined
       };
     }
   } catch (_) {}
@@ -39,10 +47,11 @@ const PERSONAL_MODE = Boolean(!SHARED_MODE && (PHASE2_DEFAULT || new URLSearchPa
 const USES_CLASSIC_WORKER = ARCHITECTURE_CANDIDATE === 'S' || ARCHITECTURE_CANDIDATE === 'T' || ARCHITECTURE_CANDIDATE === 'U' || PERSONAL_MODE || SHARED_MODE;
 const IS_CANDIDATE_U = ARCHITECTURE_CANDIDATE === 'U' || PERSONAL_MODE || SHARED_MODE;
 const PERSONAL_ROLE: 'viewer' | 'editor' = (parsedInvite?.descriptor?.role ?? (new URLSearchParams(location.search).get('role') === 'viewer' ? 'viewer' : 'editor')) as 'viewer' | 'editor';
-const executionRole = (): 'viewer' | 'editor' => SHARED_MODE ? (parsedInvite?.descriptor?.role ?? 'editor') : PERSONAL_MODE ? PERSONAL_ROLE : 'editor';
-const executionIsReadOnly = (): boolean => (SHARED_MODE && parsedInvite?.descriptor?.role === 'viewer') || (PERSONAL_MODE && PERSONAL_ROLE === 'viewer');
+let sharedExecutionRole: 'viewer' | 'editor' = 'viewer';
+const executionRole = (): 'viewer' | 'editor' => SHARED_MODE ? sharedExecutionRole : PERSONAL_MODE ? PERSONAL_ROLE : 'editor';
+const executionIsReadOnly = (): boolean => executionRole() === 'viewer';
 const RENDERER_PATH = `/runtime/renderer/${RENDERER_DIGEST}.html`;
-const MAX_RENDERER_BYTES = 2 * 1024 * 1024;
+const MAX_RENDERER_BYTES = 4 * 1024 * 1024;
 const REQUIRED_RENDERER_CSP = "default-src 'none'; script-src 'sha256-__RENDERER_BOOTSTRAP_HASH__'__RENDERER_WASM_EVAL_SOURCE__ blob:; style-src 'sha256-__RENDERER_CSS_HASH__'; img-src 'none'; font-src 'none'; connect-src 'none'; worker-src blob:; child-src 'none'; frame-src 'none'; media-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; navigate-to 'none'; frame-ancestors http://app.localhost:4173; sandbox allow-scripts; require-trusted-types-for 'script'; trusted-types smallframe-renderer-worker";
 const MAX_MESSAGE_BYTES = 256 * 1024;
 let frame: HTMLIFrameElement | undefined;
@@ -108,11 +117,12 @@ const controllerPolicy = (() => {
   const types = (globalThis as typeof globalThis & {trustedTypes?: {createPolicy: (name: string, rules: {createScriptURL: (url: string) => string; createHTML: (html: string) => string}) => {createScriptURL: (url: string) => unknown; createHTML: (html: string) => unknown}}}).trustedTypes;
   if (!types) return undefined;
   return types.createPolicy('smallframe-controller', {
-    createScriptURL: (url) => url === '/sw.js' ? url : (() => { throw new Error('SCRIPT_URL_NOT_ALLOWED'); })(),
+    createScriptURL: (url) => (url === '/sw.js' || url === '/state-worker.js') ? url : (() => { throw new Error('SCRIPT_URL_NOT_ALLOWED'); })(),
     createHTML: (html) => html !== '' && html === approvedSrcdoc ? html : (() => { throw new Error('SRCDOC_NOT_VERIFIED'); })()
   });
 })();
 const scriptUrl = (value: string): string => controllerPolicy ? controllerPolicy.createScriptURL(value) as string : value;
+Object.defineProperty(globalThis, '__smallframeScriptUrl', {value: scriptUrl, configurable: false, enumerable: false, writable: false});
 const verifiedSrcdoc = (value: string): string => {
   approvedSrcdoc = value;
   try { return controllerPolicy ? controllerPolicy.createHTML(value) as string : value; } finally { approvedSrcdoc = ''; }
@@ -382,12 +392,16 @@ const validateState = (state: Record<string, unknown>): Promise<{valid: boolean;
 const commitLocalState = (state: Record<string, unknown>): void => {
   localState = state;
   localRevision += 1;
-  post('sf.controller.snapshot', {state: localState, role: PERSONAL_MODE ? PERSONAL_ROLE : 'editor', online: navigator.onLine, revision: localRevision});
+  post('sf.controller.snapshot', {state: localState, role: executionRole(), online: navigator.onLine, revision: localRevision});
 };
 const replaceLocalState = async (state: Record<string, unknown>): Promise<void> => {
   if (stateMutationInFlight) throw new Error('STATE_BUSY');
   stateMutationInFlight = true;
   try {
+    const start = Date.now();
+    while (acceptedAppReadyGeneration === 0 && Date.now() - start < 10000) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
     const result = await validateState(state);
     if (!result.valid) throw new Error(result.error);
     commitLocalState(state);
@@ -426,18 +440,19 @@ const dispatchStateBatch = (message: RendererMessage): void => {
   if (!Array.isArray(message.operations) || message.operations.length < 1 || message.operations.length > 32) { rejectStateBatch(message.requestId); return; }
   const next = applyStateOperations(localState, message.operations);
   if (!next) { rejectStateBatch(message.requestId); return; }
-  if (!PERSONAL_MODE) {
+  if (!PERSONAL_MODE && !SHARED_MODE) {
     commitLocalState(next);
     post('sf.controller.result', {result: {requestId: message.requestId, kind: 'state', ok: true}});
     return;
   }
   stateMutationInFlight = true;
-  void validateState(next).then((result) => {
+  void validateState(next).then(async (result) => {
     if (!result.valid) { rejectStateBatch(message.requestId, result.error, 'The proposed state violates the signed package schema.'); return; }
+    if (SHARED_MODE && personalSession) await personalSession.stateChanged(next, localRevision + 1);
     commitLocalState(next);
     post('sf.controller.result', {result: {requestId: message.requestId, kind: 'state', ok: true}});
-    if (personalSession) void personalSession.stateChanged(localState, localRevision).catch(() => { byId<HTMLElement>('status').textContent = 'Local save failed; export before leaving.'; });
-  }).finally(() => { stateMutationInFlight = false; });
+    if (!SHARED_MODE && personalSession) void personalSession.stateChanged(localState, localRevision).catch(() => { byId<HTMLElement>('status').textContent = 'Local save failed; export before leaving.'; });
+  }).catch(() => rejectStateBatch(message.requestId, 'LOCAL_COMMIT_FAILED', 'Local commit failed.')).finally(() => { stateMutationInFlight = false; });
 };
 
 const onPortMessage = (event: MessageEvent): void => {
@@ -559,6 +574,7 @@ const main = async (): Promise<void> => {
       archive: personalArchive,
       apiOrigin: 'http://api.localhost:8787',
       onApprove: (state: Record<string, unknown>, role: 'viewer' | 'editor') => {
+        sharedExecutionRole = role;
         localState = structuredClone(state);
         post('sf.controller.approval', {state: localState, role});
       },
