@@ -23,30 +23,64 @@ fn jcs_bytes(val: &serde_json::Value) -> Result<Vec<u8>, String> {
     serde_jcs::to_vec(val).map_err(|_| "CANONICALIZE_FAILED".to_owned())
 }
 
-fn http_post_json(url: &str, body: &serde_json::Value, auth_header: Option<&str>) -> Result<serde_json::Value, String> {
+fn http_post_json(
+    url: &str,
+    body: &serde_json::Value,
+    auth_header: Option<&str>,
+) -> Result<serde_json::Value, String> {
     let body_str = serde_json::to_string(body).map_err(|e| format!("SERIALIZE_FAILED: {e}"))?;
     let mut cmd = ProcessCommand::new("curl");
-    cmd.args(["-s", "-S", "-X", "POST", url, "-H", "Content-Type: application/json", "-H", "Origin: http://app.localhost:4173"]);
+    cmd.args([
+        "-s",
+        "-S",
+        "-X",
+        "POST",
+        url,
+        "-H",
+        "Content-Type: application/json",
+        "-H",
+        "Origin: http://app.localhost:4173",
+    ]);
     if let Some(auth) = auth_header {
         cmd.args(["-H", &format!("Authorization: {auth}")]);
     }
     cmd.args(["--data-raw", &body_str]);
 
-    let output = cmd.output().map_err(|e| format!("HTTP_REQUEST_FAILED: {e}"))?;
+    let output = cmd
+        .output()
+        .map_err(|e| format!("HTTP_REQUEST_FAILED: {e}"))?;
     let response_str = String::from_utf8_lossy(&output.stdout);
     if !output.status.success() {
-        return Err(format!("HTTP_ERROR: {}", String::from_utf8_lossy(&output.stderr)));
+        return Err(format!(
+            "HTTP_ERROR: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
     }
 
-    serde_json::from_str(&response_str).map_err(|_| format!("HTTP_RESPONSE_INVALID: {response_str}"))
+    serde_json::from_str(&response_str)
+        .map_err(|_| format!("HTTP_RESPONSE_INVALID: {response_str}"))
 }
 
-fn http_post_bytes(url: &str, bytes: &[u8], auth_header: Option<&str>) -> Result<serde_json::Value, String> {
+fn http_post_bytes(
+    url: &str,
+    bytes: &[u8],
+    auth_header: Option<&str>,
+) -> Result<serde_json::Value, String> {
     let temp_file = std::env::temp_dir().join(format!("sf-upload-{}.bin", std::process::id()));
     fs::write(&temp_file, bytes).map_err(|e| format!("TEMP_FILE_WRITE_FAILED: {e}"))?;
 
     let mut cmd = ProcessCommand::new("curl");
-    cmd.args(["-s", "-S", "-X", "POST", url, "-H", "Content-Type: application/vnd.smallframe.package", "-H", "Origin: http://app.localhost:4173"]);
+    cmd.args([
+        "-s",
+        "-S",
+        "-X",
+        "POST",
+        url,
+        "-H",
+        "Content-Type: application/vnd.smallframe.package",
+        "-H",
+        "Origin: http://app.localhost:4173",
+    ]);
     if let Some(auth) = auth_header {
         cmd.args(["-H", &format!("Authorization: {auth}")]);
     }
@@ -58,26 +92,44 @@ fn http_post_bytes(url: &str, bytes: &[u8], auth_header: Option<&str>) -> Result
     let output = output.map_err(|e| format!("HTTP_REQUEST_FAILED: {e}"))?;
     let response_str = String::from_utf8_lossy(&output.stdout);
     if !output.status.success() {
-        return Err(format!("HTTP_ERROR: {}", String::from_utf8_lossy(&output.stderr)));
+        return Err(format!(
+            "HTTP_ERROR: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
     }
 
-    serde_json::from_str(&response_str).map_err(|_| format!("HTTP_RESPONSE_INVALID: {response_str}"))
+    serde_json::from_str(&response_str)
+        .map_err(|_| format!("HTTP_RESPONSE_INVALID: {response_str}"))
 }
 
 fn http_get_json(url: &str, auth_header: Option<&str>) -> Result<serde_json::Value, String> {
     let mut cmd = ProcessCommand::new("curl");
-    cmd.args(["-s", "-S", "-X", "GET", url, "-H", "Origin: http://app.localhost:4173"]);
+    cmd.args([
+        "-s",
+        "-S",
+        "-X",
+        "GET",
+        url,
+        "-H",
+        "Origin: http://app.localhost:4173",
+    ]);
     if let Some(auth) = auth_header {
         cmd.args(["-H", &format!("Authorization: {auth}")]);
     }
 
-    let output = cmd.output().map_err(|e| format!("HTTP_REQUEST_FAILED: {e}"))?;
+    let output = cmd
+        .output()
+        .map_err(|e| format!("HTTP_REQUEST_FAILED: {e}"))?;
     let response_str = String::from_utf8_lossy(&output.stdout);
     if !output.status.success() {
-        return Err(format!("HTTP_ERROR: {}", String::from_utf8_lossy(&output.stderr)));
+        return Err(format!(
+            "HTTP_ERROR: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
     }
 
-    serde_json::from_str(&response_str).map_err(|_| format!("HTTP_RESPONSE_INVALID: {response_str}"))
+    serde_json::from_str(&response_str)
+        .map_err(|_| format!("HTTP_RESPONSE_INVALID: {response_str}"))
 }
 
 pub fn enroll_publisher(
@@ -86,7 +138,10 @@ pub fn enroll_publisher(
     api_url: &str,
 ) -> Result<serde_json::Value, String> {
     let invite_code = if let Some(path) = invite_file {
-        fs::read_to_string(path).map_err(|_| "INVITE_FILE_READ_FAILED".to_owned())?.trim().to_owned()
+        fs::read_to_string(path)
+            .map_err(|_| "INVITE_FILE_READ_FAILED".to_owned())?
+            .trim()
+            .to_owned()
     } else {
         "BETA_INVITE_TEST_123".to_owned()
     };
@@ -244,7 +299,11 @@ pub fn publish_package(
     });
 
     let rooms_url = format!("{}/v1/rooms", api_url.trim_end_matches('/'));
-    let _room_res = http_post_json(&rooms_url, &room_creation_body, Some(&format!("Bearer {token}")))?;
+    let _room_res = http_post_json(
+        &rooms_url,
+        &room_creation_body,
+        Some(&format!("Bearer {token}")),
+    )?;
 
     // 6. Save room secrets in vault
     let room_record = json!({
@@ -270,8 +329,25 @@ pub fn publish_package(
     let w = writer_priv_str;
     let editor_c = Base64UrlUnpadded::encode_string(&editor_cap_bytes);
 
-    let viewer_invite = format!("{}/r/{}#v=1&d={}&s={}&k={}&c={}", controller_url.trim_end_matches('/'), room_id, viewer_d, viewer_s, k, viewer_c);
-    let editor_invite = format!("{}/r/{}#v=1&d={}&s={}&w={}&k={}&c={}", controller_url.trim_end_matches('/'), room_id, editor_d, editor_s, w, k, editor_c);
+    let viewer_invite = format!(
+        "{}/r/{}#v=1&d={}&s={}&k={}&c={}",
+        controller_url.trim_end_matches('/'),
+        room_id,
+        viewer_d,
+        viewer_s,
+        k,
+        viewer_c
+    );
+    let editor_invite = format!(
+        "{}/r/{}#v=1&d={}&s={}&w={}&k={}&c={}",
+        controller_url.trim_end_matches('/'),
+        room_id,
+        editor_d,
+        editor_s,
+        w,
+        k,
+        editor_c
+    );
 
     let result = if show_secrets {
         json!({
@@ -321,8 +397,15 @@ pub fn room_rotate_links(
         "editorCapHash": Base64UrlUnpadded::encode_string(&Sha256::digest(new_editor_cap))
     });
 
-    let old_editor_cap = room_rec.get("editorCapability").and_then(|v| v.as_str()).unwrap_or("");
-    let url = format!("{}/v1/rooms/{}/rotate-links", api_url.trim_end_matches('/'), room_id);
+    let old_editor_cap = room_rec
+        .get("editorCapability")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let url = format!(
+        "{}/v1/rooms/{}/rotate-links",
+        api_url.trim_end_matches('/'),
+        room_id
+    );
     http_post_json(&url, &body, Some(&format!("SF-Cap {old_editor_cap}")))
 }
 
@@ -332,8 +415,15 @@ pub fn room_revoke(
     api_url: &str,
 ) -> Result<serde_json::Value, String> {
     let room_rec = ctx.load_room_record(room_id)?;
-    let old_editor_cap = room_rec.get("editorCapability").and_then(|v| v.as_str()).unwrap_or("");
-    let url = format!("{}/v1/rooms/{}/revoke", api_url.trim_end_matches('/'), room_id);
+    let old_editor_cap = room_rec
+        .get("editorCapability")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let url = format!(
+        "{}/v1/rooms/{}/revoke",
+        api_url.trim_end_matches('/'),
+        room_id
+    );
     http_post_json(&url, &json!({}), Some(&format!("SF-Cap {old_editor_cap}")))
 }
 
@@ -344,7 +434,14 @@ pub fn room_request_repair(
     api_url: &str,
 ) -> Result<serde_json::Value, String> {
     let room_rec = ctx.load_room_record(room_id)?;
-    let old_editor_cap = room_rec.get("editorCapability").and_then(|v| v.as_str()).unwrap_or("");
-    let url = format!("{}/v1/rooms/{}/request-repair", api_url.trim_end_matches('/'), room_id);
+    let old_editor_cap = room_rec
+        .get("editorCapability")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let url = format!(
+        "{}/v1/rooms/{}/request-repair",
+        api_url.trim_end_matches('/'),
+        room_id
+    );
     http_post_json(&url, &json!({}), Some(&format!("SF-Cap {old_editor_cap}")))
 }

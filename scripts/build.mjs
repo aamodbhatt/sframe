@@ -321,6 +321,8 @@ self.onmessage = async (event) => {
       const val = JSON.parse(wasm_automerge_validate(remoteBytes, 475136));
       if (!val.ok) throw new Error(val.error?.code || 'REMOTE_STATE_INVALID');
       const bytes = wasm_automerge_merge(localBytes, remoteBytes);
+      const merged = JSON.parse(wasm_automerge_validate(bytes, 475136));
+      if (!merged.ok) throw new Error(merged.error?.code || 'MERGED_STATE_INVALID');
       const projected = wasm_automerge_project(bytes);
       self.postMessage({id, ok: true, bytes, projectedState: JSON.parse(projected)});
     } else if (type === 'encrypt') {

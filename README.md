@@ -50,6 +50,8 @@ The shared-room tests now use the actual SQLite Durable Object relay with a test
 
 Shared links are parsed with strict canonical encoding and are authenticated against the verified package publisher, room path, capability, writer key, immutable expiry, relay role/configuration, and encrypted app/package context before approval or state access. The local fixture package and signer are explicitly test-only; production package retrieval and room creation remain gated work.
 
+Decrypted collaborative documents are checked in a controller-owned WebAssembly Worker for binary, change, operation, actor, head, conflict, depth, map/property, array, scalar, key, number and supported-type limits. A rejected remote document terminates and replaces the parser Worker while retaining the last accepted local copy.
+
 The renderer's local byte ceiling was raised from 2 MiB to 4 MiB while the inherited combined verifier/CRDT Wasm build is being evaluated. Splitting the state engine and restoring a measured lightweight budget remains open. A passing test suite does not close the full Phase 3–5 specification gates.
 
 Working locally today:

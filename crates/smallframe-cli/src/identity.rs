@@ -268,7 +268,11 @@ impl IdentityContext {
         String::from_utf8(bytes).map_err(|_| "API_TOKEN_INVALID".to_owned())
     }
 
-    pub fn save_room_record(&self, room_id: &str, record: &serde_json::Value) -> Result<(), String> {
+    pub fn save_room_record(
+        &self,
+        room_id: &str,
+        record: &serde_json::Value,
+    ) -> Result<(), String> {
         let path = self.root.join(format!("room-{}.json", room_id));
         let jcs_bytes = jcs(record)?;
         write_new_private(&path, &jcs_bytes)

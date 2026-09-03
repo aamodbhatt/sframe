@@ -12,7 +12,7 @@ import {
 
 // Invite fragments are bearer credentials even in tests. Do not retain them in traces.
 test.use({trace: 'off'});
-const sharedFixture = JSON.parse(readFileSync('target/phase1-wasm/shared-test-package.json', 'utf8')) as {packageDigest: string; publisherKeyId: string};
+const sharedFixture = JSON.parse(readFileSync('target/phase1-wasm/shared-test-package.json', 'utf8')) as {packageDigest: string; publisherKeyId: string; hostileListBase64: string};
 
 test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
   // Existing TEST-ONLY package-vector signer; never a production identity.
@@ -435,4 +435,26 @@ test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
     expect(stateRequests).toBe(0);
   });
   }
+
+  test('rejects a validly encrypted and signed unsupported Automerge object before app approval', async ({page, request}) => {
+    const roomId = makeRoomId();
+    const envelope = await encryptSnapshot({roomKey, writerPrivateKey: writerPriv, roomId,
+      appId: 'dev.example.decision-board', packageDigest: sharedFixture.packageDigest,
+      stateEpoch: 0, proposedRevision: 1, previousEnvelopeDigest: encodeBase64Url(new Uint8Array(32)),
+      automergeBytes: new Uint8Array(Buffer.from(sharedFixture.hostileListBase64, 'base64'))});
+    const init = await request.post(`http://127.0.0.1:8787/__phase0/rooms/${roomId}/init-envelope`, {data: {
+      viewerCapHash: encodeBase64Url(await sha256(viewerCap)), editorCapHash: encodeBase64Url(await sha256(editorCap)),
+      expiresAtMs: activeExpiry, envelope: envelope.envelope
+    }});
+    expect(init.status()).toBe(201);
+    const signed = await createSignedRoomDescriptor({publisherPrivateKey: publisherPriv, roomId,
+      packageDigest: sharedFixture.packageDigest, publisherKeyId: sharedFixture.publisherKeyId,
+      writerPublicKey: await getPublicKeyAsync(writerPriv), capability: editorCap, role: 'editor', expiresAt: activeExpiry});
+    const fragment = formatInviteFragment({descriptorJcsBytes: signed.jcsBytes, descriptorSignature: signed.signature,
+      roomKey, capability: editorCap, writerPrivateSeed: writerPriv});
+    await page.goto(`/r/${roomId}#${fragment}`);
+    await page.getByRole('button', {name: 'Open this exact version'}).click();
+    await expect(page.locator('#trust-description')).toHaveText('REMOTE_STATE_INVALID');
+    await expect(page.locator('#runtime-panel')).toBeHidden();
+  });
 });

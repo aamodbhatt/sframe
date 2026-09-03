@@ -115,6 +115,8 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
       this.pending.clear();
     }
 
+    stop(): void { this.failClosed(); }
+
     async genesis(initialJson: string, actorIdHex: string): Promise<{bytes: Uint8Array; projectedState: Record<string, unknown>}> {
       return this.call('genesis', {initialJson, actorIdHex});
     }
@@ -294,7 +296,15 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
       return result;
     };
 
-    const worker = new StateWorkerClient();
+    let worker = new StateWorkerClient();
+    const guardedRemote = async <T>(action: (active: StateWorkerClient) => Promise<T>): Promise<T> => {
+      try { return await action(worker); }
+      catch {
+        worker.stop();
+        worker = new StateWorkerClient();
+        throw new Error('REMOTE_STATE_INVALID');
+      }
+    };
     const role = descriptor.role;
     const capHeader = `SF-Cap ${encodeBase64Url(invite.capability)}`;
 
@@ -373,21 +383,21 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
           const contentType = res.headers.get('Content-Type') ?? '';
           if (contentType.includes('application/json')) {
             const wireEnvelope = await res.json();
-            const decrypted = await worker.decrypt({
+            const decrypted = await guardedRemote(async (active) => active.decrypt({
               roomKey: invite.roomKey,
               expectedWriterPublicKey: descriptor.writerPublicKey ? decodeBase64Url(descriptor.writerPublicKey) : undefined,
               expectedAppId: metadata?.appId,
               roomId: descriptor.roomId,
               packageDigest: descriptor.packageDigest,
               envelope: wireEnvelope
-            });
+            }));
 
             if (localDocBytes) {
               if (wireEnvelope.stateEpoch !== currentEpoch) throw new Error('RECOVERY_TRANSITION_REQUIRED');
               if (wireEnvelope.proposedRevision < currentRevision) throw new Error('REMOTE_ROLLBACK');
               if (wireEnvelope.proposedRevision === currentRevision && decrypted.envelopeDigest !== currentDigest) throw new Error('REMOTE_EQUIVOCATION');
               if (wireEnvelope.proposedRevision === currentRevision + 1 && wireEnvelope.previousEnvelopeDigest !== currentDigest) throw new Error('PREDECESSOR_MISMATCH');
-              const merged = await worker.merge(localDocBytes, decrypted.automergeBytes);
+              const merged = await guardedRemote(async (active) => active.merge(localDocBytes!, decrypted.automergeBytes));
               if (approved) await options.onReplaceState(structuredClone(merged.projectedState));
               localDocBytes = merged.bytes;
               currentState = merged.projectedState;

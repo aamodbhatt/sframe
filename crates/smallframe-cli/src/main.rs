@@ -282,7 +282,10 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                 }
             }
         }
-        Command::Enroll { invite_file, api_url } => {
+        Command::Enroll {
+            invite_file,
+            api_url,
+        } => {
             let context = IdentityContext::discover(cli.test_store.as_deref())
                 .map_err(CliError::from_message)?;
             let result = enroll_publisher(&context, invite_file.as_deref(), api_url)
@@ -336,8 +339,8 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                 .map_err(CliError::from_message)?;
             match command {
                 RoomCommand::Status { room_ref, api_url } => {
-                    let result = room_status(&context, room_ref, api_url)
-                        .map_err(CliError::from_message)?;
+                    let result =
+                        room_status(&context, room_ref, api_url).map_err(CliError::from_message)?;
                     emit(&result, cli.json)
                 }
                 RoomCommand::RotateLinks { room_ref, api_url } => {
@@ -346,8 +349,8 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                     emit(&result, cli.json)
                 }
                 RoomCommand::Revoke { room_ref, api_url } => {
-                    let result = room_revoke(&context, room_ref, api_url)
-                        .map_err(CliError::from_message)?;
+                    let result =
+                        room_revoke(&context, room_ref, api_url).map_err(CliError::from_message)?;
                     emit(&result, cli.json)
                 }
                 RoomCommand::RequestRepair {
@@ -355,32 +358,35 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                     expected_etag,
                     api_url,
                 } => {
-                    let result = room_request_repair(
-                        &context,
-                        room_ref,
-                        expected_etag.as_deref(),
-                        api_url,
-                    )
-                    .map_err(CliError::from_message)?;
+                    let result =
+                        room_request_repair(&context, room_ref, expected_etag.as_deref(), api_url)
+                            .map_err(CliError::from_message)?;
                     emit(&result, cli.json)
                 }
             }
         }
         Command::Operations { command } => match command {
-            OperationsCommand::Status { operation_ref } => {
-                emit(&json!({"status": "CONFIRMED", "operationId": operation_ref}), cli.json)
-            }
-            OperationsCommand::Resume { operation_ref } => {
-                emit(&json!({"resumed": true, "operationId": operation_ref}), cli.json)
-            }
-            OperationsCommand::Abandon { operation_ref } => {
-                emit(&json!({"abandoned": true, "operationId": operation_ref}), cli.json)
-            }
+            OperationsCommand::Status { operation_ref } => emit(
+                &json!({"status": "CONFIRMED", "operationId": operation_ref}),
+                cli.json,
+            ),
+            OperationsCommand::Resume { operation_ref } => emit(
+                &json!({"resumed": true, "operationId": operation_ref}),
+                cli.json,
+            ),
+            OperationsCommand::Abandon { operation_ref } => emit(
+                &json!({"abandoned": true, "operationId": operation_ref}),
+                cli.json,
+            ),
         },
         Command::Export { command } => match command {
-            ExportCommand::Package { package_or_room_ref, output } => {
-                emit(&json!({"ok": true, "ref": package_or_room_ref, "output": output}), cli.json)
-            }
+            ExportCommand::Package {
+                package_or_room_ref,
+                output,
+            } => emit(
+                &json!({"ok": true, "ref": package_or_room_ref, "output": output}),
+                cli.json,
+            ),
         },
         Command::Dev { path } => run_dev(cli, path.as_ref()),
     }

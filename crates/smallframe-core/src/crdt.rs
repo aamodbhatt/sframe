@@ -3,12 +3,197 @@ use automerge::{
     transaction::Transactable,
 };
 use serde_json::{Map, Value as JsonValue};
+use std::collections::HashSet;
+use unicode_normalization::UnicodeNormalization;
 
 pub const MAX_AUTOMERGE_BYTES: usize = 475_136;
 pub const MAX_CHANGES: usize = 10_000;
 pub const MAX_OPERATIONS: usize = 100_000;
 pub const MAX_ACTORS: usize = 64;
 pub const MAX_HEADS: usize = 128;
+const MAX_CONFLICTS: usize = 1_024;
+const MAX_DEPTH: usize = 32;
+const MAX_MAPS: usize = 4_096;
+const MAX_PROPERTIES: usize = 16_384;
+const MAX_ARRAYS: usize = 1_024;
+const MAX_ARRAY_LENGTH: usize = 2_048;
+const MAX_SCALARS: usize = 32_768;
+const MAX_STRING_SCALARS: usize = 32_768;
+const MAX_SAFE_INTEGER: i128 = 9_007_199_254_740_991;
+
+#[derive(Default)]
+struct ProjectionCounts {
+    maps: usize,
+    properties: usize,
+    arrays: usize,
+    scalars: usize,
+    conflicts: usize,
+}
+
+fn validate_key(key: &str) -> Result<(), String> {
+    let count = key.chars().count();
+    let unsafe_key = count == 0
+        || count > 64
+        || key.nfc().collect::<String>() != key
+        || [".", "..", "__proto__", "prototype", "constructor"].contains(&key)
+        || key.chars().any(|c| {
+            c.is_control() || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        });
+    if unsafe_key {
+        Err("AUTOMERGE_KEY_INVALID".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_json_leaf(
+    value: &JsonValue,
+    depth: usize,
+    counts: &mut ProjectionCounts,
+) -> Result<(), String> {
+    if depth > MAX_DEPTH {
+        return Err("STATE_DEPTH_EXCEEDED".into());
+    }
+    match value {
+        JsonValue::Array(values) => {
+            counts.arrays += 1;
+            if counts.arrays > MAX_ARRAYS || values.len() > MAX_ARRAY_LENGTH {
+                return Err("STATE_ARRAY_LIMIT_EXCEEDED".into());
+            }
+            for value in values {
+                validate_json_leaf(value, depth + 1, counts)?;
+            }
+        }
+        JsonValue::Object(values) => {
+            counts.maps += 1;
+            if counts.maps > MAX_MAPS {
+                return Err("STATE_MAP_LIMIT_EXCEEDED".into());
+            }
+            for (key, value) in values {
+                validate_key(key)?;
+                counts.properties += 1;
+                if counts.properties > MAX_PROPERTIES {
+                    return Err("STATE_PROPERTY_LIMIT_EXCEEDED".into());
+                }
+                validate_json_leaf(value, depth + 1, counts)?;
+            }
+        }
+        JsonValue::String(value) if value.chars().count() > MAX_STRING_SCALARS => {
+            return Err("STATE_STRING_LIMIT_EXCEEDED".into());
+        }
+        JsonValue::Number(value)
+            if value.as_i64().map_or_else(
+                || {
+                    value
+                        .as_u64()
+                        .is_none_or(|n| i128::from(n) > MAX_SAFE_INTEGER)
+                },
+                |n| i128::from(n).abs() > MAX_SAFE_INTEGER,
+            ) =>
+        {
+            return Err("STATE_NUMBER_INVALID".into());
+        }
+        _ => {}
+    }
+    if !value.is_array() && !value.is_object() {
+        counts.scalars += 1;
+    }
+    if counts.scalars > MAX_SCALARS {
+        return Err("STATE_SCALAR_LIMIT_EXCEEDED".into());
+    }
+    Ok(())
+}
+
+fn validate_projection_limits(doc: &Automerge) -> Result<(), String> {
+    let mut counts = ProjectionCounts::default();
+    let mut stack = vec![(ROOT, 0usize)];
+    while let Some((object, depth)) = stack.pop() {
+        if depth > MAX_DEPTH {
+            return Err("STATE_DEPTH_EXCEEDED".into());
+        }
+        counts.maps += 1;
+        if counts.maps > MAX_MAPS {
+            return Err("STATE_MAP_LIMIT_EXCEEDED".into());
+        }
+        for key in doc.keys(&object) {
+            validate_key(&key)?;
+            counts.properties += 1;
+            if counts.properties > MAX_PROPERTIES {
+                return Err("STATE_PROPERTY_LIMIT_EXCEEDED".into());
+            }
+            let values = doc
+                .get_all(&object, key)
+                .map_err(|_| "AUTOMERGE_READ_ERROR".to_string())?;
+            counts.conflicts = counts
+                .conflicts
+                .saturating_add(values.len().saturating_sub(1));
+            if counts.conflicts > MAX_CONFLICTS {
+                return Err("AUTOMERGE_CONFLICT_LIMIT_EXCEEDED".into());
+            }
+            for (value, child) in values {
+                match value {
+                    Value::Object(ObjType::Map) => stack.push((child, depth + 1)),
+                    Value::Object(_) => return Err("AUTOMERGE_OBJECT_TYPE_FORBIDDEN".into()),
+                    Value::Scalar(scalar) => match scalar.as_ref() {
+                        ScalarValue::Null | ScalarValue::Boolean(_) => counts.scalars += 1,
+                        ScalarValue::Str(value) if value.chars().count() <= MAX_STRING_SCALARS => {
+                            counts.scalars += 1
+                        }
+                        ScalarValue::Int(value) if i128::from(*value).abs() <= MAX_SAFE_INTEGER => {
+                            counts.scalars += 1
+                        }
+                        ScalarValue::Uint(value) if i128::from(*value) <= MAX_SAFE_INTEGER => {
+                            counts.scalars += 1
+                        }
+                        ScalarValue::F64(value) if value.is_finite() => counts.scalars += 1,
+                        ScalarValue::Bytes(bytes) => {
+                            let array: JsonValue = serde_json::from_slice(bytes)
+                                .map_err(|_| "AUTOMERGE_ARRAY_INVALID".to_string())?;
+                            if !array.is_array() {
+                                return Err("AUTOMERGE_ARRAY_INVALID".into());
+                            }
+                            validate_json_leaf(&array, depth + 1, &mut counts)?;
+                        }
+                        _ => return Err("AUTOMERGE_SCALAR_TYPE_FORBIDDEN".into()),
+                    },
+                }
+                if counts.scalars > MAX_SCALARS {
+                    return Err("STATE_SCALAR_LIMIT_EXCEEDED".into());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_history_limits(
+    doc: &Automerge,
+    max_changes: usize,
+    max_operations: usize,
+    max_actors: usize,
+) -> Result<(), String> {
+    let changes = doc.get_changes(&[]);
+    if changes.len() > max_changes {
+        return Err("MAX_CHANGES_EXCEEDED".into());
+    }
+    let mut operations = 0usize;
+    let mut actors = HashSet::new();
+    for change in &changes {
+        operations = operations
+            .checked_add(change.len())
+            .ok_or_else(|| "MAX_OPERATIONS_EXCEEDED".to_string())?;
+        if operations > max_operations {
+            return Err("MAX_OPERATIONS_EXCEEDED".into());
+        }
+        for actor in change.actors() {
+            actors.insert(actor.to_bytes().to_vec());
+            if actors.len() > max_actors {
+                return Err("MAX_ACTORS_EXCEEDED".into());
+            }
+        }
+    }
+    Ok(())
+}
 
 pub fn set_json_value<T: Transactable>(
     tx: &mut T,
@@ -192,6 +377,8 @@ pub fn validate_document(doc_bytes: &[u8], max_bytes: usize) -> Result<(), Strin
     }
 
     let doc = Automerge::load(doc_bytes).map_err(|e| format!("AUTOMERGE_CORRUPT: {}", e))?;
+    validate_history_limits(&doc, MAX_CHANGES, MAX_OPERATIONS, MAX_ACTORS)?;
+    validate_projection_limits(&doc)?;
 
     if doc.get_heads().len() > MAX_HEADS {
         return Err("MAX_HEADS_EXCEEDED".into());
@@ -280,5 +467,58 @@ mod tests {
 
         assert!(parsed["decisions"]["d1"].is_null());
         assert_eq!(parsed["decisions"]["d2"]["title"], "Decision 2");
+    }
+
+    #[test]
+    fn history_limits_count_changes_operations_and_actors() {
+        let mut doc = AutoCommit::new().with_actor(ActorId::from([1_u8; 16].as_slice()));
+        doc.put(&ROOT, "one", 1).expect("first operation");
+        doc.commit();
+        doc.set_actor(ActorId::from([2_u8; 16].as_slice()));
+        doc.put(&ROOT, "two", 2).expect("second operation");
+        doc.commit();
+        let loaded = Automerge::load(&doc.save()).expect("load");
+
+        assert_eq!(
+            validate_history_limits(&loaded, 1, 10, 10),
+            Err("MAX_CHANGES_EXCEEDED".into())
+        );
+        assert_eq!(
+            validate_history_limits(&loaded, 10, 1, 10),
+            Err("MAX_OPERATIONS_EXCEEDED".into())
+        );
+        assert_eq!(
+            validate_history_limits(&loaded, 10, 10, 1),
+            Err("MAX_ACTORS_EXCEEDED".into())
+        );
+        assert!(validate_history_limits(&loaded, 2, 2, 2).is_ok());
+    }
+
+    #[test]
+    fn projection_limits_reject_unsupported_types_keys_and_numbers() {
+        let actor = ActorId::from([3_u8; 16].as_slice());
+
+        let mut list = AutoCommit::new().with_actor(actor.clone());
+        list.put_object(&ROOT, "list", ObjType::List).expect("list");
+        assert_eq!(
+            validate_document(&list.save(), MAX_AUTOMERGE_BYTES),
+            Err("AUTOMERGE_OBJECT_TYPE_FORBIDDEN".into())
+        );
+
+        let mut key = AutoCommit::new().with_actor(actor.clone());
+        key.put(&ROOT, "__proto__", true).expect("key");
+        assert_eq!(
+            validate_document(&key.save(), MAX_AUTOMERGE_BYTES),
+            Err("AUTOMERGE_KEY_INVALID".into())
+        );
+
+        let mut number = AutoCommit::new().with_actor(actor);
+        number
+            .put(&ROOT, "number", 9_007_199_254_740_992_u64)
+            .expect("number");
+        assert_eq!(
+            validate_document(&number.save(), MAX_AUTOMERGE_BYTES),
+            Err("AUTOMERGE_SCALAR_TYPE_FORBIDDEN".into())
+        );
     }
 }
