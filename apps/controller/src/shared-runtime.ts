@@ -1,3 +1,6 @@
+import {authenticateInvite, verifyInviteRelayContext} from '../../../packages/protocol/src/room-descriptor.js';
+import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.js';
+
 (() => {
   type StoredSharedRoom = {
     roomId: string;
@@ -25,6 +28,8 @@
     capabilityHash: string;
     role: 'viewer' | 'editor';
     approvedAt: number;
+    descriptorDigest: string;
+    capabilities: string[];
   };
 
   type SharedStoreApi = {
@@ -41,6 +46,7 @@
     publisherKeyId: string;
     publisherPublicKey: string;
     publisherDisplayName: string;
+    appId: string;
     appName: string;
     appVersion: string;
     description: string;
@@ -48,26 +54,6 @@
     publicTemplate: Record<string, unknown>;
     maxPlaintextBytes: number;
     declaredMode: 'personal' | 'shared';
-  };
-
-  type RoomDescriptor = {
-    protocolVersion: 1;
-    roomId: string;
-    packageDigest: string;
-    publisherKeyId: string;
-    writerPublicKey: string;
-    capabilityHash: string;
-    role: 'viewer' | 'editor';
-    expiresAt: number;
-  };
-
-  type ParsedInvite = {
-    version: 1;
-    descriptor: RoomDescriptor;
-    descriptorSignature: Uint8Array;
-    roomKey: Uint8Array;
-    capability: Uint8Array;
-    writerPrivateSeed?: Uint8Array | undefined;
   };
 
   type SharedSession = {
@@ -158,6 +144,7 @@
     async decrypt(params: {
       roomKey: Uint8Array;
       expectedWriterPublicKey?: Uint8Array | undefined;
+      expectedAppId?: string | undefined;
       roomId: string;
       packageDigest: string;
       envelope: unknown;
@@ -258,6 +245,48 @@
     let dirty = false;
     let remembered = false;
     let approved = false;
+    let authenticated = false;
+    let savedApproval: StoredSharedApproval | undefined;
+    const descriptorDigest = encodeBase64Url(invite.descriptorDigest);
+    const approvalId = `${descriptor.roomId}:${descriptorDigest}`;
+    const assertNotExpired = (): void => {
+      if (Date.now() >= descriptor.expiresAt) throw new Error('INVITE_EXPIRED');
+    };
+    const matchesApproval = (approval: StoredSharedApproval | undefined): boolean => Boolean(metadata && approval
+      && approval.approvalId === approvalId && approval.descriptorDigest === descriptorDigest
+      && approval.roomId === descriptor.roomId && approval.packageDigest === descriptor.packageDigest
+      && approval.publisherKeyId === descriptor.publisherKeyId && approval.capabilityHash === descriptor.capabilityHash
+      && approval.role === descriptor.role && stableJson(approval.capabilities) === stableJson(metadata.capabilities));
+    const checkRelayContext = async (): Promise<void> => {
+      assertNotExpired();
+      let response: Response;
+      try {
+        response = await fetch(`${apiOrigin}/v1/rooms/${descriptor.roomId}`, {
+          headers: {Authorization: capHeader}, signal: AbortSignal.timeout(5000)
+        });
+      } catch (error) {
+        // Offline reopening is allowed only for this exact previously approved link.
+        // An HTTP rejection or a metadata mismatch never takes this fallback.
+        if (matchesApproval(savedApproval) && localDocBytes && (error instanceof TypeError || (error instanceof DOMException && error.name === 'TimeoutError'))) return;
+        throw new Error('ROOM_METADATA_UNAVAILABLE');
+      }
+      if (!response.ok) throw new Error('ROOM_ACCESS_REJECTED');
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error('ROOM_METADATA_INVALID');
+      let json = '';
+      let size = 0;
+      const decoder = new TextDecoder('utf-8', {fatal: true});
+      try {
+        for (;;) {
+          const {value, done} = await reader.read();
+          if (done) break;
+          size += value.byteLength;
+          if (size > 8192) throw new Error('ROOM_METADATA_TOO_LARGE');
+          json += decoder.decode(value, {stream: true});
+        }
+        verifyInviteRelayContext(invite, JSON.parse(json + decoder.decode()));
+      } finally { await reader.cancel(); }
+    };
     let queue: Promise<unknown> = Promise.resolve();
     const serialized = <T>(action: () => Promise<T>): Promise<T> => {
       const result = queue.then(action);
@@ -326,6 +355,7 @@
     };
 
     const fetchRemoteState = async (): Promise<void> => {
+      assertNotExpired();
       try {
         const res = await fetch(`${apiOrigin}/v1/rooms/${descriptor.roomId}/state`, {
           headers: {
@@ -346,6 +376,7 @@
             const decrypted = await worker.decrypt({
               roomKey: invite.roomKey,
               expectedWriterPublicKey: descriptor.writerPublicKey ? decodeBase64Url(descriptor.writerPublicKey) : undefined,
+              expectedAppId: metadata?.appId,
               roomId: descriptor.roomId,
               packageDigest: descriptor.packageDigest,
               envelope: wireEnvelope
@@ -366,7 +397,7 @@
             }
 
             currentEpoch = wireEnvelope.stateEpoch;
-            currentAppId = wireEnvelope.aad.appId;
+            currentAppId = metadata?.appId;
             currentRevision = wireEnvelope.proposedRevision;
             currentDigest = decrypted.envelopeDigest;
             currentEtag = res.headers.get('ETag') ?? decrypted.etag;
@@ -477,7 +508,8 @@
 
     const approve = async (): Promise<void> => {
       await leasePromise;
-      if (!metadata) throw new Error('SHARED_APPROVAL_NOT_READY');
+      if (!metadata || !authenticated) throw new Error('SHARED_APPROVAL_NOT_READY');
+      await checkRelayContext();
 
       remembered = element<HTMLInputElement>('remember-approval').checked;
       try { await serialized(fetchRemoteState); }
@@ -486,7 +518,9 @@
 
       if (element<HTMLInputElement>('remember-approval').checked) {
         await store().saveApproval({
-          approvalId: `${descriptor.roomId}:${descriptor.packageDigest}:${descriptor.role}`,
+          approvalId,
+          descriptorDigest,
+          capabilities: metadata.capabilities,
           roomId: descriptor.roomId,
           packageDigest: descriptor.packageDigest,
           publisherKeyId: descriptor.publisherKeyId,
@@ -541,6 +575,7 @@
 
     return {
       handleVerified: async (meta) => {
+        await authenticateInvite(invite, meta, location.pathname);
         metadata = meta;
         element('app-title').textContent = meta.appName;
         element('app-version').textContent = meta.appVersion;
@@ -556,7 +591,9 @@
         updateRoleBadge();
 
         const storedRoom = await store().loadRoom(descriptor.roomId);
-        if (storedRoom) {
+        if (storedRoom && storedRoom.packageDigest === descriptor.packageDigest && storedRoom.role === role
+          && storedRoom.capability === encodeBase64Url(invite.capability) && storedRoom.roomKey === encodeBase64Url(invite.roomKey)
+          && storedRoom.writerPrivateSeed === (invite.writerPrivateSeed ? encodeBase64Url(invite.writerPrivateSeed) : undefined)) {
           actorIdHex = storedRoom.actorId;
           currentEpoch = storedRoom.stateEpoch;
           currentRevision = storedRoom.revision;
@@ -572,8 +609,10 @@
           // Shared replicas must load publisher-created history from the relay.
         }
 
-        const approval = await store().loadApproval(`${descriptor.roomId}:${descriptor.packageDigest}:${descriptor.role}`);
-        if (approval) {
+        savedApproval = await store().loadApproval(approvalId);
+        await checkRelayContext();
+        authenticated = true;
+        if (matchesApproval(savedApproval)) {
           await approve();
         } else {
           element('trust-panel').hidden = false;
@@ -582,6 +621,7 @@
       },
 
       stateChanged: async (state, _rev) => serialized(async () => {
+        assertNotExpired();
         await leasePromise;
         if (role !== 'editor' || !isEditorHoldingLock || !invite.writerPrivateSeed || !localDocBytes) throw new Error('READ_ONLY');
         currentState = structuredClone(state);

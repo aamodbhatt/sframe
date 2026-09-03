@@ -48,6 +48,8 @@ Candidate U is the accepted local browser architecture. The signed personal-app 
 
 The shared-room tests now use the actual SQLite Durable Object relay with a test-only, publisher-created encrypted genesis. They exercise encrypted snapshots, concurrent offline edits, viewer enforcement, local device-key wrapping, and consent. Production publisher enrollment/storage, signed recovery, complete hostile-state limits, and release readiness remain unfinished. Do not use real secrets or deploy this checkpoint.
 
+Shared links are parsed with strict canonical encoding and are authenticated against the verified package publisher, room path, capability, writer key, immutable expiry, relay role/configuration, and encrypted app/package context before approval or state access. The local fixture package and signer are explicitly test-only; production package retrieval and room creation remain gated work.
+
 The renderer's local byte ceiling was raised from 2 MiB to 4 MiB while the inherited combined verifier/CRDT Wasm build is being evaluated. Splitting the state engine and restoring a measured lightweight budget remains open. A passing test suite does not close the full Phase 3–5 specification gates.
 
 Working locally today:

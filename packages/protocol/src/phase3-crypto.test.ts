@@ -140,6 +140,9 @@ describe('Phase 3 Cryptographic Envelope & Room Descriptors', () => {
         envelope
       })
     ).rejects.toThrow('WRITER_PUBLIC_KEY_MISMATCH');
+
+    await expect(decryptSnapshot({roomKey, expectedWriterPublicKey: writerPub, expectedAppId: 'com.example.other',
+      roomId, packageDigest, envelope})).rejects.toThrow('APP_ID_AAD_MISMATCH');
   });
 
   it('creates and verifies signed room descriptors and parses invite fragments', async () => {

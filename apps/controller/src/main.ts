@@ -1,3 +1,21 @@
+import {parseInviteFragment} from '../../../packages/protocol/src/room-descriptor.js';
+import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.js';
+
+// Capture only a bounded transient fragment and scrub synchronously, even on failure.
+let initialHash = '';
+let inviteCaptureFailed = false;
+const hadFragment = Boolean(window.location.hash);
+try {
+  if (window.location.hash.length > 4097) throw new Error('FRAGMENT_TOO_LARGE');
+  initialHash = window.location.hash;
+} catch { inviteCaptureFailed = true; }
+finally {
+  if (hadFragment) {
+    try { history.replaceState(null, '', `${location.pathname}${location.search}`); }
+    catch { inviteCaptureFailed = true; initialHash = ''; }
+  }
+}
+
 const RENDERER_DIGEST = '__RENDERER_DIGEST__';
 const CONTROLLER_ORIGIN = 'http://app.localhost:4173';
 const ARCHITECTURE_CANDIDATE: string = '__ARCHITECTURE_CANDIDATE__';
@@ -5,48 +23,17 @@ const CHANNEL_TEST_FIXTURE: string = '__CHANNEL_TEST_FIXTURE__';
 const PHASE0_WASM_BYTES = Number('__PHASE0_WASM_BYTES__');
 const PHASE1_WASM_BYTES = Number('__PHASE1_WASM_BYTES__');
 const PHASE2_PACKAGE_BASE64 = '__PHASE2_PACKAGE_BASE64__';
+const SHARED_TEST_PACKAGE_BASE64 = '__SHARED_TEST_PACKAGE_BASE64__';
 const PHASE2_DEFAULT = Boolean(Number('__PHASE2_DEFAULT_FLAG__'));
 const PHASE2_EXPECTED_DIGEST = '__PHASE2_EXPECTED_DIGEST__';
 const PHASE2_EXPECTED_KEY_ID = '__PHASE2_EXPECTED_KEY_ID__';
-const initialHash = window.location.hash;
-const fromB64Url = (str: string): Uint8Array => {
-  const base64 = str.replaceAll('-', '+').replaceAll('_', '/');
-  const padded = base64.padEnd(base64.length + (4 - (base64.length % 4)) % 4, '=');
-  const binary = atob(padded);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
-  return bytes;
-};
-let parsedInvite: any = undefined;
-if (initialHash.includes('v=1&d=') || initialHash.includes('d=')) {
-  try {
-    const rawFragment = initialHash.startsWith('#') ? initialHash.slice(1) : initialHash;
-    const params = new URLSearchParams(rawFragment);
-    const d = params.get('d');
-    const s = params.get('s');
-    const k = params.get('k');
-    const c = params.get('c');
-    const w = params.get('w');
-    if (d && s && k && c) {
-      const descriptorJson = new TextDecoder().decode(fromB64Url(d));
-      const descriptor = JSON.parse(descriptorJson);
-      parsedInvite = {
-        version: 1,
-        descriptor,
-        descriptorSignature: fromB64Url(s),
-        roomKey: fromB64Url(k),
-        capability: fromB64Url(c),
-        writerPrivateSeed: w ? fromB64Url(w) : undefined
-      };
-    }
-  } catch (_) {}
-}
-
-const SHARED_MODE = Boolean(parsedInvite || new URLSearchParams(location.search).get('room') === '1');
+let parsedInvite: ParsedInvite | undefined;
+const looksLikeInvite = initialHash.includes('d=') || initialHash.includes('v=1');
+const SHARED_MODE = looksLikeInvite || location.pathname.startsWith('/r/') || new URLSearchParams(location.search).get('room') === '1';
 const PERSONAL_MODE = Boolean(!SHARED_MODE && (PHASE2_DEFAULT || new URLSearchParams(location.search).get('personal') === '1'));
 const USES_CLASSIC_WORKER = ARCHITECTURE_CANDIDATE === 'S' || ARCHITECTURE_CANDIDATE === 'T' || ARCHITECTURE_CANDIDATE === 'U' || PERSONAL_MODE || SHARED_MODE;
 const IS_CANDIDATE_U = ARCHITECTURE_CANDIDATE === 'U' || PERSONAL_MODE || SHARED_MODE;
-const PERSONAL_ROLE: 'viewer' | 'editor' = (parsedInvite?.descriptor?.role ?? (new URLSearchParams(location.search).get('role') === 'viewer' ? 'viewer' : 'editor')) as 'viewer' | 'editor';
+const PERSONAL_ROLE: 'viewer' | 'editor' = new URLSearchParams(location.search).get('role') === 'viewer' ? 'viewer' : 'editor';
 let sharedExecutionRole: 'viewer' | 'editor' = 'viewer';
 const executionRole = (): 'viewer' | 'editor' => SHARED_MODE ? sharedExecutionRole : PERSONAL_MODE ? PERSONAL_ROLE : 'editor';
 const executionIsReadOnly = (): boolean => executionRole() === 'viewer';
@@ -72,7 +59,7 @@ let personalArchive = new Uint8Array();
 let stateMutationInFlight = false;
 type StateValidation = {resolve: (result: {valid: boolean; error: string}) => void; timer: number};
 const stateValidations = new Map<string, StateValidation>();
-type PersonalPackageMetadata = {packageDigest: string; artifactDigest: string; publisherKeyId: string; publisherPublicKey: string; publisherDisplayName: string; appName: string; appVersion: string; description: string; capabilities: string[]; publicTemplate: Record<string, unknown>; maxPlaintextBytes: number; declaredMode: 'personal' | 'shared'};
+type PersonalPackageMetadata = {packageDigest: string; artifactDigest: string; publisherKeyId: string; publisherPublicKey: string; publisherDisplayName: string; appId: string; appName: string; appVersion: string; description: string; capabilities: string[]; publicTemplate: Record<string, unknown>; maxPlaintextBytes: number; declaredMode: 'personal' | 'shared'};
 type PersonalSession = {handleVerified: (metadata: PersonalPackageMetadata) => Promise<void>; stateChanged: (state: Record<string, unknown>, revision: number) => Promise<void>; setBuildId?: (buildId: string) => void; showUpdateBanner?: (waitingWorker: ServiceWorker) => void};
 let personalSession: PersonalSession | undefined;
 
@@ -360,13 +347,13 @@ const startFrame = async (rendererHtml?: string): Promise<void> => {
   });
 };
 
-type RendererMessage = {channel?: unknown; protocol?: unknown; session?: unknown; sequence?: unknown; type?: unknown; tree?: unknown; error?: unknown; requestId?: unknown; operations?: unknown; validationId?: unknown; valid?: unknown; workerKind?: unknown; blobCount?: unknown; workerSelfOrigin?: unknown; workerLocationOrigin?: unknown; workerLocationHref?: unknown; wasmStarted?: unknown; wasmBytes?: unknown; wasmProbe?: unknown; wasmDigest?: unknown; verifierStarted?: unknown; verifierBytes?: unknown; verifierVersion?: unknown; verifierDigest?: unknown; state?: unknown; generation?: unknown; restartCount?: unknown; lastReason?: unknown; stopCode?: unknown; packageDigest?: unknown; artifactDigest?: unknown; publisherKeyId?: unknown; publisherPublicKey?: unknown; publisherDisplayName?: unknown; appName?: unknown; appVersion?: unknown; description?: unknown; capabilities?: unknown; publicTemplate?: unknown; maxPlaintextBytes?: unknown; declaredMode?: unknown};
+type RendererMessage = {channel?: unknown; protocol?: unknown; session?: unknown; sequence?: unknown; type?: unknown; tree?: unknown; error?: unknown; requestId?: unknown; operations?: unknown; validationId?: unknown; valid?: unknown; workerKind?: unknown; blobCount?: unknown; workerSelfOrigin?: unknown; workerLocationOrigin?: unknown; workerLocationHref?: unknown; wasmStarted?: unknown; wasmBytes?: unknown; wasmProbe?: unknown; wasmDigest?: unknown; verifierStarted?: unknown; verifierBytes?: unknown; verifierVersion?: unknown; verifierDigest?: unknown; state?: unknown; generation?: unknown; restartCount?: unknown; lastReason?: unknown; stopCode?: unknown; packageDigest?: unknown; artifactDigest?: unknown; publisherKeyId?: unknown; publisherPublicKey?: unknown; publisherDisplayName?: unknown; appId?: unknown; appName?: unknown; appVersion?: unknown; description?: unknown; capabilities?: unknown; publicTemplate?: unknown; maxPlaintextBytes?: unknown; declaredMode?: unknown};
 
 const validPersonalMetadata = (message: RendererMessage, baseKeys: string[]): boolean => {
   if ((!PERSONAL_MODE && !SHARED_MODE) || workerLifecycleState !== 'idle') return false;
-  const fields = ['packageDigest', 'artifactDigest', 'publisherKeyId', 'publisherPublicKey', 'publisherDisplayName', 'appName', 'appVersion', 'description', 'capabilities', 'publicTemplate', 'maxPlaintextBytes', 'declaredMode'];
+  const fields = ['packageDigest', 'artifactDigest', 'publisherKeyId', 'publisherPublicKey', 'publisherDisplayName', 'appId', 'appName', 'appVersion', 'description', 'capabilities', 'publicTemplate', 'maxPlaintextBytes', 'declaredMode'];
   if (!exactKeys(message, [...baseKeys, ...fields])) return false;
-  const stringFields = fields.slice(0, 8);
+  const stringFields = fields.slice(0, 9);
   if (!stringFields.every((field) => typeof message[field as keyof RendererMessage] === 'string')) return false;
   if (!Array.isArray(message.capabilities) || !message.capabilities.every((value) => typeof value === 'string')) return false;
   if (!isPlainRecord(message.publicTemplate) || !Number.isSafeInteger(message.maxPlaintextBytes)) return false;
@@ -543,7 +530,7 @@ const onPortMessage = (event: MessageEvent): void => {
     if (message.state === 'restarting') byId<HTMLElement>('status').textContent = `App Worker restarting after ${message.lastReason}.`;
   } else if (message.type === 'sf.renderer.package-verified') {
     if (!personalSession) { terminateControllerChannel('PERSONAL_SESSION_MISSING', true); return; }
-    const metadata = {packageDigest: message.packageDigest, artifactDigest: message.artifactDigest, publisherKeyId: message.publisherKeyId, publisherPublicKey: message.publisherPublicKey, publisherDisplayName: message.publisherDisplayName, appName: message.appName, appVersion: message.appVersion, description: message.description, capabilities: message.capabilities, publicTemplate: message.publicTemplate, maxPlaintextBytes: message.maxPlaintextBytes, declaredMode: message.declaredMode} as PersonalPackageMetadata;
+    const metadata = {packageDigest: message.packageDigest, artifactDigest: message.artifactDigest, publisherKeyId: message.publisherKeyId, publisherPublicKey: message.publisherPublicKey, publisherDisplayName: message.publisherDisplayName, appId: message.appId, appName: message.appName, appVersion: message.appVersion, description: message.description, capabilities: message.capabilities, publicTemplate: message.publicTemplate, maxPlaintextBytes: message.maxPlaintextBytes, declaredMode: message.declaredMode} as PersonalPackageMetadata;
     void personalSession.handleVerified(metadata).catch((error: unknown) => terminateControllerChannel(error instanceof Error ? error.message : 'PERSONAL_SETUP_FAILED', true));
   } else if (message.type === 'sf.renderer.state.batch') {
     dispatchStateBatch(message);
@@ -562,10 +549,19 @@ const onPortMessage = (event: MessageEvent): void => {
 };
 
 const main = async (): Promise<void> => {
+  if (SHARED_MODE) {
+    if (inviteCaptureFailed) throw new Error('INVITE_CAPTURE_FAILED');
+    if (!initialHash) throw new Error('INVITE_MISSING_REOPEN_ORIGINAL_LINK');
+    try { parsedInvite = await parseInviteFragment(initialHash); }
+    catch { throw new Error('INVITE_INVALID'); }
+    finally { initialHash = ''; }
+    if (location.pathname !== `/r/${parsedInvite.descriptor.roomId}`) throw new Error('INVITE_ROOM_PATH_MISMATCH');
+  }
+  initialHash = '';
   const module = (window as Window & {SMALLFRAME_APP_MODULE?: string}).SMALLFRAME_APP_MODULE;
   if (!USES_CLASSIC_WORKER && !module) throw new Error('APP_MODULE_MISSING');
   if (SHARED_MODE && parsedInvite) {
-    const binary = atob(PHASE2_PACKAGE_BASE64);
+    const binary = atob(SHARED_TEST_PACKAGE_BASE64);
     personalArchive = Uint8Array.from(binary, (character) => character.charCodeAt(0));
     const sharedRuntime = (globalThis as typeof globalThis & {SmallframeSharedRuntime?: {createSession: (options: any) => PersonalSession}}).SmallframeSharedRuntime;
     if (!sharedRuntime) throw new Error('SHARED_RUNTIME_MISSING');
@@ -604,7 +600,6 @@ const reopenRendererForPhase0 = async (): Promise<void> => {
 };
 
 if (IS_CANDIDATE_U) {
-  if (initialHash) history.replaceState(null, document.title, `${window.location.pathname}${window.location.search}`);
   Object.defineProperty(window, '__smallframePhase0ReopenRenderer', {value: reopenRendererForPhase0, configurable: false, enumerable: false, writable: false});
 }
 

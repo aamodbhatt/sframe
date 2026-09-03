@@ -25,6 +25,8 @@
     capabilityHash: string;
     role: 'viewer' | 'editor';
     approvedAt: number;
+    descriptorDigest: string;
+    capabilities: string[];
   };
 
   type SharedStoreApi = {

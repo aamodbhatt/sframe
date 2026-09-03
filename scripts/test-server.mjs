@@ -23,6 +23,7 @@ const relay = new Miniflare({modules: true, scriptPath: join(relayDir, 'worker.m
 });
 const relayOrigin = (await relay.ready).origin;
 const relayNetwork = {online: true};
+let relayMetadataFault = '';
 const forwardRelay = async (request, response) => {
   if (!relayNetwork.online) { response.writeHead(503).end(); return; }
   const chunks = [];
@@ -41,8 +42,15 @@ const forwardRelay = async (request, response) => {
   const responseHeaders = new Headers(upstream.headers);
   // fetch() has already decompressed the body; do not forward stale framing.
   for (const name of ['content-encoding', 'content-length', 'transfer-encoding']) responseHeaders.delete(name);
+  let responseBody = Buffer.from(await upstream.arrayBuffer());
+  if (upstream.status === 200 && request.method === 'GET' && /^\/v1\/rooms\/[A-Za-z0-9_-]{22}$/u.test(request.url ?? '') && relayMetadataFault) {
+    const metadata = JSON.parse(responseBody.toString('utf8'));
+    if (relayMetadataFault === 'expiry') metadata.expiresAtMs += 1;
+    else if (relayMetadataFault === 'role') metadata.role = metadata.role === 'editor' ? 'viewer' : 'editor';
+    responseBody = Buffer.from(JSON.stringify(metadata));
+  }
   response.writeHead(upstream.status, Object.fromEntries(responseHeaders));
-  response.end(Buffer.from(await upstream.arrayBuffer()));
+  response.end(responseBody);
 };
 const candidate = process.env.SMALLFRAME_CANDIDATE ?? 'U';
 const canary = {http: 0, ws: 0, paths: []};
@@ -96,6 +104,7 @@ const resetEvidence = () => {
   serviceWorkerRequests.length = 0;
   rendererFaultTokens.clear();
   relayNetwork.online = true;
+  relayMetadataFault = '';
 };
 const evidenceSnapshot = () => ({...canary, rendererFallback: {...rendererFallback}, rendererMutation: {...rendererMutation}, appNetwork: {...appNetwork}, serviceWorkerRequests: [...serviceWorkerRequests]});
 const validControllerQuery = (url) => {
@@ -144,7 +153,7 @@ const staticHandler = (request, response) => {
   if (url.pathname === '/canary') { canary.http += 1; canary.paths.push(url.pathname + url.search); response.writeHead(204, {'Cache-Control': 'no-store'}).end(); return; }
   if (url.pathname === '/connectivity' && request.method === 'GET' && !url.search) { response.writeHead(204, {'Cache-Control': 'no-store'}).end(); return; }
   if (url.pathname === '/sw-probe') { response.writeHead(404, {...controllerHeaders, [PROVENANCE_HEADER]: 'network-fallback', 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store'}).end('network-fallback'); return; }
-  const relative = url.pathname === '/' ? '/index.html' : url.pathname;
+  const relative = url.pathname === '/' || /^\/r\/[A-Za-z0-9_-]{22}$/u.test(url.pathname) ? '/index.html' : url.pathname;
   const file = normalize(join(dist, relative));
   if (!file.startsWith(dist + sep) || !existsSync(file) || !statSync(file).isFile() || !validControllerQuery(url)) { response.writeHead(404, {'Content-Type': 'text/plain', ...controllerHeaders}).end('not found'); return; }
   if (relative.startsWith('/runtime/renderer/') && request.headers['sec-fetch-dest'] === 'iframe' && hasRendererFault(request)) {
@@ -190,6 +199,14 @@ const apiHandler = (request, response) => {
   if (url.pathname === '/__test__/relay-network' && request.method === 'POST') {
     void bodyJson(request).then((body) => {
       relayNetwork.online = body.online === true;
+      response.writeHead(204).end();
+    }).catch(() => response.writeHead(400).end());
+    return;
+  }
+  if (url.pathname === '/__test__/relay-metadata-fault' && request.method === 'POST') {
+    void bodyJson(request).then((body) => {
+      if (!body || !['', 'expiry', 'role'].includes(body.fault)) throw new Error('invalid relay metadata fault');
+      relayMetadataFault = body.fault;
       response.writeHead(204).end();
     }).catch(() => response.writeHead(400).end());
     return;

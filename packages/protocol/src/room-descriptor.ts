@@ -148,10 +148,33 @@ const parseParams = (fragmentString: string): {d: string; s: string; k: string; 
 
   const allowedKeys = w ? ['v', 'd', 's', 'w', 'k', 'c'] : ['v', 'd', 's', 'k', 'c'];
   const actualKeys = [...params.keys()];
-  if (actualKeys.length !== allowedKeys.length || !actualKeys.every((key) => allowedKeys.includes(key))) {
+  if (actualKeys.length !== allowedKeys.length || new Set(actualKeys).size !== actualKeys.length || !actualKeys.every((key) => allowedKeys.includes(key))) {
     throw new Error('INVITE_FRAGMENT_UNRECOGNIZED_KEYS');
   }
+  if (clean.split('&').some((part) => !/^(v|d|s|w|k|c)=[A-Za-z0-9_-]+$/u.test(part))) throw new Error('INVITE_ENCODING_INVALID');
   return {d, s, k, c, w};
+};
+
+const strictBase64 = (value: unknown, size?: number): Uint8Array => {
+  if (typeof value !== 'string' || !/^[A-Za-z0-9_-]+$/u.test(value)) throw new Error('INVITE_ENCODING_INVALID');
+  const bytes = decodeBase64Url(value);
+  if (encodeBase64Url(bytes) !== value || (size !== undefined && bytes.length !== size)) throw new Error('INVITE_ENCODING_INVALID');
+  return bytes;
+};
+
+const parseDescriptor = (bytes: Uint8Array): RoomDescriptor => {
+  if (bytes.length > MAX_DESCRIPTOR_BYTES) throw new Error('DESCRIPTOR_TOO_LARGE');
+  const json = new TextDecoder('utf-8', {fatal: true, ignoreBOM: true}).decode(bytes);
+  const value = JSON.parse(json) as Record<string, unknown>;
+  const keys = ['protocolVersion', 'roomId', 'packageDigest', 'publisherKeyId', 'writerPublicKey', 'capabilityHash', 'role', 'expiresAt'];
+  if (!value || Array.isArray(value) || typeof value !== 'object' || Object.keys(value).length !== keys.length || !keys.every((key) => Object.hasOwn(value, key))) throw new Error('DESCRIPTOR_SCHEMA_INVALID');
+  if (canonicalize(value) !== json) throw new Error('DESCRIPTOR_NOT_CANONICAL');
+  if (value.protocolVersion !== 1 || !['viewer', 'editor'].includes(String(value.role)) || !Number.isSafeInteger(value.expiresAt) || Number(value.expiresAt) < 0) throw new Error('DESCRIPTOR_SCHEMA_INVALID');
+  strictBase64(value.roomId, 16);
+  for (const key of ['packageDigest', 'writerPublicKey', 'capabilityHash']) strictBase64(value[key], 32);
+  if (typeof value.publisherKeyId !== 'string' || !value.publisherKeyId.startsWith('sha256:')) throw new Error('DESCRIPTOR_SCHEMA_INVALID');
+  strictBase64(value.publisherKeyId.slice(7), 32);
+  return value as RoomDescriptor;
 };
 
 const resolveWriterKey = async (descriptor: RoomDescriptor, w: string | null): Promise<Uint8Array | undefined> => {
@@ -159,7 +182,7 @@ const resolveWriterKey = async (descriptor: RoomDescriptor, w: string | null): P
   if (descriptor.role === 'viewer' && w) throw new Error('VIEWER_INVITE_CANNOT_HAVE_WRITER_KEY');
   if (!w) return undefined;
 
-  const writerPrivateSeed = decodeBase64Url(w);
+  const writerPrivateSeed = strictBase64(w, 32);
   if (writerPrivateSeed.byteLength !== 32) throw new Error('INVALID_WRITER_PRIVATE_SEED');
   const derivedPub = await getPublicKeyAsync(writerPrivateSeed);
   if (encodeBase64Url(derivedPub) !== descriptor.writerPublicKey) {
@@ -171,18 +194,16 @@ const resolveWriterKey = async (descriptor: RoomDescriptor, w: string | null): P
 export const parseInviteFragment = async (fragmentString: string): Promise<ParsedInvite> => {
   const {d, s, k, c, w} = parseParams(fragmentString);
 
-  const descriptorJcsBytes = decodeBase64Url(d);
-  const descriptorSignature = decodeBase64Url(s);
-  const roomKey = decodeBase64Url(k);
-  const capability = decodeBase64Url(c);
+  const descriptorJcsBytes = strictBase64(d);
+  const descriptorSignature = strictBase64(s, 64);
+  const roomKey = strictBase64(k, 32);
+  const capability = strictBase64(c, 32);
 
   if (descriptorSignature.byteLength !== 64) throw new Error('INVALID_SIGNATURE_LENGTH');
   if (roomKey.byteLength !== 32) throw new Error('INVALID_ROOM_KEY_LENGTH');
   if (capability.byteLength !== 32) throw new Error('INVALID_CAPABILITY_LENGTH');
 
-  const descriptorJson = new TextDecoder().decode(descriptorJcsBytes);
-  const descriptor = JSON.parse(descriptorJson) as RoomDescriptor;
-  if (descriptor.protocolVersion !== 1) throw new Error('INVALID_DESCRIPTOR_PROTOCOL');
+  const descriptor = parseDescriptor(descriptorJcsBytes);
 
   const expectedCapHash = encodeBase64Url(await sha256(capability));
   if (descriptor.capabilityHash !== expectedCapHash) {
@@ -201,6 +222,35 @@ export const parseInviteFragment = async (fragmentString: string): Promise<Parse
     capability,
     writerPrivateSeed
   };
+};
+
+/** Call only with metadata from successful, pinned package verification. */
+export const authenticateInvite = async (invite: ParsedInvite, metadata: {
+  packageDigest: string; publisherKeyId: string; publisherPublicKey: string; declaredMode: string;
+}, pathname: string, now = Date.now()): Promise<void> => {
+  const descriptor = invite.descriptor;
+  if (pathname !== `/r/${descriptor.roomId}`) throw new Error('INVITE_ROOM_PATH_MISMATCH');
+  if (descriptor.expiresAt <= now) throw new Error('INVITE_EXPIRED');
+  if (metadata.declaredMode !== 'shared' || metadata.packageDigest !== descriptor.packageDigest || metadata.publisherKeyId !== descriptor.publisherKeyId) throw new Error('INVITE_PACKAGE_MISMATCH');
+  const key = strictBase64(metadata.publisherPublicKey, 32);
+  if (`sha256:${encodeBase64Url(await sha256(key))}` !== descriptor.publisherKeyId) throw new Error('INVITE_PUBLISHER_MISMATCH');
+  const verified = await verifyRoomDescriptor(descriptor, invite.descriptorSignature, key);
+  if (!verified.valid || encodeBase64Url(verified.descriptorDigest) !== encodeBase64Url(invite.descriptorDigest)) throw new Error('INVITE_SIGNATURE_INVALID');
+};
+
+export const verifyInviteRelayContext = (invite: ParsedInvite, value: unknown): void => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('ROOM_METADATA_INVALID');
+  const meta = value as Record<string, unknown>;
+  const keys = ['roomId', 'stateEpoch', 'revision', 'envelopeDigest', 'etag', 'expiresAtMs', 'isRevoked', 'role', 'capabilityHash', 'writerPublicKey', 'packageDigest'];
+  if (Object.keys(meta).length !== keys.length || !keys.every((key) => Object.hasOwn(meta, key))
+    || !Number.isSafeInteger(meta.stateEpoch) || Number(meta.stateEpoch) < 0 || !Number.isSafeInteger(meta.revision) || Number(meta.revision) < 1
+    || typeof meta.etag !== 'string') throw new Error('ROOM_METADATA_INVALID');
+  strictBase64(meta.envelopeDigest, 32);
+  if (meta.etag !== `"sf1.${meta.stateEpoch}.${meta.revision}.${meta.envelopeDigest}"`) throw new Error('ROOM_METADATA_INVALID');
+  const d = invite.descriptor;
+  const expected = {roomId: d.roomId, packageDigest: d.packageDigest, writerPublicKey: d.writerPublicKey,
+    expiresAtMs: d.expiresAt, role: d.role, capabilityHash: d.capabilityHash, isRevoked: false};
+  if (!Object.entries(expected).every(([key, expectedValue]) => meta[key] === expectedValue)) throw new Error('INVITE_RELAY_CONTEXT_MISMATCH');
 };
 
 export const scrubAddressBar = (): string => {

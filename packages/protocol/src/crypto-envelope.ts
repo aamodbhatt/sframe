@@ -298,6 +298,7 @@ export const encryptSnapshot = async (params: {
 export const decryptSnapshot = async (params: {
   roomKey: Uint8Array;
   expectedWriterPublicKey?: Uint8Array;
+  expectedAppId?: string;
   roomId: string;
   packageDigest: string;
   envelope: WireEnvelope;
@@ -310,6 +311,7 @@ export const decryptSnapshot = async (params: {
   if (envelope.version !== 1) throw new Error('UNSUPPORTED_ENVELOPE_VERSION');
   if (envelope.aad.roomId !== params.roomId) throw new Error('ROOM_ID_AAD_MISMATCH');
   if (envelope.aad.packageDigest !== params.packageDigest) throw new Error('PACKAGE_DIGEST_AAD_MISMATCH');
+  if (params.expectedAppId !== undefined && envelope.aad.appId !== params.expectedAppId) throw new Error('APP_ID_AAD_MISMATCH');
   if (envelope.aad.stateEpoch !== envelope.stateEpoch || envelope.aad.proposedRevision !== envelope.proposedRevision) {
     throw new Error('EPOCH_REVISION_AAD_MISMATCH');
   }

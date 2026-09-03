@@ -258,6 +258,7 @@ test('renderer boundary, channel, and canary behavior', async ({page, request}) 
   if (candidate === 'R' || usesClassicWorker || candidate === 'A') {
     if (candidate === 'R' || usesClassicWorker) await expect(frame).not.toHaveAttribute('sandbox', /./u);
     else await expect(frame).toHaveAttribute('sandbox', 'allow-scripts');
+    await expect.poll(() => page.frames().some((item) => item !== page.mainFrame() && (candidate === 'A' ? item.url().startsWith('about:srcdoc') : item.url().includes('/runtime/renderer/')))).toBe(true);
     const rendererFrame = page.frames().find((item) => item !== page.mainFrame() && (candidate === 'A' ? item.url().startsWith('about:srcdoc') : item.url().includes('/runtime/renderer/')));
     if (!rendererFrame) throw new Error('renderer frame missing');
     if (candidate === 'A') {

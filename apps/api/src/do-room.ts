@@ -290,7 +290,8 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
   }
 
   private async getMetadata(request: Request, room: RoomRow): Promise<Response> {
-    if (!await this.authorize(request, room)) return problem(403, 'ROOM_AUTH_INVALID');
+    const auth = await this.authorize(request, room);
+    if (!auth) return problem(403, 'ROOM_AUTH_INVALID');
     return new Response(JSON.stringify({
       roomId: room.room_id,
       stateEpoch: room.state_epoch,
@@ -299,6 +300,10 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
       etag: room.etag,
       expiresAtMs: room.expires_at_ms,
       isRevoked: room.revoked_at_ms !== null,
+      role: auth,
+      capabilityHash: encodeBase64Url(bytesFromSql(auth === 'editor' ? room.editor_cap_hash : room.viewer_cap_hash)),
+      writerPublicKey: room.writer_public_key ? encodeBase64Url(bytesFromSql(room.writer_public_key)) : '',
+      packageDigest: room.aad_json ? JSON.parse(room.aad_json).packageDigest : '',
     }), {headers: jsonHeaders});
   }
 

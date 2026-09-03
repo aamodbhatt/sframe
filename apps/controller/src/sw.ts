@@ -226,7 +226,7 @@ sw.addEventListener('fetch', (event) => {
     event.respondWith(handleRendererFetch(url.pathname));
     return;
   }
-  const isControllerNavigation = event.request.mode === 'navigate' && (url.pathname === '/' || url.pathname === '/index.html');
+  const isControllerNavigation = event.request.mode === 'navigate' && (url.pathname === '/' || url.pathname === '/index.html' || /^\/r\/[A-Za-z0-9_-]{22}$/u.test(url.pathname));
   const pathname = isControllerNavigation ? '/' : url.pathname;
   event.respondWith(handleShellFetch(pathname, event.request));
 });

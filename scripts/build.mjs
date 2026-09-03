@@ -6,6 +6,7 @@ import ts from 'typescript';
 import {signAsync} from '@noble/ed25519';
 import canonicalize from 'canonicalize';
 import {pathToFileURL} from 'node:url';
+import {build as bundle} from 'vite';
 
 const root = process.cwd();
 const candidate = process.env.SMALLFRAME_CANDIDATE ?? 'U';
@@ -240,6 +241,7 @@ const decryptSnapshot = async (params) => {
   if (envelope.version !== 1) throw new Error('UNSUPPORTED_ENVELOPE_VERSION');
   if (envelope.aad.roomId !== params.roomId) throw new Error('ROOM_ID_AAD_MISMATCH');
   if (envelope.aad.packageDigest !== params.packageDigest) throw new Error('PACKAGE_DIGEST_AAD_MISMATCH');
+  if (params.expectedAppId !== undefined && envelope.aad.appId !== params.expectedAppId) throw new Error('APP_ID_AAD_MISMATCH');
   if (envelope.aad.stateEpoch !== envelope.stateEpoch || envelope.aad.proposedRevision !== envelope.proposedRevision) throw new Error('EPOCH_REVISION_AAD_MISMATCH');
 
   const rawRoomId = decodeBase64Url(params.roomId);
@@ -407,6 +409,34 @@ if (phase2Package.byteLength < 1 || phase2Package.byteLength > 1_310_720) throw 
 const phase2Default = process.env.SMALLFRAME_PHASE2_DEFAULT === '1';
 const phase2ExpectedDigest = configuredPackage ? (process.env.SMALLFRAME_DEV_PACKAGE_DIGEST ?? '') : phase2DefaultPackageMetadata.packageDigest;
 const phase2ExpectedKeyId = configuredPackage ? (process.env.SMALLFRAME_DEV_PUBLISHER_KEY_ID ?? '') : phase2DefaultPackageMetadata.publisherKeyId;
+const sharedFixtureBuild = spawnSync('cargo', ['run', '--quiet', '--locked', '-p', 'smallframe-core', '--example', 'generate_shared_test_package'], {cwd: root, encoding: 'utf8', env: childEnv});
+if (sharedFixtureBuild.status !== 0) throw new Error(`SHARED_TEST_PACKAGE_BUILD_FAILED: ${sharedFixtureBuild.stderr}`);
+const sharedFixture = JSON.parse(sharedFixtureBuild.stdout);
+writeFileSync(join(phase1WasmOutput, 'shared-test-package.json'), JSON.stringify(sharedFixture));
+const controllerReplacements = new Map([
+  ['__RENDERER_DIGEST__', rendererDigest], ['__RENDERER_BOOTSTRAP_HASH__', rendererBootstrapHash],
+  ['__RENDERER_CSS_HASH__', rendererCssHash], ['__RENDERER_WASM_EVAL_SOURCE__', wasmEvalSource],
+  ['__PHASE0_WASM_BYTES__', String(phase0Wasm.byteLength)], ['__PHASE1_WASM_BYTES__', String(phase1Wasm.byteLength)],
+  ['__CHANNEL_TEST_FIXTURE__', candidateUChannelFixture], ['__PHASE2_PACKAGE_BASE64__', phase2Package.toString('base64')],
+  ['__SHARED_TEST_PACKAGE_BASE64__', sharedFixture.archiveBase64], ['__PHASE2_DEFAULT_FLAG__', phase2Default ? '1' : '0'],
+  ['__PHASE2_EXPECTED_DIGEST__', phase2ExpectedDigest], ['__PHASE2_EXPECTED_KEY_ID__', phase2ExpectedKeyId],
+  ['__ARCHITECTURE_CANDIDATE__', candidate]
+]);
+// Replace build constants before Vite can fold architecture branches, then
+// bundle the actual shared protocol implementation rather than a copied verifier.
+for (const name of ['main', 'shared-runtime']) {
+  const result = await bundle({configFile: false, logLevel: 'silent', plugins: [{name: 'smallframe-build-constants',
+    transform(code, id) {
+      if (!id.endsWith('/apps/controller/src/main.ts')) return null;
+      for (const [from, to] of controllerReplacements) code = code.replaceAll(from, to);
+      return {code, map: null};
+    }}], build: {write: false, target: 'es2022', minify: false,
+    lib: {entry: join(root, 'apps/controller/src', `${name}.ts`), name: `smallframe_${name.replaceAll('-', '_')}`, formats: ['iife']}}});
+  const outputs = Array.isArray(result) ? result : [result];
+  const chunks = outputs.flatMap((output) => output.output).filter((chunk) => chunk.type === 'chunk');
+  if (chunks.length !== 1) throw new Error('CONTROLLER_BUNDLE_INVALID');
+  writeFileSync(join(controller, `${name}.js`), chunks[0].code);
+}
 let main = readFileSync(mainPath, 'utf8').replace(/\nexport \{\};\s*$/u, '').replaceAll('__RENDERER_DIGEST__', rendererDigest)
   .replaceAll('__RENDERER_BOOTSTRAP_HASH__', rendererBootstrapHash)
   .replaceAll('__RENDERER_CSS_HASH__', rendererCssHash)
@@ -415,6 +445,7 @@ let main = readFileSync(mainPath, 'utf8').replace(/\nexport \{\};\s*$/u, '').rep
   .replaceAll('__PHASE1_WASM_BYTES__', String(phase1Wasm.byteLength))
   .replaceAll('__CHANNEL_TEST_FIXTURE__', candidateUChannelFixture)
   .replaceAll('__PHASE2_PACKAGE_BASE64__', phase2Package.toString('base64'))
+  .replaceAll('__SHARED_TEST_PACKAGE_BASE64__', sharedFixture.archiveBase64)
   .replaceAll('__PHASE2_DEFAULT_FLAG__', phase2Default ? '1' : '0')
   .replaceAll('__PHASE2_EXPECTED_DIGEST__', phase2ExpectedDigest)
   .replaceAll('__PHASE2_EXPECTED_KEY_ID__', phase2ExpectedKeyId)

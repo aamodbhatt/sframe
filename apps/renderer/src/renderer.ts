@@ -1115,7 +1115,7 @@ const acceptPreparedPackage = (data: Record<string, unknown>): void => {
   preparedStateMaxBytes = Number(state.maxPlaintextBytes);
   if (!validatePreparedState(state.publicTemplate ?? {}).ok) throw new Error('PACKAGE_TEMPLATE_STATE_INVALID');
   packageApprovalPending = true;
-  sendParent('sf.renderer.package-verified', {packageDigest: prepared.packageDigest, artifactDigest: prepared.artifactDigest, publisherKeyId: prepared.publisherKeyId, publisherPublicKey: publisher.publicKey, publisherDisplayName: publisher.displayName, appName: manifest.name, appVersion: manifest.version, description: manifest.description, capabilities: manifest.capabilities, publicTemplate: state.publicTemplate ?? {}, maxPlaintextBytes: state.maxPlaintextBytes, declaredMode: state.mode});
+  sendParent('sf.renderer.package-verified', {packageDigest: prepared.packageDigest, artifactDigest: prepared.artifactDigest, publisherKeyId: prepared.publisherKeyId, publisherPublicKey: publisher.publicKey, publisherDisplayName: publisher.displayName, appId: manifest.id, appName: manifest.name, appVersion: manifest.version, description: manifest.description, capabilities: manifest.capabilities, publicTemplate: state.publicTemplate ?? {}, maxPlaintextBytes: state.maxPlaintextBytes, declaredMode: state.mode});
 };
 
 const receiveInit = (event: MessageEvent): void => {
