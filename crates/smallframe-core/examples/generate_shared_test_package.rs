@@ -17,13 +17,18 @@ fn main() {
     hostile
         .put_object(&ROOT, "forbidden", ObjType::List)
         .expect("hostile list fixture");
+    let mut invalid_schema = AutoCommit::new().with_actor(ActorId::from([0x45_u8; 16].as_slice()));
+    invalid_schema
+        .put(&ROOT, "decisions", "not-an-object")
+        .expect("schema-invalid fixture");
     println!(
         "{}",
         json!({
             "packageDigest": Base64UrlUnpadded::encode_string(&package.package_digest),
             "publisherKeyId": package.publisher_key_id,
             "archiveBase64": Base64::encode_string(&package.canonical_archive),
-            "hostileListBase64": Base64::encode_string(&hostile.save())
+            "hostileListBase64": Base64::encode_string(&hostile.save()),
+            "invalidSchemaBase64": Base64::encode_string(&invalid_schema.save())
         })
     );
 }

@@ -368,7 +368,9 @@ pub fn merge_documents(local_bytes: &[u8], remote_bytes: &[u8]) -> Result<Vec<u8
 pub fn project_document_to_json(doc_bytes: &[u8]) -> Result<String, String> {
     let doc = Automerge::load(doc_bytes).map_err(|e| format!("AUTOMERGE_LOAD_ERROR: {}", e))?;
     let val = project_json(&doc, &ROOT);
-    serde_json::to_string(&val).map_err(|e| format!("JSON_SERIALIZE_ERROR: {}", e))
+    let canonical = crate::canonical_json_bytes(&val)
+        .map_err(|error| format!("JSON_CANONICALIZE_ERROR: {}", error.code().as_str()))?;
+    String::from_utf8(canonical).map_err(|_| "JSON_CANONICALIZE_ERROR: JSON_INVALID".into())
 }
 
 pub fn validate_document(doc_bytes: &[u8], max_bytes: usize) -> Result<(), String> {
@@ -413,6 +415,7 @@ mod tests {
         let projected = project_document_to_json(&bytes).expect("project");
         let parsed: JsonValue = serde_json::from_str(&projected).expect("parse projected");
         assert_eq!(parsed["decisions"]["d1"]["title"], "Build MVP");
+        assert_eq!(projected, r#"{"decisions":{"d1":{"title":"Build MVP"}}}"#);
     }
 
     #[test]

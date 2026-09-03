@@ -12,7 +12,7 @@ import {
 
 // Invite fragments are bearer credentials even in tests. Do not retain them in traces.
 test.use({trace: 'off'});
-const sharedFixture = JSON.parse(readFileSync('target/phase1-wasm/shared-test-package.json', 'utf8')) as {packageDigest: string; publisherKeyId: string; hostileListBase64: string};
+const sharedFixture = JSON.parse(readFileSync('target/phase1-wasm/shared-test-package.json', 'utf8')) as {packageDigest: string; publisherKeyId: string; hostileListBase64: string; invalidSchemaBase64: string};
 
 test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
   // Existing TEST-ONLY package-vector signer; never a production identity.
@@ -436,12 +436,16 @@ test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
   });
   }
 
-  test('rejects a validly encrypted and signed unsupported Automerge object before app approval', async ({page, request}) => {
+  for (const [name, fixture] of [
+    ['unsupported Automerge object', () => sharedFixture.hostileListBase64],
+    ['schema-invalid projection', () => sharedFixture.invalidSchemaBase64]
+  ] as const) {
+  test(`rejects a validly encrypted and signed ${name} before app approval`, async ({page, request}) => {
     const roomId = makeRoomId();
     const envelope = await encryptSnapshot({roomKey, writerPrivateKey: writerPriv, roomId,
       appId: 'dev.example.decision-board', packageDigest: sharedFixture.packageDigest,
       stateEpoch: 0, proposedRevision: 1, previousEnvelopeDigest: encodeBase64Url(new Uint8Array(32)),
-      automergeBytes: new Uint8Array(Buffer.from(sharedFixture.hostileListBase64, 'base64'))});
+      automergeBytes: new Uint8Array(Buffer.from(fixture(), 'base64'))});
     const init = await request.post(`http://127.0.0.1:8787/__phase0/rooms/${roomId}/init-envelope`, {data: {
       viewerCapHash: encodeBase64Url(await sha256(viewerCap)), editorCapHash: encodeBase64Url(await sha256(editorCap)),
       expiresAtMs: activeExpiry, envelope: envelope.envelope
@@ -457,4 +461,5 @@ test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
     await expect(page.locator('#trust-description')).toHaveText('REMOTE_STATE_INVALID');
     await expect(page.locator('#runtime-panel')).toBeHidden();
   });
+  }
 });

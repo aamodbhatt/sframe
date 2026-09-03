@@ -88,6 +88,18 @@ ${nobleEd25519Raw}
 const STATE_CIPHERTEXT_LIMIT = 524288;
 const PADDING_BUCKET_BYTES = 4096;
 
+const validateProjectedDocument = (automergeBytes, stateSchemaJson, maxPlaintextBytes) => {
+  if (typeof stateSchemaJson !== 'string' || !Number.isSafeInteger(maxPlaintextBytes)
+    || maxPlaintextBytes < 1 || maxPlaintextBytes > 393216) throw new Error('STATE_SCHEMA_CONTEXT_INVALID');
+  const document = JSON.parse(wasm_automerge_validate(automergeBytes, 475136));
+  if (!document.ok) throw new Error(document.error?.code || 'REMOTE_STATE_INVALID');
+  const canonicalSchema = wasm_canonical_json(stateSchemaJson);
+  const canonicalProjection = wasm_canonical_json(wasm_automerge_project(automergeBytes));
+  const state = JSON.parse(wasm_validate_state(canonicalSchema, canonicalProjection, maxPlaintextBytes));
+  if (!state.ok) throw new Error(state.error?.code || 'STATE_SCHEMA_INVALID');
+  return JSON.parse(canonicalProjection);
+};
+
 const encodeBase64Url = (bytes) => {
   let binary = '';
   for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
@@ -286,10 +298,8 @@ const decryptSnapshot = async (params) => {
     ciphertextBytes
   );
   const automergeBytes = unpadPlaintext(new Uint8Array(decryptedBuffer));
-  const val = JSON.parse(wasm_automerge_validate(automergeBytes, 475136));
-  if (!val.ok) throw new Error(val.error?.code || 'REMOTE_STATE_INVALID');
-  const projected = wasm_automerge_project(automergeBytes);
-  return {automergeBytes, projectedState: JSON.parse(projected), envelopeDigest: encodeBase64Url(envelopeDigest), etag};
+  const projectedState = validateProjectedDocument(automergeBytes, params.stateSchemaJson, params.maxPlaintextBytes);
+  return {automergeBytes, projectedState, envelopeDigest: encodeBase64Url(envelopeDigest), etag};
 };
 
 let initialized = false;
@@ -317,14 +327,11 @@ self.onmessage = async (event) => {
       const projected = wasm_automerge_project(bytes);
       self.postMessage({id, ok: true, bytes, projectedState: JSON.parse(projected)});
     } else if (type === 'merge') {
-      const {localBytes, remoteBytes} = event.data;
-      const val = JSON.parse(wasm_automerge_validate(remoteBytes, 475136));
-      if (!val.ok) throw new Error(val.error?.code || 'REMOTE_STATE_INVALID');
+      const {localBytes, remoteBytes, stateSchemaJson, maxPlaintextBytes} = event.data;
+      validateProjectedDocument(remoteBytes, stateSchemaJson, maxPlaintextBytes);
       const bytes = wasm_automerge_merge(localBytes, remoteBytes);
-      const merged = JSON.parse(wasm_automerge_validate(bytes, 475136));
-      if (!merged.ok) throw new Error(merged.error?.code || 'MERGED_STATE_INVALID');
-      const projected = wasm_automerge_project(bytes);
-      self.postMessage({id, ok: true, bytes, projectedState: JSON.parse(projected)});
+      const projectedState = validateProjectedDocument(bytes, stateSchemaJson, maxPlaintextBytes);
+      self.postMessage({id, ok: true, bytes, projectedState});
     } else if (type === 'encrypt') {
       const result = await encryptSnapshot(event.data);
       self.postMessage({id, ok: true, ...result});

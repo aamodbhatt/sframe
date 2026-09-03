@@ -52,6 +52,7 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
     description: string;
     capabilities: string[];
     publicTemplate: Record<string, unknown>;
+    stateSchema: Record<string, unknown>;
     maxPlaintextBytes: number;
     declaredMode: 'personal' | 'shared';
   };
@@ -125,8 +126,8 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
       return this.call('apply_patch', {docBytes, patchJson, actorIdHex});
     }
 
-    async merge(localBytes: Uint8Array, remoteBytes: Uint8Array): Promise<{bytes: Uint8Array; projectedState: Record<string, unknown>}> {
-      return this.call('merge', {localBytes, remoteBytes});
+    async merge(localBytes: Uint8Array, remoteBytes: Uint8Array, stateSchemaJson: string, maxPlaintextBytes: number): Promise<{bytes: Uint8Array; projectedState: Record<string, unknown>}> {
+      return this.call('merge', {localBytes, remoteBytes, stateSchemaJson, maxPlaintextBytes});
     }
 
     async encrypt(params: {
@@ -149,6 +150,8 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
       expectedAppId?: string | undefined;
       roomId: string;
       packageDigest: string;
+      stateSchemaJson: string;
+      maxPlaintextBytes: number;
       envelope: unknown;
     }): Promise<{automergeBytes: Uint8Array; projectedState: Record<string, unknown>; envelopeDigest: string; etag: string}> {
       return this.call('decrypt', params);
@@ -389,6 +392,8 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
               expectedAppId: metadata?.appId,
               roomId: descriptor.roomId,
               packageDigest: descriptor.packageDigest,
+              stateSchemaJson: stableJson(metadata!.stateSchema),
+              maxPlaintextBytes: metadata!.maxPlaintextBytes,
               envelope: wireEnvelope
             }));
 
@@ -397,7 +402,7 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
               if (wireEnvelope.proposedRevision < currentRevision) throw new Error('REMOTE_ROLLBACK');
               if (wireEnvelope.proposedRevision === currentRevision && decrypted.envelopeDigest !== currentDigest) throw new Error('REMOTE_EQUIVOCATION');
               if (wireEnvelope.proposedRevision === currentRevision + 1 && wireEnvelope.previousEnvelopeDigest !== currentDigest) throw new Error('PREDECESSOR_MISMATCH');
-              const merged = await guardedRemote(async (active) => active.merge(localDocBytes!, decrypted.automergeBytes));
+              const merged = await guardedRemote(async (active) => active.merge(localDocBytes!, decrypted.automergeBytes, stableJson(metadata!.stateSchema), metadata!.maxPlaintextBytes));
               if (approved) await options.onReplaceState(structuredClone(merged.projectedState));
               localDocBytes = merged.bytes;
               currentState = merged.projectedState;

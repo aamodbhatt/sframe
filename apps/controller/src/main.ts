@@ -59,7 +59,7 @@ let personalArchive = new Uint8Array();
 let stateMutationInFlight = false;
 type StateValidation = {resolve: (result: {valid: boolean; error: string}) => void; timer: number};
 const stateValidations = new Map<string, StateValidation>();
-type PersonalPackageMetadata = {packageDigest: string; artifactDigest: string; publisherKeyId: string; publisherPublicKey: string; publisherDisplayName: string; appId: string; appName: string; appVersion: string; description: string; capabilities: string[]; publicTemplate: Record<string, unknown>; maxPlaintextBytes: number; declaredMode: 'personal' | 'shared'};
+type PersonalPackageMetadata = {packageDigest: string; artifactDigest: string; publisherKeyId: string; publisherPublicKey: string; publisherDisplayName: string; appId: string; appName: string; appVersion: string; description: string; capabilities: string[]; publicTemplate: Record<string, unknown>; stateSchema: Record<string, unknown>; maxPlaintextBytes: number; declaredMode: 'personal' | 'shared'};
 type PersonalSession = {handleVerified: (metadata: PersonalPackageMetadata) => Promise<void>; stateChanged: (state: Record<string, unknown>, revision: number) => Promise<void>; setBuildId?: (buildId: string) => void; showUpdateBanner?: (waitingWorker: ServiceWorker) => void};
 let personalSession: PersonalSession | undefined;
 
@@ -347,16 +347,16 @@ const startFrame = async (rendererHtml?: string): Promise<void> => {
   });
 };
 
-type RendererMessage = {channel?: unknown; protocol?: unknown; session?: unknown; sequence?: unknown; type?: unknown; tree?: unknown; error?: unknown; requestId?: unknown; operations?: unknown; validationId?: unknown; valid?: unknown; workerKind?: unknown; blobCount?: unknown; workerSelfOrigin?: unknown; workerLocationOrigin?: unknown; workerLocationHref?: unknown; wasmStarted?: unknown; wasmBytes?: unknown; wasmProbe?: unknown; wasmDigest?: unknown; verifierStarted?: unknown; verifierBytes?: unknown; verifierVersion?: unknown; verifierDigest?: unknown; state?: unknown; generation?: unknown; restartCount?: unknown; lastReason?: unknown; stopCode?: unknown; packageDigest?: unknown; artifactDigest?: unknown; publisherKeyId?: unknown; publisherPublicKey?: unknown; publisherDisplayName?: unknown; appId?: unknown; appName?: unknown; appVersion?: unknown; description?: unknown; capabilities?: unknown; publicTemplate?: unknown; maxPlaintextBytes?: unknown; declaredMode?: unknown};
+type RendererMessage = {channel?: unknown; protocol?: unknown; session?: unknown; sequence?: unknown; type?: unknown; tree?: unknown; error?: unknown; requestId?: unknown; operations?: unknown; validationId?: unknown; valid?: unknown; workerKind?: unknown; blobCount?: unknown; workerSelfOrigin?: unknown; workerLocationOrigin?: unknown; workerLocationHref?: unknown; wasmStarted?: unknown; wasmBytes?: unknown; wasmProbe?: unknown; wasmDigest?: unknown; verifierStarted?: unknown; verifierBytes?: unknown; verifierVersion?: unknown; verifierDigest?: unknown; state?: unknown; generation?: unknown; restartCount?: unknown; lastReason?: unknown; stopCode?: unknown; packageDigest?: unknown; artifactDigest?: unknown; publisherKeyId?: unknown; publisherPublicKey?: unknown; publisherDisplayName?: unknown; appId?: unknown; appName?: unknown; appVersion?: unknown; description?: unknown; capabilities?: unknown; publicTemplate?: unknown; stateSchema?: unknown; maxPlaintextBytes?: unknown; declaredMode?: unknown};
 
 const validPersonalMetadata = (message: RendererMessage, baseKeys: string[]): boolean => {
   if ((!PERSONAL_MODE && !SHARED_MODE) || workerLifecycleState !== 'idle') return false;
-  const fields = ['packageDigest', 'artifactDigest', 'publisherKeyId', 'publisherPublicKey', 'publisherDisplayName', 'appId', 'appName', 'appVersion', 'description', 'capabilities', 'publicTemplate', 'maxPlaintextBytes', 'declaredMode'];
+  const fields = ['packageDigest', 'artifactDigest', 'publisherKeyId', 'publisherPublicKey', 'publisherDisplayName', 'appId', 'appName', 'appVersion', 'description', 'capabilities', 'publicTemplate', 'stateSchema', 'maxPlaintextBytes', 'declaredMode'];
   if (!exactKeys(message, [...baseKeys, ...fields])) return false;
   const stringFields = fields.slice(0, 9);
   if (!stringFields.every((field) => typeof message[field as keyof RendererMessage] === 'string')) return false;
   if (!Array.isArray(message.capabilities) || !message.capabilities.every((value) => typeof value === 'string')) return false;
-  if (!isPlainRecord(message.publicTemplate) || !Number.isSafeInteger(message.maxPlaintextBytes)) return false;
+  if (!isPlainRecord(message.publicTemplate) || !isPlainRecord(message.stateSchema) || !Number.isSafeInteger(message.maxPlaintextBytes)) return false;
   return message.declaredMode === 'personal' || message.declaredMode === 'shared';
 };
 
@@ -530,7 +530,7 @@ const onPortMessage = (event: MessageEvent): void => {
     if (message.state === 'restarting') byId<HTMLElement>('status').textContent = `App Worker restarting after ${message.lastReason}.`;
   } else if (message.type === 'sf.renderer.package-verified') {
     if (!personalSession) { terminateControllerChannel('PERSONAL_SESSION_MISSING', true); return; }
-    const metadata = {packageDigest: message.packageDigest, artifactDigest: message.artifactDigest, publisherKeyId: message.publisherKeyId, publisherPublicKey: message.publisherPublicKey, publisherDisplayName: message.publisherDisplayName, appId: message.appId, appName: message.appName, appVersion: message.appVersion, description: message.description, capabilities: message.capabilities, publicTemplate: message.publicTemplate, maxPlaintextBytes: message.maxPlaintextBytes, declaredMode: message.declaredMode} as PersonalPackageMetadata;
+    const metadata = {packageDigest: message.packageDigest, artifactDigest: message.artifactDigest, publisherKeyId: message.publisherKeyId, publisherPublicKey: message.publisherPublicKey, publisherDisplayName: message.publisherDisplayName, appId: message.appId, appName: message.appName, appVersion: message.appVersion, description: message.description, capabilities: message.capabilities, publicTemplate: message.publicTemplate, stateSchema: message.stateSchema, maxPlaintextBytes: message.maxPlaintextBytes, declaredMode: message.declaredMode} as PersonalPackageMetadata;
     void personalSession.handleVerified(metadata).catch((error: unknown) => terminateControllerChannel(error instanceof Error ? error.message : 'PERSONAL_SETUP_FAILED', true));
   } else if (message.type === 'sf.renderer.state.batch') {
     dispatchStateBatch(message);

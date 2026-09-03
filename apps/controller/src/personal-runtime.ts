@@ -6,7 +6,7 @@ type PersonalStoreApi = {
   loadApproval: (approvalId: string) => Promise<unknown>;
   saveApproval: (approval: {approvalId: string; packageDigest: string; publisherKeyId: string; capabilityHash: string; approvedAt: number}) => Promise<void>;
 };
-type PackageMetadata = {packageDigest: string; artifactDigest: string; publisherKeyId: string; publisherPublicKey: string; publisherDisplayName: string; appName: string; appVersion: string; description: string; capabilities: string[]; publicTemplate: Record<string, unknown>; maxPlaintextBytes: number; declaredMode: 'personal' | 'shared'};
+type PackageMetadata = {packageDigest: string; artifactDigest: string; publisherKeyId: string; publisherPublicKey: string; publisherDisplayName: string; appName: string; appVersion: string; description: string; capabilities: string[]; publicTemplate: Record<string, unknown>; stateSchema: Record<string, unknown>; maxPlaintextBytes: number; declaredMode: 'personal' | 'shared'};
 type PersonalSession = {handleVerified: (metadata: PackageMetadata) => Promise<void>; stateChanged: (state: Record<string, unknown>, revision: number) => Promise<void>; setBuildId: (buildId: string) => void; showUpdateBanner: (waitingWorker: ServiceWorker) => void};
 type SessionOptions = {archive: Uint8Array; role: 'viewer' | 'editor'; onApprove: (state: Record<string, unknown>, role: 'viewer' | 'editor') => void; onReplaceState: (state: Record<string, unknown>) => Promise<void>};
 
@@ -171,4 +171,3 @@ const createSession = (options: SessionOptions): PersonalSession => {
 
 Object.defineProperty(globalThis, 'SmallframePersonalRuntime', {value: Object.freeze({createSession}), enumerable: false, configurable: false, writable: false});
 export {};
-
