@@ -33,7 +33,7 @@
     "clean": "node scripts/clean.mjs"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "5.20260825.1",
+    "@cloudflare/workers-types": "5.20260829.1",
     "@noble/ed25519": "2.2.3",
     "@playwright/test": "1.62.1",
     "@types/node": "22.10.5",
