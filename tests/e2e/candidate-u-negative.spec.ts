@@ -30,7 +30,7 @@ if (candidate === 'U' && fixture && fixture !== 'poison' && fixture !== 'syntax'
   test(`Candidate U fail-stops hostile fixture with exact code: ${fixture}`, async ({page, request}) => {
     const expectedCode = expectedCodes[fixture];
     expect(expectedCode, `missing expected stop code for ${fixture}`).toBeTruthy();
-    await page.goto('/');
+    await page.goto('/', {waitUntil: 'domcontentloaded'});
     await expect(page.locator('h1')).toHaveText('Decision Board');
     await expect(page.locator('#status')).toHaveText(`Controller stopped: ${expectedCode}. Local export remains available.`, {timeout: 8_000});
     await expect(page.locator('#app-host iframe')).toHaveCount(0);

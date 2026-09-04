@@ -10,7 +10,7 @@ if (candidate === 'T' && fixture) {
   });
 
   test(`Candidate T rejects bounded hostile fixture: ${fixture}`, async ({page, request}) => {
-    await page.goto('/');
+    await page.goto('/', {waitUntil: 'domcontentloaded'});
     await expect(page.locator('h1')).toHaveText('Decision Board');
     await expect(page.locator('#app-host iframe')).toHaveCount(1);
     await expect(page.locator('#status')).toContainText('Controller stopped', {timeout: 8_000});

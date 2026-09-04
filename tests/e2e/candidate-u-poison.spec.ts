@@ -7,7 +7,7 @@ if (candidate === 'U' && (fixture === 'poison' || fixture === 'global-forge')) {
   test(`Candidate U remains authoritative after contained publisher attack: ${fixture}`, async ({page, request}) => {
     const reset = await request.post('/__test__/evidence/reset');
     expect(reset.status()).toBe(204);
-    await page.goto('/');
+    await page.goto('/', {waitUntil: 'domcontentloaded'});
     await expect(page.locator('#status')).toContainText('App Worker running');
     await expect(page.locator('#app-host')).toHaveAttribute('data-worker-state', 'running');
     await expect(page.locator('#app-host')).toHaveAttribute('data-worker-generation', '1');

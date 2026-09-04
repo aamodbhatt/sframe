@@ -7,7 +7,7 @@ if (candidate === 'U' && wasmCsp === 'deny') {
   test('Candidate U fails closed when renderer CSP denies Wasm compilation', async ({page, request}) => {
     const reset = await request.post('http://127.0.0.1:8787/__test__/evidence/reset');
     expect(reset.status()).toBe(204);
-    await page.goto('/');
+    await page.goto('/', {waitUntil: 'domcontentloaded'});
     await expect(page.locator('#status')).toHaveText('Controller stopped: PRELUDE_WASM_STARTUP_FAILED. Local export remains available.', {timeout: 8_000});
     const host = page.locator('#app-host');
     await expect(host).toHaveAttribute('data-worker-state', 'stopped');

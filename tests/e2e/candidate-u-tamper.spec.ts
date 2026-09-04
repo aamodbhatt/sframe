@@ -7,7 +7,7 @@ if (candidate === 'U' && mutated) {
   test('Candidate U rejects a one-byte mutated renderer before execution', async ({page, request}) => {
     const reset = await request.post('http://127.0.0.1:8787/__test__/evidence/reset');
     expect(reset.status()).toBe(204);
-    await page.goto('/');
+    await page.goto('/', {waitUntil: 'domcontentloaded'});
     await expect(page.locator('h1')).toHaveText('Decision Board');
     await expect(page.locator('#status')).toContainText('Controller stopped', {timeout: 8_000});
     await expect(page.locator('#app-host iframe')).toHaveCount(0);

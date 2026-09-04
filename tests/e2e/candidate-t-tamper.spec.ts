@@ -5,7 +5,7 @@ const mutated = process.env.SMALLFRAME_T_MUTATE_RENDERER === '1';
 
 if (candidate === 'T' && mutated) {
   test('Candidate T rejects a one-byte mutated renderer before execution', async ({page, request}) => {
-    await page.goto('/');
+    await page.goto('/', {waitUntil: 'domcontentloaded'});
     await expect(page.locator('h1')).toHaveText('Decision Board');
     await expect(page.locator('#status')).toContainText('Controller stopped', {timeout: 8_000});
     await expect(page.locator('#app-host iframe')).toHaveCount(0);

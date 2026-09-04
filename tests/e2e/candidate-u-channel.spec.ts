@@ -29,7 +29,7 @@ if (candidate === 'U' && fixture) {
 
   if (fixture === 'ready-schema-extra' || fixture === 'ready-port') {
     test('Candidate U rejects a ready handshake with an extra field', async ({page}) => {
-      await page.goto('/');
+      await page.goto('/', {waitUntil: 'domcontentloaded'});
       await expect(page.locator('#status')).toHaveText('Controller stopped: RENDERER_HANDSHAKE_TIMEOUT. Local export remains available.', {timeout: 8_000});
       await expect(page.frameLocator('iframe').getByText(/Decisions:/u)).toHaveCount(0);
       await expect(page.locator('#app-host iframe')).toHaveCount(0);
@@ -37,13 +37,13 @@ if (candidate === 'U' && fixture) {
   } else if (fixture === 'init-schema-extra' || fixture === 'init-oversized') {
     test(`Candidate U rejects the invalid init envelope: ${fixture}`, async ({page}) => {
       const expected = fixture === 'init-oversized' ? 'INIT_MESSAGE_TOO_LARGE' : 'RENDERER_INIT_TIMEOUT';
-      await page.goto('/');
+      await page.goto('/', {waitUntil: 'domcontentloaded'});
       await expect(page.locator('#status')).toHaveText(`Controller stopped: ${expected}. Local export remains available.`, {timeout: 8_000});
       await expect(page.locator('#app-host iframe')).toHaveCount(0);
     });
   } else if (fixture === 'window-init-replay') {
     test('Candidate U consumes exactly one init and ignores the replayed window message', async ({page}) => {
-      await page.goto('/');
+      await page.goto('/', {waitUntil: 'domcontentloaded'});
       await expect(page.locator('#app-host')).toHaveAttribute('data-worker-state', 'running');
       await expect(page.locator('#app-host')).toHaveAttribute('data-worker-generation', '1');
       await expect(page.frameLocator('iframe').getByText('Decisions: 0')).toBeVisible();
@@ -57,7 +57,7 @@ if (candidate === 'U' && fixture) {
     test(`Candidate U fail-closes the injected channel violation: ${fixture}`, async ({page, request}) => {
       const expectedError = expectedErrors[fixture];
       expect(expectedError, `missing expected error for ${fixture}`).toBeTruthy();
-      await page.goto('/');
+      await page.goto('/', {waitUntil: 'domcontentloaded'});
       await expect(page.locator('#status')).toHaveText(`Controller stopped: ${expectedError}. Local export remains available.`, {timeout: 8_000});
       const stableStatus = await page.locator('#status').textContent();
       await page.waitForTimeout(750);
