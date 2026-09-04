@@ -378,6 +378,51 @@ test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
       } catch {}
       const offlineApp = page.frameLocator('iframe');
       await expect(offlineApp.getByText('1 decisions')).toBeVisible();
+
+      // Authenticated local storage can still contain output from an older or buggy
+      // controller, so restored history must pass the current document and schema checks.
+      // Leave the active runtime first so it cannot race the deliberate record rewrite.
+      await page.goto('/icon.svg', {waitUntil: 'domcontentloaded'});
+      await page.evaluate(async ({roomId: storedRoomId, invalidAutomergeBase64}) => {
+        const database = await new Promise<IDBDatabase>((resolve, reject) => {
+          const request = indexedDB.open('smallframe-shared-v1', 2);
+          request.onsuccess = () => resolve(request.result);
+          request.onerror = () => reject(request.error);
+        });
+        const read = async <T>(storeName: string): Promise<T> => await new Promise((resolve, reject) => {
+          const request = database.transaction(storeName).objectStore(storeName).get(storedRoomId);
+          request.onsuccess = () => resolve(request.result as T);
+          request.onerror = () => reject(request.error);
+        });
+        const wrapped = await read<{version: 1; roomId: string; nonce: Uint8Array; ciphertext: ArrayBuffer}>('rooms');
+        const device = await read<{roomId: string; key: CryptoKey}>('deviceKeys');
+        const aad = new TextEncoder().encode(`smallframe/local-room/v1:${storedRoomId}`);
+        const plaintext = await crypto.subtle.decrypt(
+          {name: 'AES-GCM', iv: wrapped.nonce, additionalData: aad}, device.key, wrapped.ciphertext
+        );
+        const room = JSON.parse(new TextDecoder().decode(plaintext)) as Record<string, unknown>;
+        room.automergeBase64 = invalidAutomergeBase64;
+        room.state = {decisions: 'schema-invalid'};
+        const nonce = crypto.getRandomValues(new Uint8Array(12));
+        const ciphertext = await crypto.subtle.encrypt(
+          {name: 'AES-GCM', iv: nonce, additionalData: aad}, device.key,
+          new TextEncoder().encode(JSON.stringify(room))
+        );
+        await new Promise<void>((resolve, reject) => {
+          const transaction = database.transaction('rooms', 'readwrite');
+          transaction.objectStore('rooms').put({version: 1, roomId: storedRoomId, nonce, ciphertext});
+          transaction.oncomplete = () => resolve();
+          transaction.onerror = () => reject(transaction.error);
+          transaction.onabort = () => reject(transaction.error);
+        });
+        database.close();
+      }, {roomId, invalidAutomergeBase64: sharedFixture.invalidSchemaBase64});
+
+      await page.goto(`/r/${activeRoomId}#${fragment}`, {waitUntil: 'domcontentloaded'});
+      await expect(page.locator('#status')).toHaveText(
+        'Controller stopped: LOCAL_STATE_INVALID. Local export remains available.'
+      );
+      await expect(page.locator('iframe')).toHaveCount(0);
     } finally {
       expect((await request.post(networkControl, {data: {online: true}})).status()).toBe(204);
     }

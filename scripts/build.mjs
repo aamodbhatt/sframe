@@ -332,6 +332,10 @@ self.onmessage = async (event) => {
       const bytes = wasm_automerge_merge(localBytes, remoteBytes);
       const projectedState = validateProjectedDocument(bytes, stateSchemaJson, maxPlaintextBytes);
       self.postMessage({id, ok: true, bytes, projectedState});
+    } else if (type === 'validate') {
+      const {docBytes, stateSchemaJson, maxPlaintextBytes} = event.data;
+      const projectedState = validateProjectedDocument(docBytes, stateSchemaJson, maxPlaintextBytes);
+      self.postMessage({id, ok: true, projectedState});
     } else if (type === 'encrypt') {
       const result = await encryptSnapshot(event.data);
       self.postMessage({id, ok: true, ...result});

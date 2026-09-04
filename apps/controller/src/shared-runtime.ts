@@ -130,6 +130,10 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
       return this.call('merge', {localBytes, remoteBytes, stateSchemaJson, maxPlaintextBytes});
     }
 
+    async validate(docBytes: Uint8Array, stateSchemaJson: string, maxPlaintextBytes: number): Promise<{projectedState: Record<string, unknown>}> {
+      return this.call('validate', {docBytes, stateSchemaJson, maxPlaintextBytes});
+    }
+
     async encrypt(params: {
       roomKey: Uint8Array;
       writerPrivateKey: Uint8Array;
@@ -300,14 +304,16 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
     };
 
     let worker = new StateWorkerClient();
-    const guardedRemote = async <T>(action: (active: StateWorkerClient) => Promise<T>): Promise<T> => {
+    const guardedState = async <T>(action: (active: StateWorkerClient) => Promise<T>, failure: 'LOCAL_STATE_INVALID' | 'REMOTE_STATE_INVALID'): Promise<T> => {
       try { return await action(worker); }
       catch {
         worker.stop();
         worker = new StateWorkerClient();
-        throw new Error('REMOTE_STATE_INVALID');
+        throw new Error(failure);
       }
     };
+    const guardedRemote = async <T>(action: (active: StateWorkerClient) => Promise<T>): Promise<T> =>
+      guardedState(action, 'REMOTE_STATE_INVALID');
     const role = descriptor.role;
     const capHeader = `SF-Cap ${encodeBase64Url(invite.capability)}`;
 
@@ -609,16 +615,21 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
         if (storedRoom && storedRoom.packageDigest === descriptor.packageDigest && storedRoom.role === role
           && storedRoom.capability === encodeBase64Url(invite.capability) && storedRoom.roomKey === encodeBase64Url(invite.roomKey)
           && storedRoom.writerPrivateSeed === (invite.writerPrivateSeed ? encodeBase64Url(invite.writerPrivateSeed) : undefined)) {
+          if (!storedRoom.automergeBase64) throw new Error('LOCAL_STATE_INVALID');
+          let restoredBytes: Uint8Array;
+          try { restoredBytes = decodeBase64Url(storedRoom.automergeBase64); }
+          catch { throw new Error('LOCAL_STATE_INVALID'); }
+          const restored = await guardedState(async (active) => active.validate(
+            restoredBytes, stableJson(meta.stateSchema), meta.maxPlaintextBytes
+          ), 'LOCAL_STATE_INVALID');
           actorIdHex = storedRoom.actorId;
           currentEpoch = storedRoom.stateEpoch;
           currentRevision = storedRoom.revision;
           currentDigest = storedRoom.envelopeDigest;
           currentEtag = storedRoom.etag;
-          currentState = storedRoom.state;
+          currentState = restored.projectedState;
           dirty = storedRoom.dirty;
-          if (storedRoom.automergeBase64) {
-            localDocBytes = decodeBase64Url(storedRoom.automergeBase64);
-          }
+          localDocBytes = restoredBytes;
         } else {
           currentState = meta.publicTemplate ? structuredClone(meta.publicTemplate) : {};
           // Shared replicas must load publisher-created history from the relay.
