@@ -6,7 +6,7 @@ test.describe('Phase 2 automated accessibility checks across fixtures', () => {
   });
 
   test('controller shell and Decision Board fixture satisfy full accessibility criteria', async ({page}) => {
-    await page.goto('/?personal=1');
+    await page.goto('/?personal=1', {waitUntil: 'domcontentloaded'});
 
     // 1. Trust panel accessibility checks
     await expect(page.getByRole('heading', {name: 'Decision Board', level: 2})).toBeVisible();
@@ -78,7 +78,7 @@ test.describe('Phase 2 automated accessibility checks across fixtures', () => {
   });
 
   test('verifies keyboard focusability and reduced motion styles', async ({page}) => {
-    await page.goto('/?personal=1');
+    await page.goto('/?personal=1', {waitUntil: 'domcontentloaded'});
     await page.getByRole('button', {name: 'Open this exact version'}).click();
 
     // Tab key navigation flows cleanly through interactive elements

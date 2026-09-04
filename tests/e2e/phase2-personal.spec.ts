@@ -6,7 +6,7 @@ test.describe('Phase 2 signed personal workspace', () => {
   });
 
   test('reviews, persists, exports, imports, reopens offline, and enforces viewer mode', async ({page, request}) => {
-    await page.goto('/?personal=1');
+    await page.goto('/?personal=1', {waitUntil: 'domcontentloaded'});
     await expect(page.getByRole('heading', {name: 'Decision Board', level: 2})).toBeVisible();
     await expect(page.getByText('cryptographic key—not verified legal identity')).toBeVisible();
     await expect(page.getByText(/Do not enter passwords/)).toBeVisible();
@@ -48,7 +48,7 @@ test.describe('Phase 2 signed personal workspace', () => {
       expect((await request.post(networkControl, {data: {online: true}})).status()).toBe(204);
     }
 
-    await page.goto('/?personal=1&role=viewer');
+    await page.goto('/?personal=1&role=viewer', {waitUntil: 'domcontentloaded'});
     await expect(page.locator('#role')).toHaveText('viewer');
     await expect(app.getByText('2 decisions')).toBeVisible();
     await app.getByRole('button', {name: 'Add decision'}).click();

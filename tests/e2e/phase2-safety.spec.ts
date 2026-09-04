@@ -6,7 +6,7 @@ test.describe('Phase 2 hostile-package, tampered-package, malformed-state, stora
   });
 
   test('rejects malformed state imports and non-conforming state shapes', async ({page}) => {
-    await page.goto('/?personal=1');
+    await page.goto('/?personal=1', {waitUntil: 'domcontentloaded'});
     await page.getByRole('button', {name: 'Open this exact version'}).click();
     const app = page.frameLocator('iframe');
     await expect(app.getByRole('button', {name: 'Add decision'})).toBeVisible();
@@ -64,7 +64,7 @@ test.describe('Phase 2 hostile-package, tampered-package, malformed-state, stora
   });
 
   test('survives storage corruption gracefully with exports remaining functional', async ({page}) => {
-    await page.goto('/?personal=1');
+    await page.goto('/?personal=1', {waitUntil: 'domcontentloaded'});
     await page.getByRole('button', {name: 'Open this exact version'}).click();
     const app = page.frameLocator('iframe');
     await expect(app.getByRole('button', {name: 'Add decision'})).toBeVisible();
@@ -84,7 +84,7 @@ test.describe('Phase 2 hostile-package, tampered-package, malformed-state, stora
   });
 
   test('sandboxed worker has no access to DOM, localStorage, IndexedDB, or network', async ({page}) => {
-    await page.goto('/?personal=1');
+    await page.goto('/?personal=1', {waitUntil: 'domcontentloaded'});
     await page.getByRole('button', {name: 'Open this exact version'}).click();
     const app = page.frameLocator('iframe');
     await expect(app.getByRole('button', {name: 'Add decision'})).toBeVisible();

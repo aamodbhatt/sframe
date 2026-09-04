@@ -75,7 +75,7 @@ test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
     });
 
     // Navigate to invite URL with fragment
-    await page.goto(`/r/${activeRoomId}#${editorFragment}`);
+    await page.goto(`/r/${activeRoomId}#${editorFragment}`, {waitUntil: 'domcontentloaded'});
 
     // Verify fragment is scrubbed synchronously from address bar
     await expect(page).toHaveURL(`http://app.localhost:4173/r/${activeRoomId}`);
@@ -122,7 +122,7 @@ test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
     });
 
     const viewerPage = await context.newPage();
-    await viewerPage.goto(`/r/${activeRoomId}#${viewerFragment}`);
+    await viewerPage.goto(`/r/${activeRoomId}#${viewerFragment}`, {waitUntil: 'domcontentloaded'});
 
     // Verify fragment scrubbed
     expect(viewerPage.url().includes('#')).toBe(false);
@@ -176,7 +176,7 @@ test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
       }
     });
 
-    await page.goto(`/r/${activeRoomId}#${fragment}`);
+    await page.goto(`/r/${activeRoomId}#${fragment}`, {waitUntil: 'domcontentloaded'});
     await page.getByRole('button', {name: 'Open this exact version'}).click();
     const app = page.frameLocator('iframe');
     await expect(app.getByRole('button', {name: 'Add decision'})).toBeVisible();
@@ -230,13 +230,13 @@ test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
     });
 
     // Tab 1 opens as editor
-    await page.goto(`/r/${activeRoomId}#${fragment}`);
+    await page.goto(`/r/${activeRoomId}#${fragment}`, {waitUntil: 'domcontentloaded'});
     await page.getByRole('button', {name: 'Open this exact version'}).click();
     await expect(page.locator('#role')).toHaveText('editor');
 
     // Tab 2 in same browser profile opens same editor invite
     const tab2 = await context.newPage();
-    await tab2.goto(`/r/${activeRoomId}#${fragment}`);
+    await tab2.goto(`/r/${activeRoomId}#${fragment}`, {waitUntil: 'domcontentloaded'});
     const approveBtn = tab2.getByRole('button', {name: 'Open this exact version'});
     if (await approveBtn.isVisible()) {
       await approveBtn.click();
@@ -337,7 +337,7 @@ test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
       writerPrivateSeed: writerPriv
     });
 
-    await page.goto(`/r/${activeRoomId}#${fragment}`);
+    await page.goto(`/r/${activeRoomId}#${fragment}`, {waitUntil: 'domcontentloaded'});
     await page.locator('#remember-approval').check();
     await page.getByRole('button', {name: 'Open this exact version'}).click();
     const app = page.frameLocator('iframe');
@@ -369,7 +369,7 @@ test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
     const networkControl = 'http://127.0.0.1:8787/__test__/controller-network';
     expect((await request.post(networkControl, {data: {online: false}})).status()).toBe(204);
     try {
-      await page.goto(`/r/${activeRoomId}#${fragment}`);
+      await page.goto(`/r/${activeRoomId}#${fragment}`, {waitUntil: 'domcontentloaded'});
       const approveBtn = page.getByRole('button', {name: 'Open this exact version'});
       try {
         if (await approveBtn.isVisible({timeout: 1000})) {
@@ -434,7 +434,7 @@ test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
       writerPublicKey: await getPublicKeyAsync(writerPriv), capability: editorCap, role: 'editor', expiresAt: activeExpiry});
     const fragment = formatInviteFragment({descriptorJcsBytes: signed.jcsBytes, descriptorSignature: signed.signature,
       roomKey, capability: editorCap, writerPrivateSeed: writerPriv});
-    await page.goto(`/r/${activeRoomId}#${fragment}`);
+    await page.goto(`/r/${activeRoomId}#${fragment}`, {waitUntil: 'domcontentloaded'});
     await page.locator('#remember-approval').uncheck();
     await page.getByRole('button', {name: 'Open this exact version'}).click();
     const put = page.waitForResponse((r) => r.request().method() === 'PUT');
@@ -474,7 +474,7 @@ test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
     const fragment = formatInviteFragment({descriptorJcsBytes: signed.jcsBytes, descriptorSignature: signed.signature,
       roomKey, capability: editorCap, writerPrivateSeed: writerPriv});
     const path = kind === 'room-path' ? `/r/${encodeBase64Url(randomBytes(16))}` : `/r/${activeRoomId}`;
-    await page.goto(`${path}#${fragment}`);
+    await page.goto(`${path}#${fragment}`, {waitUntil: 'domcontentloaded'});
     await expect(page.locator('#status')).toHaveAttribute('data-state', 'error');
     await expect(page.locator('iframe')).toHaveCount(0);
     expect(stateRequests).toBe(0);
@@ -501,7 +501,7 @@ test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
       writerPublicKey: await getPublicKeyAsync(writerPriv), capability: editorCap, role: 'editor', expiresAt: activeExpiry});
     const fragment = formatInviteFragment({descriptorJcsBytes: signed.jcsBytes, descriptorSignature: signed.signature,
       roomKey, capability: editorCap, writerPrivateSeed: writerPriv});
-    await page.goto(`/r/${roomId}#${fragment}`);
+    await page.goto(`/r/${roomId}#${fragment}`, {waitUntil: 'domcontentloaded'});
     await page.getByRole('button', {name: 'Open this exact version'}).click();
     await expect(page.locator('#trust-description')).toHaveText('REMOTE_STATE_INVALID');
     await expect(page.locator('#runtime-panel')).toBeHidden();

@@ -6,7 +6,7 @@ test.describe('Phase 2 signed controller release pinning and safe update behavio
   });
 
   test('controller verifies release manifest, displays build ID, and registers service worker', async ({page}) => {
-    await page.goto('/?personal=1');
+    await page.goto('/?personal=1', {waitUntil: 'domcontentloaded'});
     await page.getByRole('button', {name: 'Open this exact version'}).click();
 
     // Verify service worker probe responds with service-worker-probe provenance
@@ -28,7 +28,7 @@ test.describe('Phase 2 signed controller release pinning and safe update behavio
   });
 
   test('safe update banner appears when a new service worker waits and user can trigger update', async ({page}) => {
-    await page.goto('/?personal=1');
+    await page.goto('/?personal=1', {waitUntil: 'domcontentloaded'});
     await page.getByRole('button', {name: 'Open this exact version'}).click();
 
     const app = page.frameLocator('iframe');

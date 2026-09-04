@@ -247,7 +247,7 @@ test('renderer boundary, channel, and canary behavior', async ({page, request}) 
     expect(reset.status()).toBe(204);
   }
   const responsePromise = candidate === 'A' ? Promise.resolve(null) : rendererResponse(page);
-  await page.goto('/#phase0-secret-fixture');
+  await page.goto('/#phase0-secret-fixture', {waitUntil: 'domcontentloaded'});
   const rendererPath = await rendererPathFrom(page);
   const response = await responsePromise;
   if (candidate !== 'A') expect(response).not.toBeNull();
