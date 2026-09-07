@@ -31,7 +31,7 @@
 
   type SharedStoreApi = {
     loadRoom: (roomId: string) => Promise<StoredSharedRoom | undefined>;
-    saveRoom: (room: StoredSharedRoom) => Promise<void>;
+    saveRoom: (room: StoredSharedRoom, approval?: StoredSharedApproval) => Promise<void>;
     forgetRoom: (roomId: string) => Promise<void>;
     loadApproval: (approvalId: string) => Promise<StoredSharedApproval | undefined>;
     saveApproval: (approval: StoredSharedApproval) => Promise<void>;
@@ -90,13 +90,6 @@
   };
 
   type WrappedRoom = {version: 1; roomId: string; nonce: Uint8Array<ArrayBuffer>; ciphertext: ArrayBuffer};
-  const deviceKey = async (roomId: string): Promise<CryptoKey> => navigator.locks.request(`smallframe:device-key:${roomId}`, async () => {
-    const saved = await readRecord<{roomId: string; key: CryptoKey}>('deviceKeys', roomId);
-    if (saved) return saved.key;
-    const key = await crypto.subtle.generateKey({name: 'AES-GCM', length: 256}, false, ['encrypt', 'decrypt']);
-    await writeRecord('deviceKeys', {roomId, key});
-    return key;
-  });
   const roomAad = (roomId: string): Uint8Array<ArrayBuffer> => new TextEncoder().encode(`smallframe/local-room/v1:${roomId}`);
   const loadWrappedRoom = async (roomId: string): Promise<StoredSharedRoom | undefined> => {
     const saved = await readRecord<WrappedRoom>('rooms', roomId);
@@ -110,11 +103,38 @@
     if (room.roomId !== roomId) throw new Error('LOCAL_ROOM_CONTEXT_INVALID');
     return room;
   };
-  const saveWrappedRoom = async (room: StoredSharedRoom): Promise<void> => {
-    const key = await deviceKey(room.roomId);
-    const nonce = crypto.getRandomValues(new Uint8Array(12));
-    const ciphertext = await crypto.subtle.encrypt({name: 'AES-GCM', iv: nonce, additionalData: roomAad(room.roomId)}, key, new TextEncoder().encode(JSON.stringify(room)));
-    await writeRecord('rooms', {version: 1, roomId: room.roomId, nonce, ciphertext});
+  const commitWrappedRoom = async (room: WrappedRoom, key: CryptoKey, approval?: StoredSharedApproval): Promise<void> => {
+    const database = await openDatabase();
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const transaction = database.transaction(['deviceKeys', 'rooms', 'approvals'], 'readwrite');
+        transaction.oncomplete = () => resolve();
+        transaction.onerror = () => reject(new Error('SHARED_STORAGE_WRITE_FAILED'));
+        transaction.onabort = () => reject(new Error('SHARED_STORAGE_WRITE_ABORTED'));
+        try {
+          transaction.objectStore('deviceKeys').put({roomId: room.roomId, key});
+          transaction.objectStore('rooms').put(room);
+          if (approval) transaction.objectStore('approvals').put(approval);
+        } catch {
+          // A synchronous clone/put exception must also roll back earlier requests.
+          try { transaction.abort(); } catch { /* Already aborted. */ }
+          reject(new Error('SHARED_STORAGE_WRITE_FAILED'));
+        }
+      });
+    } finally { database.close(); }
+  };
+  const saveWrappedRoom = async (room: StoredSharedRoom, approval?: StoredSharedApproval): Promise<void> => {
+    if (approval && (approval.roomId !== room.roomId || approval.packageDigest !== room.packageDigest || approval.role !== room.role)) {
+      throw new Error('LOCAL_APPROVAL_CONTEXT_INVALID');
+    }
+    await navigator.locks.request(`smallframe:device-key:${room.roomId}`, async () => {
+      const saved = await readRecord<{roomId: string; key: CryptoKey}>('deviceKeys', room.roomId);
+      const key = saved?.key ?? await crypto.subtle.generateKey({name: 'AES-GCM', length: 256}, false, ['encrypt', 'decrypt']);
+      const nonce = crypto.getRandomValues(new Uint8Array(12));
+      const ciphertext = await crypto.subtle.encrypt({name: 'AES-GCM', iv: nonce, additionalData: roomAad(room.roomId)}, key, new TextEncoder().encode(JSON.stringify(room)));
+      // Crypto runs before the transaction; key, ciphertext and consent commit together.
+      await commitWrappedRoom({version: 1, roomId: room.roomId, nonce, ciphertext}, key, approval);
+    });
   };
   const api: SharedStoreApi = Object.freeze({
     loadRoom: loadWrappedRoom,

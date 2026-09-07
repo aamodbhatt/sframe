@@ -34,7 +34,7 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
 
   type SharedStoreApi = {
     loadRoom: (roomId: string) => Promise<StoredSharedRoom | undefined>;
-    saveRoom: (room: StoredSharedRoom) => Promise<void>;
+    saveRoom: (room: StoredSharedRoom, approval?: StoredSharedApproval) => Promise<void>;
     forgetRoom: (roomId: string) => Promise<void>;
     loadApproval: (approvalId: string) => Promise<StoredSharedApproval | undefined>;
     saveApproval: (approval: StoredSharedApproval) => Promise<void>;
@@ -351,8 +351,8 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
       }
     };
 
-    const persistRoom = async (dirty: boolean, state = currentState, docBytes = localDocBytes): Promise<void> => {
-      if (!remembered || !isEditorHoldingLock) return;
+    const persistRoom = async (dirty: boolean, state = currentState, docBytes = localDocBytes, approval?: StoredSharedApproval): Promise<void> => {
+      if ((!remembered && !approval) || !isEditorHoldingLock) return;
         await store().saveRoom({
           roomId: descriptor.roomId,
           packageDigest: descriptor.packageDigest,
@@ -369,7 +369,7 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
           actorId: actorIdHex,
           automergeBase64: docBytes ? encodeBase64Url(docBytes) : undefined,
           updatedAt: Date.now()
-        });
+        }, approval);
         element('last-sync').textContent = `Saved locally: ${new Date().toLocaleTimeString()}`;
     };
 
@@ -532,13 +532,13 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
       if (!metadata || !authenticated) throw new Error('SHARED_APPROVAL_NOT_READY');
       await checkRelayContext();
 
-      remembered = element<HTMLInputElement>('remember-approval').checked;
+      const remember = element<HTMLInputElement>('remember-approval').checked;
       try { await serialized(fetchRemoteState); }
       catch (error) { if (!localDocBytes) throw error; }
       if (!localDocBytes) throw new Error('VERIFIED_GENESIS_UNAVAILABLE');
 
-      if (element<HTMLInputElement>('remember-approval').checked) {
-        await store().saveApproval({
+      if (remember) {
+        const approval: StoredSharedApproval = {
           approvalId,
           descriptorDigest,
           capabilities: metadata.capabilities,
@@ -548,8 +548,11 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
           capabilityHash: descriptor.capabilityHash,
           role,
           approvedAt: Date.now()
-        });
+        };
+        if (isEditorHoldingLock) await persistRoom(dirty, currentState, localDocBytes, approval);
+        else await store().saveApproval(approval);
       }
+      remembered = remember;
 
       element('trust-panel').hidden = true;
       element('runtime-panel').hidden = false;

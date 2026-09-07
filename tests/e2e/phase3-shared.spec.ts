@@ -48,6 +48,79 @@ test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
     } catch {}
   });
 
+  for (const failure of ['abort', 'throw'] as const) {
+    test(`initial remembered editor consent is atomic on approval ${failure}`, async ({page}) => {
+      const signed = await createSignedRoomDescriptor({
+        publisherPrivateKey: publisherPriv, roomId: activeRoomId,
+        packageDigest: sharedFixture.packageDigest, publisherKeyId: sharedFixture.publisherKeyId,
+        writerPublicKey: await getPublicKeyAsync(writerPriv), capability: editorCap,
+        role: 'editor', expiresAt: activeExpiry
+      });
+      const fragment = formatInviteFragment({descriptorJcsBytes: signed.jcsBytes,
+        descriptorSignature: signed.signature, roomKey, capability: editorCap, writerPrivateSeed: writerPriv});
+      await page.goto(`/r/${activeRoomId}#${fragment}`, {waitUntil: 'domcontentloaded'});
+      const approve = page.getByRole('button', {name: 'Open this exact version'});
+      await expect(approve).toBeVisible();
+      const counts = async () => page.evaluate(async () => {
+        const database = await new Promise<IDBDatabase>((resolve, reject) => {
+          const request = indexedDB.open('smallframe-shared-v1', 2);
+          request.onsuccess = () => resolve(request.result);
+          request.onerror = () => reject(new Error('TEST_DB_OPEN_FAILED'));
+        });
+        try {
+          return await Promise.all(['rooms', 'deviceKeys', 'approvals'].map(async (name) =>
+            await new Promise<number>((resolve, reject) => {
+              const request = database.transaction(name).objectStore(name).count();
+              request.onsuccess = () => resolve(request.result);
+              request.onerror = () => reject(new Error('TEST_DB_COUNT_FAILED'));
+            })));
+        } finally { database.close(); }
+      });
+      expect(await counts()).toEqual([0, 0, 0]);
+      await page.evaluate((failure) => {
+        const original = IDBObjectStore.prototype.put;
+        IDBObjectStore.prototype.put = function(value, key) {
+          if (this.name === 'approvals') {
+            IDBObjectStore.prototype.put = original;
+            if (failure === 'throw') throw new DOMException('TEST_ONLY', 'DataCloneError');
+            const request = key === undefined ? original.call(this, value) : original.call(this, value, key);
+            this.transaction.abort();
+            return request;
+          }
+          return key === undefined ? original.call(this, value) : original.call(this, value, key);
+        };
+      }, failure);
+      await approve.click();
+      await expect(page.locator('#trust-description')).toContainText('SHARED_STORAGE_WRITE_');
+      await expect(approve).toBeVisible();
+      expect(await counts()).toEqual([0, 0, 0]);
+      await expect(page.frameLocator('iframe').getByRole('button', {name: 'Add decision'})).toHaveCount(0);
+
+      await approve.click();
+      await expect(page.frameLocator('iframe').getByText('0 decisions')).toBeVisible();
+      expect(await counts()).toEqual([1, 1, 1]);
+      const rejectedContexts = await page.evaluate(async ({roomId, approvalId}) => {
+        const api = (globalThis as typeof globalThis & {SmallframeSharedStore: {
+          loadRoom: (id: string) => Promise<Record<string, unknown>>;
+          loadApproval: (id: string) => Promise<Record<string, unknown>>;
+          saveRoom: (room: Record<string, unknown>, approval: Record<string, unknown>) => Promise<void>;
+        }}).SmallframeSharedStore;
+        const room = await api.loadRoom(roomId);
+        const approval = await api.loadApproval(approvalId);
+        const results = [];
+        for (const field of ['roomId', 'packageDigest', 'role']) {
+          try { await api.saveRoom(room, {...approval, [field]: 'wrong-context'}); results.push(false); }
+          catch (error) { results.push(error instanceof Error && error.message === 'LOCAL_APPROVAL_CONTEXT_INVALID'); }
+        }
+        return results;
+      }, {roomId: activeRoomId, approvalId: `${activeRoomId}:${encodeBase64Url(signed.descriptorDigest)}`});
+      expect(rejectedContexts).toEqual([true, true, true]);
+      expect(await counts()).toEqual([1, 1, 1]);
+      await page.goto(`/r/${activeRoomId}#${fragment}`, {waitUntil: 'domcontentloaded'});
+      await expect(page.frameLocator('iframe').getByText('0 decisions')).toBeVisible();
+    });
+  }
+
   test('an aborted local commit cannot leak into sync and a later edit commits once', async ({page}) => {
     const signed = await createSignedRoomDescriptor({
       publisherPrivateKey: publisherPriv, roomId: activeRoomId,
