@@ -107,11 +107,12 @@ test('Phase 0 response provenance and verified-cache evidence', async ({page, re
   expect(evidence.probeBody).toContain('smallframe-service-worker:');
   expect(evidence.probeProvenance).toBe('service-worker-probe');
 
-  const directNetwork = await request.get(`http://app.localhost:4173${rendererPath}`);
+  // Node requests use the bound address; browser navigation retains the exact CSP origin.
+  const directNetwork = await request.get(`http://127.0.0.1:4173${rendererPath}`);
   expect(directNetwork.headers()['x-smallframe-response-provenance']).toBe('network-fallback');
   expect(directNetwork.headers()['content-security-policy']).toContain("frame-ancestors 'none'");
   if (usesCandidateTFraming) {
-    const controller = await request.get('/');
+    const controller = await request.get('http://127.0.0.1:4173/');
     const controllerCsp = controller.headers()['content-security-policy'] ?? '';
     expect(parseCsp(controllerCsp).get('frame-src')).toEqual(['http://app.localhost:4173/runtime/renderer/', 'http://app.localhost:4173/sw.js']);
   }
@@ -164,7 +165,7 @@ if (usesCandidateTFraming) {
       {path: '/sw.js?redirect=1', status: 302}
     ];
     for (const {path, status} of paths) {
-      const response = await request.get(path, {maxRedirects: 0});
+      const response = await request.get(`http://127.0.0.1:4173${path}`, {maxRedirects: 0});
       const headers = response.headers();
       const responseCsp = parseCsp(headers['content-security-policy'] ?? '');
       expect([...responseCsp.entries()]).toEqual([...expectedServiceWorkerCsp.entries()]);
@@ -174,11 +175,11 @@ if (usesCandidateTFraming) {
       }
       expect(headers['content-type']).toBe('text/javascript; charset=utf-8');
       expect(headers['x-content-type-options']).toBe('nosniff');
-      expect(response.url()).toBe(`http://app.localhost:4173${path}`);
+      expect(response.url()).toBe(`http://127.0.0.1:4173${path}`);
       expect(response.status()).toBe(status);
       if (status === 302) expect(headers.location).toBe('/sw.js');
     }
-    const direct = await request.get(await rendererPathFrom(page));
+    const direct = await request.get(`http://127.0.0.1:4173${await rendererPathFrom(page)}`);
     expect(direct.headers()['content-security-policy']).toContain("frame-ancestors 'none'");
     await page.evaluate(() => {
       const sources = [
@@ -420,7 +421,7 @@ test('verified renderer transport-offline reopen', async ({browserName, page: fi
       await page.frameLocator('iframe').getByRole('button', {name: 'Add decision'}).click();
       await expect(page.frameLocator('iframe').getByText('Decisions: 1')).toBeVisible();
       const faultToken = `${Date.now()}-${Math.random().toString(36).slice(2)}-renderer`;
-      const fault = await page.request.post('/__test__/renderer-fault', {data: {token: faultToken}});
+      const fault = await page.request.post('http://127.0.0.1:4173/__test__/renderer-fault', {data: {token: faultToken}});
       expect(fault.status()).toBe(204);
       await context.addCookies([{name: 'smallframe-renderer-fault', value: faultToken, domain: 'app.localhost', path: '/'}]);
     }

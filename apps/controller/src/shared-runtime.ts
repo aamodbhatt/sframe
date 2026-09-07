@@ -351,7 +351,7 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
       }
     };
 
-    const persistRoom = async (dirty: boolean): Promise<void> => {
+    const persistRoom = async (dirty: boolean, state = currentState, docBytes = localDocBytes): Promise<void> => {
       if (!remembered || !isEditorHoldingLock) return;
         await store().saveRoom({
           roomId: descriptor.roomId,
@@ -360,14 +360,14 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
           roomKey: encodeBase64Url(invite.roomKey),
           capability: encodeBase64Url(invite.capability),
           writerPrivateSeed: invite.writerPrivateSeed ? encodeBase64Url(invite.writerPrivateSeed) : undefined,
-          state: currentState,
+          state,
           stateEpoch: currentEpoch,
           revision: currentRevision,
           envelopeDigest: currentDigest,
           etag: currentEtag,
           dirty,
           actorId: actorIdHex,
-          automergeBase64: localDocBytes ? encodeBase64Url(localDocBytes) : undefined,
+          automergeBase64: docBytes ? encodeBase64Url(docBytes) : undefined,
           updatedAt: Date.now()
         });
         element('last-sync').textContent = `Saved locally: ${new Date().toLocaleTimeString()}`;
@@ -650,16 +650,17 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
         assertNotExpired();
         await leasePromise;
         if (role !== 'editor' || !isEditorHoldingLock || !invite.writerPrivateSeed || !localDocBytes) throw new Error('READ_ONLY');
-        currentState = structuredClone(state);
         setStatus('Syncing…');
 
         try {
-          const patchRes = await worker.applyPatch(localDocBytes, JSON.stringify(currentState), actorIdHex);
+          const patchRes = await worker.applyPatch(localDocBytes, JSON.stringify(state), actorIdHex);
+          // Publish the candidate to memory only after its durable commit. A rejected
+          // batch must never enter a later focus/reconnect sync or the export path.
+          await persistRoom(true, patchRes.projectedState, patchRes.bytes);
           localDocBytes = patchRes.bytes;
           currentState = patchRes.projectedState;
 
           dirty = true;
-          await persistRoom(true);
           window.setTimeout(requestSync, 0);
         } catch {
           setStatus('Local save failed');

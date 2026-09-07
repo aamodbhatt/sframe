@@ -48,6 +48,54 @@ test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
     } catch {}
   });
 
+  test('an aborted local commit cannot leak into sync and a later edit commits once', async ({page}) => {
+    const signed = await createSignedRoomDescriptor({
+      publisherPrivateKey: publisherPriv, roomId: activeRoomId,
+      packageDigest: sharedFixture.packageDigest, publisherKeyId: sharedFixture.publisherKeyId,
+      writerPublicKey: await getPublicKeyAsync(writerPriv), capability: editorCap,
+      role: 'editor', expiresAt: activeExpiry
+    });
+    const fragment = formatInviteFragment({descriptorJcsBytes: signed.jcsBytes,
+      descriptorSignature: signed.signature, roomKey, capability: editorCap, writerPrivateSeed: writerPriv});
+    await page.goto(`/r/${activeRoomId}#${fragment}`, {waitUntil: 'domcontentloaded'});
+    await page.getByRole('button', {name: 'Open this exact version'}).click();
+    const app = page.frameLocator('iframe');
+    await expect(app.getByText('0 decisions')).toBeVisible();
+
+    let writes = 0;
+    page.on('request', (request) => { if (request.method() === 'PUT') writes += 1; });
+    // Abort after put has queued its request, before IndexedDB commits. No runtime
+    // test hook is needed and the original method is restored on first injection.
+    await page.evaluate(() => {
+      const original = IDBObjectStore.prototype.put;
+      IDBObjectStore.prototype.put = function(value, key) {
+        const request = key === undefined ? original.call(this, value) : original.call(this, value, key);
+        if (this.name === 'rooms') {
+          IDBObjectStore.prototype.put = original;
+          this.transaction.abort();
+        }
+        return request;
+      };
+    });
+    await app.getByRole('button', {name: 'Add decision'}).click();
+    await expect(page.locator('#connectivity')).toHaveText('Local save failed');
+    await expect(app.getByText('0 decisions')).toBeVisible();
+    expect(writes).toBe(0);
+
+    // A real sync must finish without resurrecting or publishing the rejected edit.
+    await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+    await expect(page.locator('#connectivity')).toHaveText('Synced');
+    await expect(app.getByText('0 decisions')).toBeVisible();
+    expect(writes).toBe(0);
+
+    await app.getByRole('button', {name: 'Add decision'}).click();
+    await expect(app.getByText('1 decisions')).toBeVisible();
+    await expect.poll(() => writes).toBe(1);
+    await expect(page.locator('#connectivity')).toHaveText('Synced');
+    await page.goto(`/r/${activeRoomId}#${fragment}`, {waitUntil: 'domcontentloaded'});
+    await expect(page.frameLocator('iframe').getByText('1 decisions')).toBeVisible();
+  });
+
   test('scrubs invite fragment synchronously, opens shared editor, edits state, and enforces viewer mode', async ({page, context}) => {
     const roomId = activeRoomId;
     const packageDigest = sharedFixture.packageDigest;
