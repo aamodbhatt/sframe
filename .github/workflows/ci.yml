@@ -33,6 +33,11 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Configure exact local browser origins
+        run: |
+          printf '\n127.0.0.1 app.localhost api.localhost\n' | sudo tee -a /etc/hosts > /dev/null
+          node --input-type=module -e "import {lookup} from 'node:dns/promises'; import assert from 'node:assert/strict'; for (const host of ['app.localhost', 'api.localhost']) { const addresses = await lookup(host, {all: true}); assert(addresses.length > 0 && addresses.every(({address}) => address === '127.0.0.1')); }"
+
       - name: Bootstrap toolchain
         run: npm run bootstrap
 

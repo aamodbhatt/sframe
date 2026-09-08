@@ -84,7 +84,7 @@ const evidenceFor = async (page: PageLike, path: string) => page.evaluate(async 
 
 test('Phase 0 response provenance and verified-cache evidence', async ({page, request}) => {
   const responsePromise = candidate === 'A' ? Promise.resolve(null) : rendererResponse(page);
-  await page.goto('/', {waitUntil: 'domcontentloaded'});
+  await page.goto('/', {waitUntil: 'commit'});
   await expect(page.locator('#build')).toContainText('Verified renderer');
   const rendererPath = await rendererPathFrom(page);
   const rendererResponseValue = await responsePromise;
@@ -124,7 +124,7 @@ test('Phase 0 response provenance and verified-cache evidence', async ({page, re
 
 test('Phase 1 production Wasm verifies the native canonical package vector', async ({page}) => {
   test.skip(candidate !== 'U', 'Phase 1 verifier is Candidate U only');
-  await page.goto('/', {waitUntil: 'domcontentloaded'});
+  await page.goto('/', {waitUntil: 'commit'});
   await expect(page.locator('#status')).toContainText('App Worker running', {timeout: 8_000});
   const renderer = page.frames().find((frame) => frame.url().includes('/runtime/renderer/'));
   expect(renderer).toBeDefined();
@@ -152,7 +152,7 @@ test('Phase 1 production Wasm verifies the native canonical package vector', asy
 
 if (usesCandidateTFraming) {
   test(`Candidate ${candidate} exact Service Worker frame-source compatibility and fail-closed negatives`, async ({page, request}) => {
-    await page.goto('/', {waitUntil: 'domcontentloaded'});
+    await page.goto('/', {waitUntil: 'commit'});
     await expect(page.locator('#build')).toContainText('Verified renderer');
     const paths = [
       {path: '/sw.js', status: 200},
@@ -248,7 +248,7 @@ test('renderer boundary, channel, and canary behavior', async ({page, request}) 
     expect(reset.status()).toBe(204);
   }
   const responsePromise = candidate === 'A' ? Promise.resolve(null) : rendererResponse(page);
-  await page.goto('/#phase0-secret-fixture', {waitUntil: 'domcontentloaded'});
+  await page.goto('/#phase0-secret-fixture', {waitUntil: 'commit'});
   const rendererPath = await rendererPathFrom(page);
   const response = await responsePromise;
   if (candidate !== 'A') expect(response).not.toBeNull();
@@ -366,16 +366,17 @@ test('renderer boundary, channel, and canary behavior', async ({page, request}) 
 test('verified renderer transport-offline reopen', async ({browserName, page: fixturePage, request}, testInfo) => {
   if (candidate === 'U') {
     const page = fixturePage;
-    await page.goto('/', {waitUntil: 'domcontentloaded'});
+    await page.goto('/', {waitUntil: 'commit'});
     await expect(page.locator('#status')).toContainText('App Worker running');
     await expect(page.frameLocator('iframe').getByText('Decisions: 0')).toBeVisible();
     await page.frameLocator('iframe').getByRole('button', {name: 'Add decision'}).click();
     await expect(page.frameLocator('iframe').getByText('Decisions: 1')).toBeVisible();
     const rendererPath = await rendererPathFrom(page);
-    const beforeOffline = await evidenceCounts(request);
     const networkControl = 'http://127.0.0.1:8787/__test__/controller-network';
     const stopped = await request.post(networkControl, {data: {online: false}});
     expect(stopped.status()).toBe(204);
+    // Snapshot only after the listener and in-flight connections are closed.
+    const beforeOffline = await evidenceCounts(request);
     try {
       let positiveControlFailed = false;
       try { await request.get(`http://127.0.0.1:4173${rendererPath}`, {timeout: 1_500}); }
@@ -412,7 +413,7 @@ test('verified renderer transport-offline reopen', async ({browserName, page: fi
   const context = await browserType.launchPersistentContext(testInfo.outputPath('persistent-profile'), {headless: true, serviceWorkers: 'allow'});
   try {
     const page = context.pages()[0] ?? await context.newPage();
-    await page.goto('/', {waitUntil: 'domcontentloaded'});
+    await page.goto('/', {waitUntil: 'commit'});
     const firstRenderer = page.locator('iframe');
     await expect(firstRenderer).toHaveCount(1);
     if (candidate === 'T') {
@@ -475,7 +476,7 @@ if (candidate === 'U') {
 
 if (usesClassicWorker) {
   test(`Candidate ${candidate} external watchdog terminates a hung event and restarts from saved state`, async ({page, request}) => {
-    await page.goto('/', {waitUntil: 'domcontentloaded'});
+    await page.goto('/', {waitUntil: 'commit'});
     await expect(page.locator('#status')).toContainText('App Worker running');
     await page.frameLocator('iframe').getByRole('button', {name: 'Add decision'}).click();
     await expect(page.frameLocator('iframe').getByText('Decisions: 1')).toBeVisible();
@@ -509,7 +510,7 @@ if (usesClassicWorker) {
 
 if (candidate === 'U') {
   test('Candidate U exhausts its single watchdog restart budget and fail-stops', async ({page}) => {
-    await page.goto('/', {waitUntil: 'domcontentloaded'});
+    await page.goto('/', {waitUntil: 'commit'});
     const host = page.locator('#app-host');
     await expect(host).toHaveAttribute('data-worker-state', 'running');
     await page.frameLocator('iframe').getByRole('button', {name: 'Run bounded watchdog fixture'}).click();
@@ -529,7 +530,7 @@ if (candidate === 'U') {
 
 if (candidate === 'T' || candidate === 'U') {
   test(`Candidate ${candidate} private port and lexical authority boundary`, async ({page}) => {
-    await page.goto('/', {waitUntil: 'domcontentloaded'});
+    await page.goto('/', {waitUntil: 'commit'});
     await expect(page.locator('#status')).toContainText('App Worker running');
     await expect(page.frameLocator('iframe').getByText('Decisions: 0')).toBeVisible();
     if (candidate === 'U') {
