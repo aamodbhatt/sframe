@@ -22,10 +22,14 @@ const relay = new Miniflare({modules: true, scriptPath: join(relayDir, 'worker.m
   d1Databases: ['DB'], r2Buckets: ['PACKAGES'], durableObjects: {ROOMS: {className: 'RoomDurableObject', useSQLite: true}}
 });
 const relayOrigin = (await relay.ready).origin;
-const relayNetwork = {online: true};
+const relayNetwork = {online: true, disconnect: false};
 let relayMetadataFault = '';
 const forwardRelay = async (request, response) => {
-  if (!relayNetwork.online) { response.writeHead(503).end(); return; }
+  if (!relayNetwork.online) {
+    if (relayNetwork.disconnect) request.socket.destroy();
+    else response.writeHead(503).end();
+    return;
+  }
   const chunks = [];
   let size = 0;
   for await (const chunk of request) {
@@ -104,6 +108,7 @@ const resetEvidence = () => {
   serviceWorkerRequests.length = 0;
   rendererFaultTokens.clear();
   relayNetwork.online = true;
+  relayNetwork.disconnect = false;
   relayMetadataFault = '';
 };
 const evidenceSnapshot = () => ({...canary, rendererFallback: {...rendererFallback}, rendererMutation: {...rendererMutation}, appNetwork: {...appNetwork}, serviceWorkerRequests: [...serviceWorkerRequests]});
@@ -199,6 +204,7 @@ const apiHandler = (request, response) => {
   if (url.pathname === '/__test__/relay-network' && request.method === 'POST') {
     void bodyJson(request).then((body) => {
       relayNetwork.online = body.online === true;
+      relayNetwork.disconnect = body.disconnect === true;
       response.writeHead(204).end();
     }).catch(() => response.writeHead(400).end());
     return;

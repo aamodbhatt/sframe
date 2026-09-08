@@ -351,7 +351,17 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
       }
     };
 
-    const persistRoom = async (dirty: boolean, state = currentState, docBytes = localDocBytes, approval?: StoredSharedApproval): Promise<void> => {
+    type RevisionTuple = Pick<StoredSharedRoom, 'stateEpoch' | 'revision' | 'envelopeDigest' | 'etag'>;
+    const revisionTuple = (): RevisionTuple => ({stateEpoch: currentEpoch, revision: currentRevision,
+      envelopeDigest: currentDigest, etag: currentEtag});
+    const promoteRevision = (tuple: RevisionTuple): void => {
+      currentEpoch = tuple.stateEpoch;
+      currentRevision = tuple.revision;
+      currentDigest = tuple.envelopeDigest;
+      currentEtag = tuple.etag;
+    };
+    const persistRoom = async (dirty: boolean, state = currentState, docBytes = localDocBytes,
+      approval?: StoredSharedApproval, tuple = revisionTuple()): Promise<void> => {
       if ((!remembered && !approval) || !isEditorHoldingLock) return;
         await store().saveRoom({
           roomId: descriptor.roomId,
@@ -361,10 +371,7 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
           capability: encodeBase64Url(invite.capability),
           writerPrivateSeed: invite.writerPrivateSeed ? encodeBase64Url(invite.writerPrivateSeed) : undefined,
           state,
-          stateEpoch: currentEpoch,
-          revision: currentRevision,
-          envelopeDigest: currentDigest,
-          etag: currentEtag,
+          ...tuple,
           dirty,
           actorId: actorIdHex,
           automergeBase64: docBytes ? encodeBase64Url(docBytes) : undefined,
@@ -403,31 +410,29 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
               envelope: wireEnvelope
             }));
 
+            let candidate = {bytes: decrypted.automergeBytes, projectedState: decrypted.projectedState};
             if (localDocBytes) {
               if (wireEnvelope.stateEpoch !== currentEpoch) throw new Error('RECOVERY_TRANSITION_REQUIRED');
               if (wireEnvelope.proposedRevision < currentRevision) throw new Error('REMOTE_ROLLBACK');
               if (wireEnvelope.proposedRevision === currentRevision && decrypted.envelopeDigest !== currentDigest) throw new Error('REMOTE_EQUIVOCATION');
               if (wireEnvelope.proposedRevision === currentRevision + 1 && wireEnvelope.previousEnvelopeDigest !== currentDigest) throw new Error('PREDECESSOR_MISMATCH');
-              const merged = await guardedRemote(async (active) => active.merge(localDocBytes!, decrypted.automergeBytes, stableJson(metadata!.stateSchema), metadata!.maxPlaintextBytes));
-              if (approved) await options.onReplaceState(structuredClone(merged.projectedState));
-              localDocBytes = merged.bytes;
-              currentState = merged.projectedState;
-            } else {
-              localDocBytes = decrypted.automergeBytes;
-              currentState = decrypted.projectedState;
+              candidate = await guardedRemote(async (active) => active.merge(localDocBytes!, decrypted.automergeBytes, stableJson(metadata!.stateSchema), metadata!.maxPlaintextBytes));
             }
 
-            currentEpoch = wireEnvelope.stateEpoch;
+            const tuple: RevisionTuple = {stateEpoch: wireEnvelope.stateEpoch, revision: wireEnvelope.proposedRevision,
+              envelopeDigest: decrypted.envelopeDigest, etag: res.headers.get('ETag') ?? decrypted.etag};
+            // Commit the complete candidate before exposing it or advancing lineage.
+            await persistRoom(dirty, candidate.projectedState, candidate.bytes, undefined, tuple);
+            localDocBytes = candidate.bytes;
+            currentState = candidate.projectedState;
+            promoteRevision(tuple);
             currentAppId = metadata?.appId;
-            currentRevision = wireEnvelope.proposedRevision;
-            currentDigest = decrypted.envelopeDigest;
-            currentEtag = res.headers.get('ETag') ?? decrypted.etag;
+            if (approved) await options.onReplaceState(structuredClone(currentState));
           } else {
             throw new Error('SIGNED_ENVELOPE_REQUIRED');
           }
 
           setStatus(dirty ? 'Saved locally · pending sync' : 'Synced');
-          await persistRoom(dirty);
         } else {
           throw new Error('RELAY_UNAVAILABLE');
         }
@@ -448,11 +453,11 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
           headers: {Authorization: capHeader, 'Content-Type': 'application/json', 'If-Match': currentEtag},
           body: JSON.stringify(encrypted.envelope)});
         if (res.ok) {
-          currentRevision += 1;
-          currentDigest = encrypted.envelopeDigest;
-          currentEtag = encrypted.etag;
+          const tuple: RevisionTuple = {stateEpoch: currentEpoch, revision: currentRevision + 1,
+            envelopeDigest: encrypted.envelopeDigest, etag: encrypted.etag};
+          await persistRoom(false, currentState, localDocBytes, undefined, tuple);
+          promoteRevision(tuple);
           dirty = false;
-          await persistRoom(false);
           setStatus('Synced');
           return;
         }

@@ -188,6 +188,88 @@ test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
     await expect(page.frameLocator('iframe').getByText('1 decisions')).toBeVisible();
   });
 
+  for (const failure of ['remote', 'acknowledgement'] as const) {
+    test(`an aborted ${failure} commit preserves the durable replica and retries`, async ({page, browser, request}) => {
+      const signed = await createSignedRoomDescriptor({publisherPrivateKey: publisherPriv, roomId: activeRoomId,
+        packageDigest: sharedFixture.packageDigest, publisherKeyId: sharedFixture.publisherKeyId,
+        writerPublicKey: await getPublicKeyAsync(writerPriv), capability: editorCap,
+        role: 'editor', expiresAt: activeExpiry});
+      const fragment = formatInviteFragment({descriptorJcsBytes: signed.jcsBytes, descriptorSignature: signed.signature,
+        roomKey, capability: editorCap, writerPrivateSeed: writerPriv});
+      await gotoInvite(page, `/r/${activeRoomId}`, fragment);
+      await page.getByRole('button', {name: 'Open this exact version'}).click();
+      const app = page.frameLocator('iframe');
+      await expect(app.getByText('0 decisions')).toBeVisible();
+      const peer = await browser.newContext();
+      try {
+        let writes = 0;
+        page.on('request', (req) => { if (req.method() === 'PUT') writes += 1; });
+        // Keep rejecting every candidate after the selected boundary, including
+        // realtime retries. The fault changes no runtime code or plaintext record.
+        await page.evaluate((failure) => {
+          const scope = globalThis as any;
+          let rejectWrites = failure === 'remote';
+          const fetch = window.fetch;
+          const put = IDBObjectStore.prototype.put;
+          window.fetch = async (...args) => {
+            const response = await fetch(...args);
+            if (args[1]?.method === 'PUT' && response.ok) rejectWrites = true;
+            return response;
+          };
+          IDBObjectStore.prototype.put = function(value, key) {
+            const result = key === undefined ? put.call(this, value) : put.call(this, value, key);
+            if (this.name === 'rooms' && rejectWrites) this.transaction.abort();
+            return result;
+          };
+          scope.restoreCommitFault = () => { window.fetch = fetch; IDBObjectStore.prototype.put = put; };
+        }, failure);
+        if (failure === 'remote') {
+          const other = await peer.newPage();
+          await gotoInvite(other, `/r/${activeRoomId}`, fragment);
+          await other.getByRole('button', {name: 'Open this exact version'}).click();
+          await other.frameLocator('iframe').getByRole('button', {name: 'Add decision'}).click();
+          await expect(other.locator('#connectivity')).toHaveText('Synced');
+          await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+        } else {
+          await app.getByRole('button', {name: 'Add decision'}).click();
+          await expect.poll(() => writes).toBe(1);
+        }
+        await expect(page.locator('#connectivity')).toHaveText('Sync paused · local copy retained');
+        await expect(app.getByText(failure === 'remote' ? '0 decisions' : '1 decisions')).toBeVisible();
+        // Return only coordination metadata; never return decrypted state or keys.
+        const saved = await page.evaluate(async (roomId) => {
+          const room = await (globalThis as any).SmallframeSharedStore.loadRoom(roomId);
+          return {revision: room.revision, dirty: room.dirty};
+        }, activeRoomId);
+        expect(saved).toEqual({revision: 1, dirty: failure === 'acknowledgement'});
+        await page.evaluate(() => { (globalThis as any).restoreCommitFault(); window.dispatchEvent(new Event('focus')); });
+        await expect(page.locator('#connectivity')).toHaveText('Synced');
+        await expect(app.getByText('1 decisions')).toBeVisible();
+        // A rejected acknowledgement must retain dirty intent until a later
+        // successful CAS and durable acknowledgement; a remote merge emits no PUT.
+        expect(writes).toBe(failure === 'remote' ? 0 : 2);
+        const committed = await page.evaluate(async (roomId) => {
+          const room = await (globalThis as any).SmallframeSharedStore.loadRoom(roomId);
+          return {revision: room.revision, dirty: room.dirty};
+        }, activeRoomId);
+        expect(committed).toEqual({revision: failure === 'remote' ? 2 : 3, dirty: false});
+        await peer.close();
+        // Drop real controller and relay transports. Browser offline emulation
+        // also disables SW navigation in some engines and is not an outage proxy.
+        expect((await request.post('http://127.0.0.1:8787/__test__/relay-network',
+          {data: {online: false, disconnect: true}})).status()).toBe(204);
+        expect((await request.post('http://127.0.0.1:8787/__test__/controller-network',
+          {data: {online: false}})).status()).toBe(204);
+        await gotoInvite(page, `/r/${activeRoomId}`, fragment);
+        await expect(page.frameLocator('iframe').getByText('1 decisions')).toBeVisible();
+      } finally {
+        await request.post('http://127.0.0.1:8787/__test__/controller-network', {data: {online: true}});
+        await request.post('http://127.0.0.1:8787/__test__/relay-network', {data: {online: true}});
+        await peer.close();
+      }
+    });
+  }
+
   test('scrubs invite fragment synchronously, opens shared editor, edits state, and enforces viewer mode', async ({page, context}) => {
     const roomId = activeRoomId;
     const packageDigest = sharedFixture.packageDigest;
