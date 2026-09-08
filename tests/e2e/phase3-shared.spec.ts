@@ -270,6 +270,57 @@ test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
     });
   }
 
+  for (const fault of ['oversized', 'stalled'] as const) {
+    test(`bounds an ${fault} relay response and retains a usable replica`, async ({page}) => {
+      const signed = await createSignedRoomDescriptor({publisherPrivateKey: publisherPriv, roomId: activeRoomId,
+        packageDigest: sharedFixture.packageDigest, publisherKeyId: sharedFixture.publisherKeyId,
+        writerPublicKey: await getPublicKeyAsync(writerPriv), capability: editorCap,
+        role: 'editor', expiresAt: activeExpiry});
+      const fragment = formatInviteFragment({descriptorJcsBytes: signed.jcsBytes, descriptorSignature: signed.signature,
+        roomKey, capability: editorCap, writerPrivateSeed: writerPriv});
+      await gotoInvite(page, `/r/${activeRoomId}`, fragment);
+      await page.getByRole('button', {name: 'Open this exact version'}).click();
+      const app = page.frameLocator('iframe');
+      await expect(app.getByText('0 decisions')).toBeVisible();
+      await page.evaluate((fault) => {
+        const scope = globalThis as any;
+        const fetch = window.fetch;
+        const evidence = {chunks: 0, cancelled: false};
+        scope.bodyFaultEvidence = evidence;
+        scope.restoreBodyFault = () => { window.fetch = fetch; };
+        window.fetch = async (...args) => {
+          if (!String(args[0]).endsWith('/state')) return fetch(...args);
+          return new Response(new ReadableStream<Uint8Array>({
+            pull(controller) {
+              if (fault === 'stalled') return;
+              evidence.chunks += 1;
+              // Bounded pressure fixture even if the client limit regresses.
+              if (evidence.chunks > 20) { controller.close(); return; }
+              controller.enqueue(new Uint8Array(65_536).fill(32));
+            },
+            cancel() { evidence.cancelled = true; }
+          }), {headers: {'Content-Type': 'application/json', 'Content-Length': '1'}});
+        };
+        window.dispatchEvent(new Event('focus'));
+      }, fault);
+      await expect(page.locator('#connectivity')).toHaveText('Sync paused · local copy retained', {timeout: 8000});
+      const evidence = await page.evaluate(() => (globalThis as any).bodyFaultEvidence as {chunks: number; cancelled: boolean});
+      expect(evidence.cancelled).toBe(true);
+      expect(evidence.chunks).toBeLessThanOrEqual(13);
+      await expect(app.getByText('0 decisions')).toBeVisible();
+      const saved = await page.evaluate(async (roomId) => {
+        const room = await (globalThis as any).SmallframeSharedStore.loadRoom(roomId);
+        return {revision: room.revision, dirty: room.dirty};
+      }, activeRoomId);
+      expect(saved).toEqual({revision: 1, dirty: false});
+      await page.evaluate(() => { (globalThis as any).restoreBodyFault(); window.dispatchEvent(new Event('focus')); });
+      await expect(page.locator('#connectivity')).toHaveText('Synced');
+      await app.getByRole('button', {name: 'Add decision'}).click();
+      await expect(app.getByText('1 decisions')).toBeVisible();
+      await expect(page.locator('#connectivity')).toHaveText('Synced');
+    });
+  }
+
   test('scrubs invite fragment synchronously, opens shared editor, edits state, and enforces viewer mode', async ({page, context}) => {
     const roomId = activeRoomId;
     const packageDigest = sharedFixture.packageDigest;
