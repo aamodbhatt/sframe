@@ -321,6 +321,93 @@ test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
     });
   }
 
+  for (const field of ['revision', 'etag', 'actorId', 'dirty', 'automergeBase64'] as const) {
+    test(`rejects authenticated local corruption in ${field} before state access`, async ({page}) => {
+      const signed = await createSignedRoomDescriptor({publisherPrivateKey: publisherPriv, roomId: activeRoomId,
+        packageDigest: sharedFixture.packageDigest, publisherKeyId: sharedFixture.publisherKeyId,
+        writerPublicKey: await getPublicKeyAsync(writerPriv), capability: editorCap,
+        role: 'editor', expiresAt: activeExpiry});
+      const fragment = formatInviteFragment({descriptorJcsBytes: signed.jcsBytes, descriptorSignature: signed.signature,
+        roomKey, capability: editorCap, writerPrivateSeed: writerPriv});
+      await gotoInvite(page, `/r/${activeRoomId}`, fragment);
+      await page.getByRole('button', {name: 'Open this exact version'}).click();
+      await expect(page.frameLocator('iframe').getByText('0 decisions')).toBeVisible();
+      // Exit the runtime before writing a legitimately wrapped but corrupt record.
+      await page.goto('/icon.svg', {waitUntil: 'commit'});
+      await page.evaluate(async ({roomId, field}) => {
+        const database = await new Promise<IDBDatabase>((resolve, reject) => {
+          const request = indexedDB.open('smallframe-shared-v1', 2);
+          request.onsuccess = () => resolve(request.result);
+          request.onerror = () => reject(new Error('TEST_DATABASE_OPEN_FAILED'));
+        });
+        const read = (store: string): Promise<any> => new Promise((resolve, reject) => {
+          const request = database.transaction(store).objectStore(store).get(roomId);
+          request.onsuccess = () => resolve(request.result);
+          request.onerror = () => reject(new Error('TEST_DATABASE_READ_FAILED'));
+        });
+        const [wrapped, device] = await Promise.all([read('rooms'), read('deviceKeys')]);
+        const aad = new TextEncoder().encode(`smallframe/local-room/v1:${roomId}`);
+        const plaintext = await crypto.subtle.decrypt({name: 'AES-GCM', iv: wrapped.nonce, additionalData: aad}, device.key, wrapped.ciphertext);
+        const room = JSON.parse(new TextDecoder().decode(plaintext));
+        const invalid = {revision: 0, etag: '*', actorId: 'g'.repeat(32), dirty: 'false', automergeBase64: 'AB'};
+        room[field] = invalid[field];
+        const nonce = crypto.getRandomValues(new Uint8Array(12));
+        const ciphertext = await crypto.subtle.encrypt({name: 'AES-GCM', iv: nonce, additionalData: aad}, device.key,
+          new TextEncoder().encode(JSON.stringify(room)));
+        await new Promise<void>((resolve, reject) => {
+          const transaction = database.transaction('rooms', 'readwrite');
+          transaction.objectStore('rooms').put({version: 1, roomId, nonce, ciphertext});
+          transaction.oncomplete = () => resolve();
+          transaction.onabort = () => reject(new Error('TEST_DATABASE_WRITE_FAILED'));
+        });
+        database.close();
+      }, {roomId: activeRoomId, field});
+      let stateRequests = 0;
+      page.on('request', (request) => { if (request.url().endsWith('/state')) stateRequests += 1; });
+      await gotoInvite(page, `/r/${activeRoomId}`, fragment);
+      await expect(page.locator('#status')).toContainText('LOCAL_STATE_INVALID');
+      await expect(page.locator('iframe')).toHaveCount(0);
+      expect(stateRequests).toBe(0);
+    });
+  }
+
+  test('rejects a relay ETag that differs from the authenticated envelope', async ({page}) => {
+    const signed = await createSignedRoomDescriptor({publisherPrivateKey: publisherPriv, roomId: activeRoomId,
+      packageDigest: sharedFixture.packageDigest, publisherKeyId: sharedFixture.publisherKeyId,
+      writerPublicKey: await getPublicKeyAsync(writerPriv), capability: editorCap,
+      role: 'editor', expiresAt: activeExpiry});
+    const fragment = formatInviteFragment({descriptorJcsBytes: signed.jcsBytes, descriptorSignature: signed.signature,
+      roomKey, capability: editorCap, writerPrivateSeed: writerPriv});
+    await gotoInvite(page, `/r/${activeRoomId}`, fragment);
+    await page.getByRole('button', {name: 'Open this exact version'}).click();
+    const app = page.frameLocator('iframe');
+    await expect(app.getByText('0 decisions')).toBeVisible();
+    await page.evaluate(() => {
+      const fetch = window.fetch;
+      (globalThis as any).restoreEtagFault = () => { window.fetch = fetch; };
+      window.fetch = async (...args) => {
+        const response = await fetch(...args);
+        if (!String(args[0]).endsWith('/state')) return response;
+        const headers = new Headers(response.headers);
+        headers.set('ETag', '*');
+        return new Response(response.body, {status: response.status, headers});
+      };
+      window.dispatchEvent(new Event('focus'));
+    });
+    await expect(page.locator('#connectivity')).toHaveText('Sync paused · local copy retained');
+    const intact = await page.evaluate(async (roomId) => {
+      const room = await (globalThis as any).SmallframeSharedStore.loadRoom(roomId);
+      return room.revision === 1 && room.dirty === false && room.etag !== '*';
+    }, activeRoomId);
+    expect(intact).toBe(true);
+    await expect(app.getByText('0 decisions')).toBeVisible();
+    await page.evaluate(() => { (globalThis as any).restoreEtagFault(); window.dispatchEvent(new Event('focus')); });
+    await expect(page.locator('#connectivity')).toHaveText('Synced');
+    await app.getByRole('button', {name: 'Add decision'}).click();
+    await expect(app.getByText('1 decisions')).toBeVisible();
+    await expect(page.locator('#connectivity')).toHaveText('Synced');
+  });
+
   test('scrubs invite fragment synchronously, opens shared editor, edits state, and enforces viewer mode', async ({page, context}) => {
     const roomId = activeRoomId;
     const packageDigest = sharedFixture.packageDigest;

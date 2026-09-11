@@ -1,4 +1,5 @@
 import {authenticateInvite, verifyInviteRelayContext} from '../../../packages/protocol/src/room-descriptor.js';
+import {validateReplicaMetadata, verifiedRelayEtag} from './replica-metadata.js';
 import {readBoundedJson} from './bounded-json.js';
 import {ENVELOPE_BODY_LIMIT, type WireEnvelope} from '../../../packages/protocol/src/crypto-envelope.js';
 import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.js';
@@ -423,7 +424,7 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
             }
 
             const tuple: RevisionTuple = {stateEpoch: wireEnvelope.stateEpoch, revision: wireEnvelope.proposedRevision,
-              envelopeDigest: decrypted.envelopeDigest, etag: res.headers.get('ETag') ?? decrypted.etag};
+              envelopeDigest: decrypted.envelopeDigest, etag: verifiedRelayEtag(res.headers.get('ETag'), decrypted.etag)};
             // Commit the complete candidate before exposing it or advancing lineage.
             await persistRoom(dirty, candidate.projectedState, candidate.bytes, undefined, tuple);
             localDocBytes = candidate.bytes;
@@ -626,6 +627,7 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
         if (storedRoom && storedRoom.packageDigest === descriptor.packageDigest && storedRoom.role === role
           && storedRoom.capability === encodeBase64Url(invite.capability) && storedRoom.roomKey === encodeBase64Url(invite.roomKey)
           && storedRoom.writerPrivateSeed === (invite.writerPrivateSeed ? encodeBase64Url(invite.writerPrivateSeed) : undefined)) {
+          validateReplicaMetadata(storedRoom);
           if (!storedRoom.automergeBase64) throw new Error('LOCAL_STATE_INVALID');
           let restoredBytes: Uint8Array;
           try { restoredBytes = decodeBase64Url(storedRoom.automergeBase64); }

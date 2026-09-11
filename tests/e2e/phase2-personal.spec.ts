@@ -6,7 +6,7 @@ test.describe('Phase 2 signed personal workspace', () => {
   });
 
   test('reviews, persists, exports, imports, reopens offline, and enforces viewer mode', async ({page, request}) => {
-    await page.goto('/?personal=1', {waitUntil: 'domcontentloaded'});
+    await page.goto('/?personal=1', {waitUntil: 'commit'});
     await expect(page.getByRole('heading', {name: 'Decision Board', level: 2})).toBeVisible();
     await expect(page.getByText('cryptographic key—not verified legal identity')).toBeVisible();
     await expect(page.getByText(/Do not enter passwords/)).toBeVisible();
@@ -36,19 +36,19 @@ test.describe('Phase 2 signed personal workspace', () => {
     await expect(page.locator('#status')).toContainText('Import rejected: STATE_SCHEMA_INVALID');
     await expect(app.getByText('2 decisions')).toBeVisible();
 
-    await page.reload();
+    await page.reload({waitUntil: 'commit'});
     await expect(app.getByText('2 decisions')).toBeVisible();
     const networkControl = 'http://127.0.0.1:8787/__test__/controller-network';
     expect((await request.post(networkControl, {data: {online: false}})).status()).toBe(204);
     try {
-      await page.reload({waitUntil: 'domcontentloaded'});
+      await page.reload({waitUntil: 'commit'});
       await expect(page.locator('#connectivity')).toContainText('Offline');
       await expect(app.getByText('2 decisions')).toBeVisible();
     } finally {
       expect((await request.post(networkControl, {data: {online: true}})).status()).toBe(204);
     }
 
-    await page.goto('/?personal=1&role=viewer', {waitUntil: 'domcontentloaded'});
+    await page.goto('/?personal=1&role=viewer', {waitUntil: 'commit'});
     await expect(page.locator('#role')).toHaveText('viewer');
     await expect(app.getByText('2 decisions')).toBeVisible();
     await app.getByRole('button', {name: 'Add decision'}).click();
