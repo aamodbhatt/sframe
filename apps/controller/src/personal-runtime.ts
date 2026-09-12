@@ -1,3 +1,5 @@
+import {readPersonalImport} from './personal-import.js';
+
 type PersonalStoreApi = {
   workspaceIdFor: (packageDigest: string) => Promise<string>;
   loadWorkspace: (workspaceId: string) => Promise<{workspaceId: string; packageDigest: string; buildId?: string; releaseDigest?: string; state: Record<string, unknown>; revision: number; updatedAt: number} | undefined>;
@@ -8,7 +10,7 @@ type PersonalStoreApi = {
 };
 type PackageMetadata = {packageDigest: string; artifactDigest: string; publisherKeyId: string; publisherPublicKey: string; publisherDisplayName: string; appName: string; appVersion: string; description: string; capabilities: string[]; publicTemplate: Record<string, unknown>; stateSchema: Record<string, unknown>; maxPlaintextBytes: number; declaredMode: 'personal' | 'shared'};
 type PersonalSession = {handleVerified: (metadata: PackageMetadata) => Promise<void>; stateChanged: (state: Record<string, unknown>, revision: number) => Promise<void>; setBuildId: (buildId: string) => void; showUpdateBanner: (waitingWorker: ServiceWorker) => void};
-type SessionOptions = {archive: Uint8Array; role: 'viewer' | 'editor'; onApprove: (state: Record<string, unknown>, role: 'viewer' | 'editor') => void; onReplaceState: (state: Record<string, unknown>) => Promise<void>};
+type SessionOptions = {archive: Uint8Array; role: 'viewer' | 'editor'; onApprove: (state: Record<string, unknown>, role: 'viewer' | 'editor') => void; onReplaceState: (state: Record<string, unknown>, beforeCommit?: () => Promise<void>) => Promise<void>};
 
 const element = <T extends HTMLElement>(id: string): T => {
   const value = document.getElementById(id);
@@ -83,9 +85,11 @@ const createSession = (options: SessionOptions): PersonalSession => {
   window.setInterval(probeConnectivity, 3000);
   probeConnectivity();
 
-  const persist = async (): Promise<void> => {
+  const persist = async (state = currentState, nextRevision = revision): Promise<void> => {
     if (!metadata || !workspaceId) return;
-    await store().saveWorkspace({workspaceId, packageDigest: metadata.packageDigest, buildId: currentBuildId, state: structuredClone(currentState), revision, updatedAt: Date.now()});
+    try { await store().saveWorkspace({workspaceId, packageDigest: metadata.packageDigest, buildId: currentBuildId, state: structuredClone(state), revision: nextRevision, updatedAt: Date.now()}); }
+    catch { throw new Error('LOCAL_COMMIT_FAILED'); }
+    element('status').removeAttribute('data-operation-error');
     element('last-sync').textContent = `Saved locally: ${new Date().toLocaleTimeString()}`;
   };
   const approve = async (): Promise<void> => {
@@ -106,16 +110,13 @@ const createSession = (options: SessionOptions): PersonalSession => {
     const input = event.currentTarget as HTMLInputElement;
     const file = input.files?.[0];
     if (!file || !metadata || options.role === 'viewer') return;
-    void file.text().then(async (body) => {
-      if (new TextEncoder().encode(body).byteLength > metadata!.maxPlaintextBytes) throw new Error('STATE_TOO_LARGE');
-      const parsed: unknown = JSON.parse(body);
-      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('STATE_INVALID');
-      const nextState = structuredClone(parsed as Record<string, unknown>);
-      await options.onReplaceState(nextState);
-      currentState = nextState;
-      revision += 1;
-      await persist();
-    }).catch((error: unknown) => { element('status').textContent = `Import rejected: ${error instanceof Error ? error.message : 'STATE_INVALID'}`; }).finally(() => { input.value = ''; });
+    void readPersonalImport(file, metadata.maxPlaintextBytes).then(async (nextState) => {
+      await options.onReplaceState(nextState, async () => {
+        await persist(nextState, revision + 1);
+        currentState = nextState;
+        revision += 1;
+      });
+    }).catch((error: unknown) => { element('status').setAttribute('data-operation-error', ''); element('status').textContent = `Import rejected: ${error instanceof Error ? error.message : 'STATE_INVALID'}`; }).finally(() => { input.value = ''; });
   });
   element('forget-workspace').addEventListener('click', () => { if (workspaceId && window.confirm('Forget this local workspace after exporting anything you need?')) void store().forgetWorkspace(workspaceId).then(() => location.reload()); });
   element('leave-package').addEventListener('click', () => { location.href = 'about:blank'; });
@@ -165,7 +166,13 @@ const createSession = (options: SessionOptions): PersonalSession => {
       if (approval) await approve();
       else { element('runtime-panel').hidden = true; element('trust-panel').hidden = false; element<HTMLButtonElement>('approve-package').focus(); }
     },
-    stateChanged: async (state, nextRevision) => { currentState = structuredClone(state); revision = nextRevision; await persist(); }
+    stateChanged: async (state, nextRevision) => {
+      const candidate = structuredClone(state);
+      try { await persist(candidate, nextRevision); }
+      catch { element('status').setAttribute('data-operation-error', ''); element('status').textContent = 'Local save failed; change was not applied.'; throw new Error('LOCAL_COMMIT_FAILED'); }
+      currentState = candidate;
+      revision = nextRevision;
+    }
   });
 };
 

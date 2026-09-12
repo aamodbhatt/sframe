@@ -77,7 +77,7 @@ test.describe('Phase 2 automated accessibility checks across fixtures', () => {
     expect(iframeSemantics.headings).toContain('h2');
   });
 
-  test('verifies keyboard focusability and reduced motion styles', async ({page}) => {
+  test('allows keyboard focus after approval', async ({page}) => {
     await page.goto('/?personal=1', {waitUntil: 'commit'});
     await page.getByRole('button', {name: 'Open this exact version'}).click();
 

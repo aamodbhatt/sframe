@@ -437,7 +437,7 @@ const controllerReplacements = new Map([
 ]);
 // Replace build constants before Vite can fold architecture branches, then
 // bundle the actual shared protocol implementation rather than a copied verifier.
-for (const name of ['main', 'shared-runtime']) {
+for (const name of ['main', 'personal-runtime', 'shared-runtime']) {
   const result = await bundle({configFile: false, logLevel: 'silent', plugins: [{name: 'smallframe-build-constants',
     transform(code, id) {
       if (!id.endsWith('/apps/controller/src/main.ts')) return null;

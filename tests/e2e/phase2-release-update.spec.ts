@@ -27,7 +27,7 @@ test.describe('Phase 2 signed controller release pinning and safe update behavio
     await expect(page.locator('#build')).toContainText('Build');
   });
 
-  test('safe update banner appears when a new service worker waits and user can trigger update', async ({page}) => {
+  test('displays and dismisses the update banner without changing workspace state', async ({page}) => {
     await page.goto('/?personal=1', {waitUntil: 'commit'});
     await page.getByRole('button', {name: 'Open this exact version'}).click();
 

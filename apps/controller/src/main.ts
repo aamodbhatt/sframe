@@ -381,7 +381,7 @@ const commitLocalState = (state: Record<string, unknown>): void => {
   localRevision += 1;
   post('sf.controller.snapshot', {state: localState, role: executionRole(), online: navigator.onLine, revision: localRevision});
 };
-const replaceLocalState = async (state: Record<string, unknown>): Promise<void> => {
+const replaceLocalState = async (state: Record<string, unknown>, beforeCommit?: () => Promise<void>): Promise<void> => {
   if (stateMutationInFlight) throw new Error('STATE_BUSY');
   stateMutationInFlight = true;
   try {
@@ -391,6 +391,7 @@ const replaceLocalState = async (state: Record<string, unknown>): Promise<void> 
     }
     const result = await validateState(state);
     if (!result.valid) throw new Error(result.error);
+    await beforeCommit?.();
     commitLocalState(state);
   } finally {
     stateMutationInFlight = false;
@@ -435,11 +436,15 @@ const dispatchStateBatch = (message: RendererMessage): void => {
   stateMutationInFlight = true;
   void validateState(next).then(async (result) => {
     if (!result.valid) { rejectStateBatch(message.requestId, result.error, 'The proposed state violates the signed package schema.'); return; }
-    if (SHARED_MODE && personalSession) await personalSession.stateChanged(next, localRevision + 1);
+    if (personalSession) await personalSession.stateChanged(next, localRevision + 1);
     commitLocalState(next);
     post('sf.controller.result', {result: {requestId: message.requestId, kind: 'state', ok: true}});
-    if (!SHARED_MODE && personalSession) void personalSession.stateChanged(localState, localRevision).catch(() => { byId<HTMLElement>('status').textContent = 'Local save failed; export before leaving.'; });
   }).catch(() => rejectStateBatch(message.requestId, 'LOCAL_COMMIT_FAILED', 'Local commit failed.')).finally(() => { stateMutationInFlight = false; });
+};
+
+const reportRendered = (): void => {
+  const status = byId<HTMLElement>('status');
+  if (!status.hasAttribute('data-operation-error')) status.textContent = 'App Worker running; renderer accepted the declarative tree.';
 };
 
 const onPortMessage = (event: MessageEvent): void => {
@@ -497,7 +502,7 @@ const onPortMessage = (event: MessageEvent): void => {
   expectedPortSequence += 1;
   try {
   if (message.type === 'sf.renderer.rendered') {
-    byId<HTMLElement>('status').textContent = 'App Worker running; renderer accepted the declarative tree.';
+    reportRendered();
   } else if (message.type === 'sf.renderer.app-ready') {
     acceptedAppReadyGeneration = Number(message.generation) || acceptedAppReadyGeneration;
     const host = byId<HTMLElement>('app-host');
@@ -527,7 +532,10 @@ const onPortMessage = (event: MessageEvent): void => {
     host.dataset.workerLastReason = message.lastReason;
     if (typeof message.stopCode === 'string') host.dataset.workerStopCode = message.stopCode;
     else delete host.dataset.workerStopCode;
-    if (message.state === 'restarting') byId<HTMLElement>('status').textContent = `App Worker restarting after ${message.lastReason}.`;
+    if (message.state === 'restarting') {
+      byId<HTMLElement>('status').removeAttribute('data-operation-error');
+      byId<HTMLElement>('status').textContent = `App Worker restarting after ${message.lastReason}.`;
+    }
   } else if (message.type === 'sf.renderer.package-verified') {
     if (!personalSession) { terminateControllerChannel('PERSONAL_SESSION_MISSING', true); return; }
     const metadata = {packageDigest: message.packageDigest, artifactDigest: message.artifactDigest, publisherKeyId: message.publisherKeyId, publisherPublicKey: message.publisherPublicKey, publisherDisplayName: message.publisherDisplayName, appId: message.appId, appName: message.appName, appVersion: message.appVersion, description: message.description, capabilities: message.capabilities, publicTemplate: message.publicTemplate, stateSchema: message.stateSchema, maxPlaintextBytes: message.maxPlaintextBytes, declaredMode: message.declaredMode} as PersonalPackageMetadata;
@@ -579,9 +587,9 @@ const main = async (): Promise<void> => {
   } else if (PERSONAL_MODE) {
     const binary = atob(PHASE2_PACKAGE_BASE64);
     personalArchive = Uint8Array.from(binary, (character) => character.charCodeAt(0));
-    const runtime = (globalThis as typeof globalThis & {SmallframePersonalRuntime?: {createSession: (options: {archive: Uint8Array; role: 'viewer' | 'editor'; onApprove: (state: Record<string, unknown>, role: 'viewer' | 'editor') => void; onReplaceState: (state: Record<string, unknown>) => Promise<void>}) => PersonalSession}}).SmallframePersonalRuntime;
+    const runtime = (globalThis as typeof globalThis & {SmallframePersonalRuntime?: {createSession: (options: {archive: Uint8Array; role: 'viewer' | 'editor'; onApprove: (state: Record<string, unknown>, role: 'viewer' | 'editor') => void; onReplaceState: (state: Record<string, unknown>, beforeCommit?: () => Promise<void>) => Promise<void>}) => PersonalSession}}).SmallframePersonalRuntime;
     if (!runtime) throw new Error('PERSONAL_RUNTIME_MISSING');
-    personalSession = runtime.createSession({archive: personalArchive, role: PERSONAL_ROLE, onApprove: (state, role) => { localState = structuredClone(state); post('sf.controller.approval', {state: localState, role}); }, onReplaceState: async (state) => replaceLocalState(structuredClone(state))});
+    personalSession = runtime.createSession({archive: personalArchive, role: PERSONAL_ROLE, onApprove: (state, role) => { localState = structuredClone(state); post('sf.controller.approval', {state: localState, role}); }, onReplaceState: async (state, beforeCommit) => replaceLocalState(structuredClone(state), beforeCommit)});
   } else {
     byId<HTMLElement>('runtime-panel').hidden = false;
   }

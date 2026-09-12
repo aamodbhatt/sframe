@@ -63,14 +63,14 @@ test.describe('Phase 2 hostile-package, tampered-package, malformed-state, stora
     await expect(app.getByText('1 decisions')).toBeVisible();
   });
 
-  test('survives storage corruption gracefully with exports remaining functional', async ({page}) => {
+  test('exports workspace data and the executable package', async ({page}) => {
     await page.goto('/?personal=1', {waitUntil: 'commit'});
     await page.getByRole('button', {name: 'Open this exact version'}).click();
     const app = page.frameLocator('iframe');
     await expect(app.getByRole('button', {name: 'Add decision'})).toBeVisible();
     await app.getByRole('button', {name: 'Add decision'}).click();
 
-    // Verify exports work even if storage is forgotten or corrupted
+    // Verify both export actions produce the expected named downloads
     await page.getByRole('button', {name: 'Workspace'}).click();
     const exportPromise = page.waitForEvent('download');
     await page.getByRole('button', {name: 'Export readable JSON'}).click();
