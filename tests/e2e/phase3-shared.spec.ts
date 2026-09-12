@@ -408,6 +408,55 @@ test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
     await expect(page.locator('#connectivity')).toHaveText('Synced');
   });
 
+  for (const fault of ['duplicate', 'escaped-duplicate', 'unknown-field', 'revision-zero'] as const) {
+    test(`rejects a signed relay envelope with ${fault} before approval`, async ({page}) => {
+      const signed = await createSignedRoomDescriptor({publisherPrivateKey: publisherPriv, roomId: activeRoomId,
+        packageDigest: sharedFixture.packageDigest, publisherKeyId: sharedFixture.publisherKeyId,
+        writerPublicKey: await getPublicKeyAsync(writerPriv), capability: editorCap,
+        role: 'editor', expiresAt: activeExpiry});
+      const fragment = formatInviteFragment({descriptorJcsBytes: signed.jcsBytes, descriptorSignature: signed.signature,
+        roomKey, capability: editorCap, writerPrivateSeed: writerPriv});
+      const encrypted = await encryptSnapshot({roomKey, writerPrivateKey: writerPriv, roomId: activeRoomId,
+        appId: 'dev.example.decision-board', packageDigest: sharedFixture.packageDigest, stateEpoch: 0,
+        proposedRevision: fault === 'revision-zero' ? 0 : 1, previousEnvelopeDigest: encodeBase64Url(new Uint8Array(32)),
+        automergeBytes: new Uint8Array(readFileSync('target/phase1-wasm/phase3-genesis.bin'))});
+      let body = JSON.stringify(encrypted.envelope);
+      if (fault === 'duplicate') body = '{"version":1,' + body.slice(1);
+      if (fault === 'escaped-duplicate') body = '{"\\u0076ersion":1,' + body.slice(1);
+      if (fault === 'unknown-field') body = '{"ignored":true,' + body.slice(1);
+      await gotoInvite(page, `/r/${activeRoomId}`, fragment);
+      // The envelope is correctly signed; only the wire contract is malformed.
+      // Transfer ciphertext only, never room keys or decrypted content.
+      await page.evaluate((body) => {
+        const fetch = window.fetch;
+        (globalThis as any).restoreEnvelopeFault = () => { window.fetch = fetch; };
+        window.fetch = async (...args) => String(args[0]).endsWith('/state')
+          ? new Response(body, {headers: {'Content-Type': 'application/json'}}) : fetch(...args);
+      }, body);
+      await page.getByRole('button', {name: 'Open this exact version'}).click();
+      await expect(page.locator('#trust-description')).toHaveText('REMOTE_STATE_INVALID');
+      await expect(page.frameLocator('iframe').getByRole('button')).toHaveCount(0);
+      const empty = await page.evaluate(async () => {
+        const database = await new Promise<IDBDatabase>((resolve, reject) => {
+          const request = indexedDB.open('smallframe-shared-v1', 2);
+          request.onsuccess = () => resolve(request.result);
+          request.onerror = () => reject(new Error('TEST_DATABASE_OPEN_FAILED'));
+        });
+        const count = (name: string): Promise<number> => new Promise((resolve) => {
+          const request = database.transaction(name).objectStore(name).count();
+          request.onsuccess = () => resolve(request.result);
+        });
+        const counts = await Promise.all(['rooms', 'deviceKeys', 'approvals'].map(count));
+        database.close();
+        return counts.every((count) => count === 0);
+      });
+      expect(empty).toBe(true);
+      await page.evaluate(() => (globalThis as any).restoreEnvelopeFault());
+      await page.getByRole('button', {name: 'Open this exact version'}).click();
+      await expect(page.frameLocator('iframe').getByText('0 decisions')).toBeVisible();
+    });
+  }
+
   test('scrubs invite fragment synchronously, opens shared editor, edits state, and enforces viewer mode', async ({page, context}) => {
     const roomId = activeRoomId;
     const packageDigest = sharedFixture.packageDigest;

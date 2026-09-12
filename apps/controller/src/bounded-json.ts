@@ -1,3 +1,5 @@
+import {parseUniqueJson} from './strict-json.js';
+
 // Bound bytes before decoding/parsing; Content-Length is untrusted and optional.
 export const readBoundedJson = async (response: Response, maximumBytes: number, timeoutMs = 5000): Promise<unknown> => {
   let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
@@ -13,7 +15,7 @@ export const readBoundedJson = async (response: Response, maximumBytes: number, 
       let json = '';
       for (;;) {
         const {value, done} = await active.read();
-        if (done) return JSON.parse(json + decoder.decode());
+        if (done) return parseUniqueJson(json + decoder.decode());
         if (value.byteLength > maximumBytes - length) throw new Error();
         length += value.byteLength;
         json += decoder.decode(value, {stream: true});

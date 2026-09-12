@@ -1,7 +1,8 @@
 import {authenticateInvite, verifyInviteRelayContext} from '../../../packages/protocol/src/room-descriptor.js';
 import {validateReplicaMetadata, verifiedRelayEtag} from './replica-metadata.js';
 import {readBoundedJson} from './bounded-json.js';
-import {ENVELOPE_BODY_LIMIT, type WireEnvelope} from '../../../packages/protocol/src/crypto-envelope.js';
+import {validateWireEnvelope} from './wire-envelope.js';
+import {ENVELOPE_BODY_LIMIT} from '../../../packages/protocol/src/crypto-envelope.js';
 import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.js';
 
 (() => {
@@ -402,7 +403,7 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
         if (res.status === 200) {
           const contentType = res.headers.get('Content-Type') ?? '';
           if (contentType.includes('application/json')) {
-            const wireEnvelope = await readBoundedJson(res, ENVELOPE_BODY_LIMIT) as WireEnvelope;
+            const wireEnvelope = validateWireEnvelope(await readBoundedJson(res, ENVELOPE_BODY_LIMIT));
             const decrypted = await guardedRemote(async (active) => active.decrypt({
               roomKey: invite.roomKey,
               expectedWriterPublicKey: descriptor.writerPublicKey ? decodeBase64Url(descriptor.writerPublicKey) : undefined,
