@@ -1,3 +1,4 @@
+import {parseUniqueJson} from '../../../packages/protocol/src/strict-json.js';
 import {DurableObject, type DurableObjectState, type HibernatableWebSocket} from 'cloudflare:workers';
 import {
   CAPABILITY_RE,
@@ -224,7 +225,7 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
     const bounded = await readBoundedBody(request, 724_992);
     if (bounded.kind !== 'ok') return problem(400, 'BODY_INVALID');
     try {
-      const body = JSON.parse(new TextDecoder().decode(bounded.body));
+      const body = parseUniqueJson(new TextDecoder('utf-8', {fatal: true}).decode(bounded.body)) as Record<string, any>;
       const viewer = decodeFixed32(body.viewerCapHash);
       const editor = decodeFixed32(body.editorCapHash);
       const envelope = this.parsePutWireEnvelope(new TextEncoder().encode(JSON.stringify(body.envelope)));
@@ -628,9 +629,9 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
 
   private parsePutWireEnvelope(body: Uint8Array): WireEnvelope | null {
     try {
-      const text = new TextDecoder().decode(body);
+      const text = new TextDecoder('utf-8', {fatal: true}).decode(body);
       if (!text.trim().startsWith('{')) return null;
-      const parsed = JSON.parse(text);
+      const parsed = parseUniqueJson(text);
       if (this.validEnvelopeShape(parsed)) {
         return parsed as WireEnvelope;
       }

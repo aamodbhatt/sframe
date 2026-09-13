@@ -51,9 +51,13 @@ describe('SQLite Durable Object Phase 3 Protocol & Lifecycle', () => {
       roomId: room, appId: 'test.room', packageDigest: base64url(randomBytes(32)), stateEpoch: 0,
       proposedRevision: 1, previousEnvelopeDigest: base64url(new Uint8Array(32)), automergeBytes: Uint8Array.of(1, 2, 3)};
     const genesis = await encryptSnapshot(params);
-    const init = await fetch(`${apiOrigin}/__phase0/rooms/${room}/init-envelope`, {method: 'POST', body: JSON.stringify({
+    const bootstrapBody = JSON.stringify({
       viewerCapHash: capabilityHash(viewer), editorCapHash: capabilityHash(editor), expiresAtMs: Date.now() + 60_000, envelope: genesis.envelope
-    })});
+    });
+    const bootstrap = (body: string) => fetch(`${apiOrigin}/__phase0/rooms/${room}/init-envelope`, {method: 'POST', body});
+    expect((await bootstrap('{"expiresAtMs":1,' + bootstrapBody.slice(1))).status).toBe(400);
+    expect((await bootstrap(bootstrapBody.replace('"envelope":{', '"envelope":{"version":1,'))).status).toBe(400);
+    const init = await bootstrap(bootstrapBody);
     expect(init.status).toBe(201);
     const nextParams = {...params, proposedRevision: 2, previousEnvelopeDigest: base64url(genesis.envelopeDigest)};
     const next = await encryptSnapshot(nextParams);
@@ -64,6 +68,20 @@ describe('SQLite Durable Object Phase 3 Protocol & Lifecycle', () => {
     expect((await put({untrusted: true}, editor, 'application/octet-stream')).status).toBe(400);
     expect((await put({version: 1})).status).toBe(400);
     expect((await put(next.envelope, viewer)).status).toBe(403);
+    const putRaw = (body: string | Uint8Array) => fetch(`${apiOrigin}/v1/rooms/${room}/state`, {
+      method: 'PUT', headers: {Origin: CONTROLLER_ORIGIN, Authorization: authorization(editor),
+        'If-Match': genesis.etag, 'Content-Type': 'application/json'}, body
+    });
+    const serialized = JSON.stringify(next.envelope);
+    const ambiguous = [
+      '{"version":1,' + serialized.slice(1),
+      '{"\\u0076ersion":1,' + serialized.slice(1),
+      serialized.replace('"aad":{', '"aad":{"protocolVersion":1,'),
+      '{"ignored":' + '['.repeat(33) + '0' + ']'.repeat(33) + ',' + serialized.slice(1)
+    ];
+    for (const body of ambiguous) expect((await putRaw(body)).status).toBe(400);
+    const invalidUtf8 = new Uint8Array([123, 34, 255, 34, 58, 49, 125]);
+    expect((await putRaw(invalidUtf8)).status).toBe(400);
     const {revision, ...withoutRevision} = next.envelope;
     expect((await put({...withoutRevision, proposedRevision: revision})).status).toBe(400);
     expect((await put({...next.envelope, proposedRevision: revision})).status).toBe(400);

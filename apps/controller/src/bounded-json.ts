@@ -1,4 +1,4 @@
-import {parseUniqueJson} from './strict-json.js';
+import {parseUniqueJson} from '../../../packages/protocol/src/strict-json.js';
 
 // Bound bytes before decoding/parsing; Content-Length is untrusted and optional.
 export const readBoundedJson = async (response: Response, maximumBytes: number, timeoutMs = 5000): Promise<unknown> => {
