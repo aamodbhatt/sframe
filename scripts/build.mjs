@@ -232,7 +232,7 @@ const encryptSnapshot = async (params) => {
   const envelopeWithoutSig = {
     version: 1,
     stateEpoch: params.stateEpoch,
-    proposedRevision: params.proposedRevision,
+    revision: params.proposedRevision,
     envelopeSalt: encodeBase64Url(envelopeSalt),
     previousEnvelopeDigest: params.previousEnvelopeDigest,
     ciphertext: encodeBase64Url(ciphertextBytes),
@@ -254,7 +254,7 @@ const decryptSnapshot = async (params) => {
   if (envelope.aad.roomId !== params.roomId) throw new Error('ROOM_ID_AAD_MISMATCH');
   if (envelope.aad.packageDigest !== params.packageDigest) throw new Error('PACKAGE_DIGEST_AAD_MISMATCH');
   if (params.expectedAppId !== undefined && envelope.aad.appId !== params.expectedAppId) throw new Error('APP_ID_AAD_MISMATCH');
-  if (envelope.aad.stateEpoch !== envelope.stateEpoch || envelope.aad.proposedRevision !== envelope.proposedRevision) throw new Error('EPOCH_REVISION_AAD_MISMATCH');
+  if (envelope.aad.stateEpoch !== envelope.stateEpoch || envelope.aad.proposedRevision !== envelope.revision) throw new Error('EPOCH_REVISION_AAD_MISMATCH');
 
   const rawRoomId = decodeBase64Url(params.roomId);
   const rawPackageDigest = decodeBase64Url(params.packageDigest);
@@ -273,14 +273,14 @@ const decryptSnapshot = async (params) => {
   }
 
   const aadBytes = new TextEncoder().encode(canonicalize(envelope.aad));
-  const writeMessage = await computeWriteMessage(rawRoomId, rawPackageDigest, envelope.stateEpoch, envelope.proposedRevision, rawPreviousDigest, envelopeSalt, aadBytes, ciphertextBytes);
+  const writeMessage = await computeWriteMessage(rawRoomId, rawPackageDigest, envelope.stateEpoch, envelope.revision, rawPreviousDigest, envelopeSalt, aadBytes, ciphertextBytes);
   const validSig = await verifyAsync(writerSignature, writeMessage, writerPublicKey);
   if (!validSig) throw new Error('WRITER_SIGNATURE_INVALID');
 
   const unsignedEnvelope = {
     version: 1,
     stateEpoch: envelope.stateEpoch,
-    proposedRevision: envelope.proposedRevision,
+    revision: envelope.revision,
     envelopeSalt: envelope.envelopeSalt,
     previousEnvelopeDigest: envelope.previousEnvelopeDigest,
     ciphertext: envelope.ciphertext,
@@ -288,9 +288,9 @@ const decryptSnapshot = async (params) => {
     aad: envelope.aad
   };
   const envelopeDigest = await computeEnvelopeDigest(unsignedEnvelope, writerSignature);
-  const etag = computeEtag(envelope.stateEpoch, envelope.proposedRevision, envelopeDigest);
+  const etag = computeEtag(envelope.stateEpoch, envelope.revision, envelopeDigest);
 
-  const derivedKey = await deriveEnvelopeKey(params.roomKey, rawRoomId, envelopeSalt, envelope.stateEpoch, envelope.proposedRevision);
+  const derivedKey = await deriveEnvelopeKey(params.roomKey, rawRoomId, envelopeSalt, envelope.stateEpoch, envelope.revision);
   const nonce = new Uint8Array(12);
   const decryptedBuffer = await crypto.subtle.decrypt(
     {name: 'AES-GCM', iv: nonce, additionalData: aadBytes, tagLength: 128},

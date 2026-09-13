@@ -18,7 +18,7 @@ export type AadObject = {
 export type WireEnvelope = {
   version: 1;
   stateEpoch: number;
-  proposedRevision: number;
+  revision: number;
   envelopeSalt: string;
   previousEnvelopeDigest: string;
   ciphertext: string;
@@ -276,7 +276,7 @@ export const encryptSnapshot = async (params: {
   const envelopeWithoutSig = {
     version: 1 as const,
     stateEpoch: params.stateEpoch,
-    proposedRevision: params.proposedRevision,
+    revision: params.proposedRevision,
     envelopeSalt: encodeBase64Url(envelopeSalt),
     previousEnvelopeDigest: params.previousEnvelopeDigest,
     ciphertext: encodeBase64Url(ciphertextBytes),
@@ -312,7 +312,7 @@ export const decryptSnapshot = async (params: {
   if (envelope.aad.roomId !== params.roomId) throw new Error('ROOM_ID_AAD_MISMATCH');
   if (envelope.aad.packageDigest !== params.packageDigest) throw new Error('PACKAGE_DIGEST_AAD_MISMATCH');
   if (params.expectedAppId !== undefined && envelope.aad.appId !== params.expectedAppId) throw new Error('APP_ID_AAD_MISMATCH');
-  if (envelope.aad.stateEpoch !== envelope.stateEpoch || envelope.aad.proposedRevision !== envelope.proposedRevision) {
+  if (envelope.aad.stateEpoch !== envelope.stateEpoch || envelope.aad.proposedRevision !== envelope.revision) {
     throw new Error('EPOCH_REVISION_AAD_MISMATCH');
   }
 
@@ -345,7 +345,7 @@ export const decryptSnapshot = async (params: {
     rawRoomId,
     rawPackageDigest,
     envelope.stateEpoch,
-    envelope.proposedRevision,
+    envelope.revision,
     rawPreviousDigest,
     envelopeSalt,
     aadBytes,
@@ -360,7 +360,7 @@ export const decryptSnapshot = async (params: {
     rawRoomId,
     envelopeSalt,
     envelope.stateEpoch,
-    envelope.proposedRevision
+    envelope.revision
   );
 
   const nonce = new Uint8Array(12);
@@ -385,7 +385,7 @@ export const decryptSnapshot = async (params: {
   const envelopeWithoutSig = {
     version: 1,
     stateEpoch: envelope.stateEpoch,
-    proposedRevision: envelope.proposedRevision,
+    revision: envelope.revision,
     envelopeSalt: envelope.envelopeSalt,
     previousEnvelopeDigest: envelope.previousEnvelopeDigest,
     ciphertext: envelope.ciphertext,
@@ -393,7 +393,7 @@ export const decryptSnapshot = async (params: {
     aad: envelope.aad
   };
   const envelopeDigest = await computeEnvelopeDigest(envelopeWithoutSig, writerSignature);
-  const etag = computeEtag(envelope.stateEpoch, envelope.proposedRevision, envelopeDigest);
+  const etag = computeEtag(envelope.stateEpoch, envelope.revision, envelopeDigest);
 
   return {automergeBytes: unpaddedAutomerge, envelopeDigest, etag};
 };

@@ -1,5 +1,5 @@
 import {createHash, randomBytes} from 'node:crypto';
-import {encryptSnapshot} from '../packages/protocol/src/crypto-envelope.js';
+import {encryptSnapshot, computeEnvelopeDigest, computeEtag, decodeBase64Url} from '../packages/protocol/src/crypto-envelope.js';
 import {mkdir, mkdtemp, rm} from 'node:fs/promises';
 import {join, resolve} from 'node:path';
 import {Miniflare} from 'miniflare';
@@ -64,6 +64,25 @@ describe('SQLite Durable Object Phase 3 Protocol & Lifecycle', () => {
     expect((await put({untrusted: true}, editor, 'application/octet-stream')).status).toBe(400);
     expect((await put({version: 1})).status).toBe(400);
     expect((await put(next.envelope, viewer)).status).toBe(403);
+    const {revision, ...withoutRevision} = next.envelope;
+    expect((await put({...withoutRevision, proposedRevision: revision})).status).toBe(400);
+    expect((await put({...next.envelope, proposedRevision: revision})).status).toBe(400);
+    expect((await put({...next.envelope, aad: {...next.envelope.aad, proposedRevision: revision + 1}})).status).toBe(400);
+    const read = (etag = genesis.etag) => fetch(`${apiOrigin}/v1/rooms/${room}/state`, {
+      headers: {Origin: CONTROLLER_ORIGIN, Authorization: authorization(viewer), 'If-None-Match': etag}
+    });
+    expect((await read()).status).toBe(304);
+    // Simulate a pre-correction persisted head without rewriting its ciphertext.
+    const {writerSignature, revision: genesisRevision, ...genesisRest} = genesis.envelope;
+    const legacyDigest = await computeEnvelopeDigest({...genesisRest, proposedRevision: genesisRevision}, decodeBase64Url(writerSignature));
+    const storage = await miniflare.unsafeGetDurableObjectStorage(WORKER_NAME, DO_CLASS, {name: room});
+    await storage.exec('UPDATE room_state SET envelope_digest = ?, etag = ?', base64url(legacyDigest), computeEtag(0, 1, legacyDigest));
+    expect((await read(computeEtag(0, 1, legacyDigest))).status).toBe(409);
+    expect((await put(next.envelope)).status).toBe(409);
+    const retained = await storage.exec<{unchanged: number}>('SELECT (revision = 1 AND envelope_digest = ? AND envelope_salt = ?) AS unchanged FROM room_state', base64url(legacyDigest), genesis.envelope.envelopeSalt);
+    expect(retained).toEqual([{unchanged: 1}]);
+    // Restore only the test metadata and prove subsequent valid writes still work.
+    await storage.exec('UPDATE room_state SET envelope_digest = ?, etag = ?', base64url(genesis.envelopeDigest), genesis.etag);
     const forged = {...next.envelope, writerSignature: base64url(randomBytes(64))};
     expect((await put(forged)).status).toBe(400);
     const wrongWriter = await encryptSnapshot({...nextParams, writerPrivateKey: new Uint8Array(randomBytes(32))});

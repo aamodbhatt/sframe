@@ -408,7 +408,7 @@ test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
     await expect(page.locator('#connectivity')).toHaveText('Synced');
   });
 
-  for (const fault of ['duplicate', 'escaped-duplicate', 'unknown-field', 'revision-zero'] as const) {
+  for (const fault of ['duplicate', 'escaped-duplicate', 'unknown-field', 'revision-zero', 'legacy-revision', 'both-revisions'] as const) {
     test(`rejects a signed relay envelope with ${fault} before approval`, async ({page}) => {
       const signed = await createSignedRoomDescriptor({publisherPrivateKey: publisherPriv, roomId: activeRoomId,
         packageDigest: sharedFixture.packageDigest, publisherKeyId: sharedFixture.publisherKeyId,
@@ -424,6 +424,8 @@ test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
       if (fault === 'duplicate') body = '{"version":1,' + body.slice(1);
       if (fault === 'escaped-duplicate') body = '{"\\u0076ersion":1,' + body.slice(1);
       if (fault === 'unknown-field') body = '{"ignored":true,' + body.slice(1);
+      if (fault === 'legacy-revision') body = body.replace('"revision":', '"proposedRevision":');
+      if (fault === 'both-revisions') body = '{"proposedRevision":1,' + body.slice(1);
       await gotoInvite(page, `/r/${activeRoomId}`, fragment);
       // The envelope is correctly signed; only the wire contract is malformed.
       // Transfer ciphertext only, never room keys or decrypted content.
@@ -601,7 +603,7 @@ test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
     const parsed = JSON.parse(interceptedPutBody);
     expect(parsed.version).toBe(1);
     expect(parsed.stateEpoch).toBe(0);
-    expect(parsed.proposedRevision).toBe(2);
+    expect(parsed.revision).toBe(2);
     expect(typeof parsed.envelopeSalt).toBe('string');
     expect(typeof parsed.ciphertext).toBe('string');
     expect(typeof parsed.writerSignature).toBe('string');

@@ -585,20 +585,11 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
       'X-Smallframe-Revision': String(room.revision),
       'X-Smallframe-Envelope-Digest': room.envelope_digest,
     };
+    if (!await this.storedWireDigestMatches(room)) return problem(409, 'STORED_ENVELOPE_FORMAT_INVALID');
     if (request.headers.get('If-None-Match') === room.etag) return new Response(null, {status: 304, headers});
 
     if (room.aad_json) {
-      const wireEnvelope = {
-        version: 1,
-        stateEpoch: room.state_epoch,
-        proposedRevision: room.revision,
-        envelopeSalt: room.envelope_salt ?? '',
-        previousEnvelopeDigest: room.previous_envelope_digest ?? '',
-        ciphertext: encodeBase64Url(bytesFromSql(room.ciphertext)),
-        writerPublicKey: room.writer_public_key ? encodeBase64Url(bytesFromSql(room.writer_public_key)) : '',
-        writerSignature: room.writer_signature ? encodeBase64Url(bytesFromSql(room.writer_signature)) : '',
-        aad: JSON.parse(room.aad_json)
-      };
+      const wireEnvelope = this.storedWireEnvelope(room);
       return new Response(JSON.stringify(wireEnvelope), {
         headers: {...headers, 'Content-Type': 'application/json; charset=utf-8'}
       });
@@ -607,6 +598,32 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
     return new Response(room.ciphertext, {
       headers: {...headers, 'Content-Type': 'application/octet-stream'}
     });
+  }
+
+  private storedWireEnvelope(room: RoomRow): WireEnvelope {
+    return {
+      version: 1,
+      stateEpoch: room.state_epoch,
+      revision: room.revision,
+      envelopeSalt: room.envelope_salt ?? '',
+      previousEnvelopeDigest: room.previous_envelope_digest ?? '',
+      ciphertext: encodeBase64Url(bytesFromSql(room.ciphertext)),
+      writerPublicKey: room.writer_public_key ? encodeBase64Url(bytesFromSql(room.writer_public_key)) : '',
+      writerSignature: room.writer_signature ? encodeBase64Url(bytesFromSql(room.writer_signature)) : '',
+      aad: JSON.parse(room.aad_json!)
+    };
+  }
+
+  private async storedWireDigestMatches(room: RoomRow): Promise<boolean> {
+    if (!room.aad_json) return true;
+    try {
+      const {writerSignature, ...unsigned} = this.storedWireEnvelope(room);
+      const signature = decodeBase64Url(writerSignature, 64);
+      if (!signature) return false;
+      const digest = await computeEnvelopeDigest(unsigned, signature);
+      return encodeBase64Url(digest) === room.envelope_digest
+        && computeEtag(room.state_epoch, room.revision, digest) === room.etag;
+    } catch { return false; }
   }
 
   private parsePutWireEnvelope(body: Uint8Array): WireEnvelope | null {
@@ -623,9 +640,9 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
 
   private validEnvelopeShape(value: any): boolean {
     if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-    const keys = ['version', 'stateEpoch', 'proposedRevision', 'envelopeSalt', 'previousEnvelopeDigest', 'ciphertext', 'writerPublicKey', 'writerSignature', 'aad'];
+    const keys = ['version', 'stateEpoch', 'revision', 'envelopeSalt', 'previousEnvelopeDigest', 'ciphertext', 'writerPublicKey', 'writerSignature', 'aad'];
     if (Object.keys(value).sort().join() !== [...keys].sort().join() || value.version !== 1) return false;
-    if (![value.stateEpoch, value.proposedRevision].every((n) => Number.isSafeInteger(n) && n >= 0)) return false;
+    if (![value.stateEpoch, value.revision].every((n) => Number.isSafeInteger(n) && n >= 0)) return false;
     if (!keys.slice(3, 8).every((key) => typeof value[key] === 'string')) return false;
     const aad = value.aad;
     if (!aad || typeof aad !== 'object' || Array.isArray(aad)) return false;
@@ -638,10 +655,10 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
     if (wireEnvelope.version !== 1) return {ok: false as const, status: 400, code: 'ENVELOPE_VERSION_INVALID'};
     if (wireEnvelope.aad.roomId !== initialRoom.room_id) return {ok: false as const, status: 400, code: 'ROOM_ID_AAD_MISMATCH'};
     if (wireEnvelope.stateEpoch !== initialRoom.state_epoch) return {ok: false as const, status: 409, code: 'EPOCH_MISMATCH'};
-    if (wireEnvelope.proposedRevision !== initialRoom.revision + 1) return {ok: false as const, status: 409, code: 'REVISION_CONFLICT'};
+    if (wireEnvelope.revision !== initialRoom.revision + 1) return {ok: false as const, status: 409, code: 'REVISION_CONFLICT'};
     if (wireEnvelope.previousEnvelopeDigest !== initialRoom.envelope_digest) return {ok: false as const, status: 409, code: 'PREDECESSOR_MISMATCH'};
     const aad = wireEnvelope.aad;
-    if (aad.stateEpoch !== wireEnvelope.stateEpoch || aad.proposedRevision !== wireEnvelope.proposedRevision || aad.previousEnvelopeDigest !== wireEnvelope.previousEnvelopeDigest) {
+    if (aad.stateEpoch !== wireEnvelope.stateEpoch || aad.proposedRevision !== wireEnvelope.revision || aad.previousEnvelopeDigest !== wireEnvelope.previousEnvelopeDigest) {
       return {ok: false as const, status: 400, code: 'AAD_TUPLE_MISMATCH'};
     }
     if (initialRoom.aad_json) {
@@ -675,20 +692,20 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
 
     const aadBytes = new TextEncoder().encode(canonicalize(wireEnvelope.aad)!);
     const writeMessage = await computeWriteMessage(
-      rawRoomId, rawPackageDigest, wireEnvelope.stateEpoch, wireEnvelope.proposedRevision,
+      rawRoomId, rawPackageDigest, wireEnvelope.stateEpoch, wireEnvelope.revision,
       rawPrevDigest, saltBytes, aadBytes, cipherBytes
     );
     const validSig = await verifyAsync(writerSigBytes, writeMessage, writerPubBytes);
     if (!validSig) return {ok: false as const, status: 400, code: 'WRITER_SIGNATURE_INVALID'};
 
     const unsignedEnvelope = {
-      version: 1, stateEpoch: wireEnvelope.stateEpoch, proposedRevision: wireEnvelope.proposedRevision,
+      version: 1, stateEpoch: wireEnvelope.stateEpoch, revision: wireEnvelope.revision,
       envelopeSalt: wireEnvelope.envelopeSalt, previousEnvelopeDigest: wireEnvelope.previousEnvelopeDigest,
       ciphertext: wireEnvelope.ciphertext, writerPublicKey: wireEnvelope.writerPublicKey, aad: wireEnvelope.aad
     };
     const envelopeDigestBytes = await computeEnvelopeDigest(unsignedEnvelope, writerSigBytes);
     const envelopeDigest = encodeBase64Url(envelopeDigestBytes);
-    const etag = computeEtag(wireEnvelope.stateEpoch, wireEnvelope.proposedRevision, envelopeDigestBytes);
+    const etag = computeEtag(wireEnvelope.stateEpoch, wireEnvelope.revision, envelopeDigestBytes);
 
     return {ok: true as const, writerPubBytes, writerSigBytes, cipherBytes, envelopeDigest, etag};
   }
@@ -711,7 +728,7 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
              previous_envelope_digest = ?, writer_public_key = ?, writer_signature = ?,
              envelope_salt = ?, aad_json = ?
          WHERE singleton = 1 AND room_id = ? AND etag = ?`,
-        wireEnvelope.proposedRevision,
+        wireEnvelope.revision,
         verified.envelopeDigest,
         exactArrayBuffer(verified.cipherBytes),
         verified.etag,
@@ -723,7 +740,7 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
         current.room_id,
         current.etag,
       ).toArray();
-      return {epoch: current.state_epoch, revision: wireEnvelope.proposedRevision, digest: verified.envelopeDigest, etag: verified.etag};
+      return {epoch: current.state_epoch, revision: wireEnvelope.revision, digest: verified.envelopeDigest, etag: verified.etag};
     });
   }
 
@@ -753,6 +770,7 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
     if (!await this.authorize(request, initialRoom, true)) return problem(403, 'ROOM_AUTH_INVALID');
     if (initialRoom.recovery_status === 'RECOVERY_REQUIRED') return problem(503, 'RECOVERY_REQUIRED');
 
+    if (!await this.storedWireDigestMatches(initialRoom)) return problem(409, 'STORED_ENVELOPE_FORMAT_INVALID');
     const ifMatch = request.headers.get('If-Match');
     if (!ifMatch) return problem(428, 'IF_MATCH_REQUIRED');
 

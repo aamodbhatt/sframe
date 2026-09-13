@@ -3,7 +3,7 @@ import {validateWireEnvelope} from './wire-envelope.js';
 
 // Synthetic public wire fields only; these are not encrypted room contents.
 const binary = (bytes: number) => 'A'.repeat(Math.ceil(bytes * 4 / 3));
-const valid = () => ({version: 1, stateEpoch: 0, proposedRevision: 1, envelopeSalt: binary(16),
+const valid = () => ({version: 1, stateEpoch: 0, revision: 1, envelopeSalt: binary(16),
   previousEnvelopeDigest: binary(32), ciphertext: binary(16), writerPublicKey: binary(32), writerSignature: binary(64),
   aad: {protocolVersion: 1, appId: 'test.example', roomId: binary(16), packageDigest: binary(32),
     stateEpoch: 0, proposedRevision: 1, previousEnvelopeDigest: binary(32)}});
@@ -22,7 +22,7 @@ describe('strict incoming envelope shape', () => {
   });
   const invalid: [string, unknown][] = [
     ['version', 2], ['stateEpoch', -1], ['stateEpoch', 17], ['stateEpoch', 0.5],
-    ['proposedRevision', 0], ['proposedRevision', '1'], ['proposedRevision', Number.MAX_SAFE_INTEGER + 1],
+    ['revision', 0], ['revision', '1'], ['revision', Number.MAX_SAFE_INTEGER + 1],
     ['envelopeSalt', binary(15)], ['envelopeSalt', binary(16) + '='],
     ['previousEnvelopeDigest', binary(31)], ['writerPublicKey', binary(33)],
     ['writerSignature', binary(64).slice(0, -1) + 'B'], ['ciphertext', binary(16).slice(0, -1) + 'B'],
@@ -39,6 +39,17 @@ describe('strict incoming envelope shape', () => {
     const bad: Record<string, unknown> = {protocolVersion: 2, stateEpoch: 1, proposedRevision: 2,
       previousEnvelopeDigest: 'B'.repeat(43), roomId: 'bad', packageDigest: 'bad', appId: ''};
     expect(() => validateWireEnvelope({...envelope, aad: {...envelope.aad, [field]: bad[field]}})).toThrow('REMOTE_STATE_INVALID');
+  });
+  it.each(['legacy', 'both'])('rejects %s outer revision names', (kind) => {
+    const envelope: any = valid();
+    envelope.proposedRevision = envelope.revision;
+    if (kind === 'legacy') delete envelope.revision;
+    expect(() => validateWireEnvelope(envelope)).toThrow('REMOTE_STATE_INVALID');
+  });
+  it('rejects an app ID shorter than the schema minimum', () => {
+    const envelope = valid();
+    envelope.aad.appId = 'ab';
+    expect(() => validateWireEnvelope(envelope)).toThrow('REMOTE_STATE_INVALID');
   });
   it('accepts the maximum ciphertext length and recovery epoch bound', () => {
     const envelope = valid();

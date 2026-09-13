@@ -418,13 +418,13 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
             let candidate = {bytes: decrypted.automergeBytes, projectedState: decrypted.projectedState};
             if (localDocBytes) {
               if (wireEnvelope.stateEpoch !== currentEpoch) throw new Error('RECOVERY_TRANSITION_REQUIRED');
-              if (wireEnvelope.proposedRevision < currentRevision) throw new Error('REMOTE_ROLLBACK');
-              if (wireEnvelope.proposedRevision === currentRevision && decrypted.envelopeDigest !== currentDigest) throw new Error('REMOTE_EQUIVOCATION');
-              if (wireEnvelope.proposedRevision === currentRevision + 1 && wireEnvelope.previousEnvelopeDigest !== currentDigest) throw new Error('PREDECESSOR_MISMATCH');
+              if (wireEnvelope.revision < currentRevision) throw new Error('REMOTE_ROLLBACK');
+              if (wireEnvelope.revision === currentRevision && decrypted.envelopeDigest !== currentDigest) throw new Error('REMOTE_EQUIVOCATION');
+              if (wireEnvelope.revision === currentRevision + 1 && wireEnvelope.previousEnvelopeDigest !== currentDigest) throw new Error('PREDECESSOR_MISMATCH');
               candidate = await guardedRemote(async (active) => active.merge(localDocBytes!, decrypted.automergeBytes, stableJson(metadata!.stateSchema), metadata!.maxPlaintextBytes));
             }
 
-            const tuple: RevisionTuple = {stateEpoch: wireEnvelope.stateEpoch, revision: wireEnvelope.proposedRevision,
+            const tuple: RevisionTuple = {stateEpoch: wireEnvelope.stateEpoch, revision: wireEnvelope.revision,
               envelopeDigest: decrypted.envelopeDigest, etag: verifiedRelayEtag(res.headers.get('ETag'), decrypted.etag)};
             // Commit the complete candidate before exposing it or advancing lineage.
             await persistRoom(dirty, candidate.projectedState, candidate.bytes, undefined, tuple);

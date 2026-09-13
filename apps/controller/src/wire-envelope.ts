@@ -15,7 +15,7 @@ const canonicalBinary = (value: unknown, minimum: number, maximum = minimum): bo
 };
 
 export const validateWireEnvelope = (value: unknown): WireEnvelope => {
-  if (!exactRecord(value, ['version', 'stateEpoch', 'proposedRevision', 'envelopeSalt',
+  if (!exactRecord(value, ['version', 'stateEpoch', 'revision', 'envelopeSalt',
     'previousEnvelopeDigest', 'ciphertext', 'writerPublicKey', 'writerSignature', 'aad'])) throw new Error('REMOTE_STATE_INVALID');
   const aad = value.aad;
   if (!exactRecord(aad, ['protocolVersion', 'appId', 'roomId', 'packageDigest',
@@ -27,10 +27,10 @@ export const validateWireEnvelope = (value: unknown): WireEnvelope => {
 
 const validateContext = (value: Record<string, unknown>, aad: Record<string, unknown>): void => {
   if (value.version !== 1 || aad.protocolVersion !== 1 || !integer(value.stateEpoch, 0, 16)
-    || !integer(value.proposedRevision, 1, Number.MAX_SAFE_INTEGER)
-    || value.stateEpoch !== aad.stateEpoch || value.proposedRevision !== aad.proposedRevision
+    || !integer(value.revision, 1, Number.MAX_SAFE_INTEGER)
+    || value.stateEpoch !== aad.stateEpoch || value.revision !== aad.proposedRevision
     || value.previousEnvelopeDigest !== aad.previousEnvelopeDigest
-    || typeof aad.appId !== 'string' || aad.appId.length < 1 || aad.appId.length > 128) throw new Error('REMOTE_STATE_INVALID');
+    || typeof aad.appId !== 'string' || aad.appId.length < 3 || aad.appId.length > 128) throw new Error('REMOTE_STATE_INVALID');
 };
 const validateBinary = (value: Record<string, unknown>, aad: Record<string, unknown>): void => {
   if (!canonicalBinary(value.envelopeSalt, 16) || !canonicalBinary(value.previousEnvelopeDigest, 32)

@@ -1,3 +1,5 @@
+import Ajv2020 from 'ajv/dist/2020.js';
+import {readFileSync} from 'node:fs';
 import {describe, expect, it} from 'vitest';
 import {getPublicKeyAsync} from '@noble/ed25519';
 import {
@@ -80,7 +82,14 @@ describe('Phase 3 Cryptographic Envelope & Room Descriptors', () => {
 
     expect(envelope.version).toBe(1);
     expect(envelope.stateEpoch).toBe(0);
-    expect(envelope.proposedRevision).toBe(1);
+    expect(envelope.revision).toBe(1);
+    expect(Object.hasOwn(envelope, 'proposedRevision')).toBe(false);
+    expect(envelope.aad.proposedRevision).toBe(1);
+    const schema = JSON.parse(readFileSync('packages/protocol/schemas/state-envelope-v1.json', 'utf8'));
+    expect(new Ajv2020({strict: true}).compile(schema)(envelope)).toBe(true);
+    const {writerSignature, revision, ...rest} = envelope;
+    const legacyDigest = await computeEnvelopeDigest({...rest, proposedRevision: revision}, decodeBase64Url(writerSignature));
+    expect(encodeBase64Url(legacyDigest) === encodeBase64Url(envelopeDigest)).toBe(false);
     expect(envelope.writerPublicKey).toBe(encodeBase64Url(writerPub));
     expect(etag).toMatch(/^"sf1\.0\.1\.[A-Za-z0-9_-]+"$/);
 
