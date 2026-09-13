@@ -90,3 +90,57 @@ test('personal imports reject oversized files before reading and hide parser dia
   await app.getByRole('button', {name: 'Add decision'}).click();
   await expect(app.getByText('1 decisions')).toBeVisible();
 });
+
+for (const failure of ['abort', 'throw'] as const) {
+  test(`initial personal approval is atomic on ${failure}`, async ({page}) => {
+    await page.goto('/?personal=1', {waitUntil: 'commit'});
+    await expect(page.getByRole('button', {name: 'Open this exact version'})).toBeVisible();
+    await page.evaluate((failure) => {
+      const put = IDBObjectStore.prototype.put;
+      IDBObjectStore.prototype.put = function(value, key) {
+        if (this.name === 'approvals') {
+          IDBObjectStore.prototype.put = put;
+          if (failure === 'throw') throw new Error('TEST_APPROVAL_WRITE_FAILED');
+          this.transaction.abort();
+        }
+        return key === undefined ? put.call(this, value) : put.call(this, value, key);
+      };
+    }, failure);
+    await page.getByRole('button', {name: 'Open this exact version'}).click();
+    await expect(page.locator('#trust-description')).toHaveText('LOCAL_COMMIT_FAILED');
+    await expect(page.frameLocator('iframe').getByRole('button')).toHaveCount(0);
+    expect(await page.evaluate(async () => {
+      const database = await new Promise<IDBDatabase>((resolve, reject) => {
+        const request = indexedDB.open('smallframe-personal-v1', 1);
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(new Error('TEST_DATABASE_OPEN_FAILED'));
+      });
+      const counts = await Promise.all(['workspaces', 'approvals'].map((name) => new Promise<number>((resolve) => {
+        const request = database.transaction(name).objectStore(name).count();
+        request.onsuccess = () => resolve(request.result);
+      })));
+      database.close();
+      return counts.every((count) => count === 0);
+    })).toBe(true);
+    await page.getByRole('button', {name: 'Open this exact version'}).click();
+    await expect(page.frameLocator('iframe').getByText('0 decisions')).toBeVisible();
+    await page.reload({waitUntil: 'commit'});
+    await expect(page.frameLocator('iframe').getByText('0 decisions')).toBeVisible();
+  });
+}
+
+test('a stale personal review cannot overwrite a workspace initialized by another tab', async ({page, context}) => {
+  await page.goto('/?personal=1', {waitUntil: 'commit'});
+  await expect(page.getByRole('button', {name: 'Open this exact version'})).toBeVisible();
+  const stale = await context.newPage();
+  await stale.goto('/?personal=1', {waitUntil: 'commit'});
+  await expect(stale.getByRole('button', {name: 'Open this exact version'})).toBeVisible();
+  await page.getByRole('button', {name: 'Open this exact version'}).click();
+  await page.frameLocator('iframe').getByRole('button', {name: 'Add decision'}).click();
+  await expect(page.frameLocator('iframe').getByText('1 decisions')).toBeVisible();
+  await stale.getByRole('button', {name: 'Open this exact version'}).click();
+  await expect(stale.locator('#trust-description')).toHaveText('LOCAL_COMMIT_FAILED');
+  await expect(stale.frameLocator('iframe').getByRole('button')).toHaveCount(0);
+  await stale.reload({waitUntil: 'commit'});
+  await expect(stale.frameLocator('iframe').getByText('1 decisions')).toBeVisible();
+});

@@ -1,6 +1,9 @@
 import {readPersonalImport} from './personal-import.js';
 
+type PersonalApproval = {approvalId: string; packageDigest: string; publisherKeyId: string; capabilityHash: string; approvedAt: number};
+type PersonalWorkspace = {workspaceId: string; packageDigest: string; buildId?: string; releaseDigest?: string; state: Record<string, unknown>; revision: number; updatedAt: number};
 type PersonalStoreApi = {
+  initializeWorkspace: (workspace: PersonalWorkspace, approval?: PersonalApproval) => Promise<void>;
   workspaceIdFor: (packageDigest: string) => Promise<string>;
   loadWorkspace: (workspaceId: string) => Promise<{workspaceId: string; packageDigest: string; buildId?: string; releaseDigest?: string; state: Record<string, unknown>; revision: number; updatedAt: number} | undefined>;
   saveWorkspace: (workspace: {workspaceId: string; packageDigest: string; buildId?: string; releaseDigest?: string; state: Record<string, unknown>; revision: number; updatedAt: number}) => Promise<void>;
@@ -49,6 +52,7 @@ const createSession = (options: SessionOptions): PersonalSession => {
   let workspaceId = '';
   let currentState: Record<string, unknown> = {};
   let revision = 0;
+  let hasDurableWorkspace = false;
   let currentBuildId = '';
   const menu = element<HTMLButtonElement>('chrome-menu');
   const actions = element<HTMLElement>('workspace-actions');
@@ -95,7 +99,14 @@ const createSession = (options: SessionOptions): PersonalSession => {
   const approve = async (): Promise<void> => {
     if (!metadata) throw new Error('PERSONAL_APPROVAL_NOT_READY');
     const hash = await capabilityHash(metadata.capabilities);
-    if ((element<HTMLInputElement>('remember-approval')).checked) await store().saveApproval({approvalId: `${workspaceId}:${metadata.packageDigest}:${metadata.publisherKeyId}:${hash}`, packageDigest: metadata.packageDigest, publisherKeyId: metadata.publisherKeyId, capabilityHash: hash, approvedAt: Date.now()});
+    const approval = element<HTMLInputElement>('remember-approval').checked
+      ? {approvalId: `${workspaceId}:${metadata.packageDigest}:${metadata.publisherKeyId}:${hash}`, packageDigest: metadata.packageDigest,
+        publisherKeyId: metadata.publisherKeyId, capabilityHash: hash, approvedAt: Date.now()} : undefined;
+    if (!hasDurableWorkspace) {
+      await store().initializeWorkspace({workspaceId, packageDigest: metadata.packageDigest, buildId: currentBuildId,
+        state: structuredClone(currentState), revision, updatedAt: Date.now()}, approval);
+      hasDurableWorkspace = true;
+    } else if (approval) await store().saveApproval(approval);
     element('trust-panel').hidden = true;
     element('runtime-panel').hidden = false;
     options.onApprove(structuredClone(currentState), options.role);
@@ -146,6 +157,7 @@ const createSession = (options: SessionOptions): PersonalSession => {
       metadata = verified;
       workspaceId = await store().workspaceIdFor(verified.packageDigest);
       const saved = await store().loadWorkspace(workspaceId);
+      hasDurableWorkspace = saved?.packageDigest === verified.packageDigest;
       currentState = saved?.packageDigest === verified.packageDigest ? structuredClone(saved.state) : structuredClone(verified.publicTemplate);
       revision = saved?.packageDigest === verified.packageDigest ? saved.revision : 0;
       element('app-title').textContent = verified.appName;

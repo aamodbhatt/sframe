@@ -1,7 +1,7 @@
 type StoredWorkspace = {workspaceId: string; packageDigest: string; buildId?: string; releaseDigest?: string; state: Record<string, unknown>; revision: number; updatedAt: number};
 type StoredApproval = {approvalId: string; packageDigest: string; publisherKeyId: string; capabilityHash: string; approvedAt: number};
 type StoredPointer = {packageDigest: string; workspaceId: string};
-type StoreApi = {workspaceIdFor: (packageDigest: string) => Promise<string>; loadWorkspace: (workspaceId: string) => Promise<StoredWorkspace | undefined>; saveWorkspace: (workspace: StoredWorkspace) => Promise<void>; forgetWorkspace: (workspaceId: string) => Promise<void>; loadApproval: (approvalId: string) => Promise<StoredApproval | undefined>; saveApproval: (approval: StoredApproval) => Promise<void>};
+type StoreApi = {workspaceIdFor: (packageDigest: string) => Promise<string>; loadWorkspace: (workspaceId: string) => Promise<StoredWorkspace | undefined>; saveWorkspace: (workspace: StoredWorkspace) => Promise<void>; initializeWorkspace: (workspace: StoredWorkspace, approval?: StoredApproval) => Promise<void>; forgetWorkspace: (workspaceId: string) => Promise<void>; loadApproval: (approvalId: string) => Promise<StoredApproval | undefined>; saveApproval: (approval: StoredApproval) => Promise<void>};
 
 const openDatabase = async (): Promise<IDBDatabase> => await new Promise((resolve, reject) => {
   const request = indexedDB.open('smallframe-personal-v1', 1);
@@ -42,6 +42,27 @@ const writeRecord = async (storeName: string, value: unknown): Promise<void> => 
   } finally { database.close(); }
 };
 
+const initializeWorkspace = async (workspace: StoredWorkspace, approval?: StoredApproval): Promise<void> => {
+  if (approval && approval.packageDigest !== workspace.packageDigest) throw new Error('LOCAL_APPROVAL_CONTEXT_INVALID');
+  const database = await openDatabase();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const transaction = database.transaction(['workspaces', 'approvals'], 'readwrite');
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(new Error('LOCAL_COMMIT_FAILED'));
+      transaction.onabort = () => reject(new Error('LOCAL_COMMIT_FAILED'));
+      try {
+        // A stale review tab must not replace a workspace created elsewhere.
+        transaction.objectStore('workspaces').add(workspace);
+        if (approval) transaction.objectStore('approvals').put(approval);
+      } catch {
+        try { transaction.abort(); } catch { /* Already aborted. */ }
+        reject(new Error('LOCAL_COMMIT_FAILED'));
+      }
+    });
+  } finally { database.close(); }
+};
+
 const deleteRecord = async (storeName: string, key: string): Promise<void> => {
   const database = await openDatabase();
   try {
@@ -56,6 +77,7 @@ const deleteRecord = async (storeName: string, key: string): Promise<void> => {
 };
 
 const api: StoreApi = Object.freeze({
+  initializeWorkspace,
   workspaceIdFor: async (packageDigest) => {
     const existing = await readRecord<StoredPointer>('pointers', packageDigest);
     if (existing) return existing.workspaceId;
