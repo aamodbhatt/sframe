@@ -43,6 +43,34 @@ const initializeRoom = async (
 );
 
 describe('SQLite Durable Object Phase 3 Protocol & Lifecycle', () => {
+  it('rejects a stalled encrypted upload without advancing the head and permits a valid retry', async () => {
+    const room = base64url(randomBytes(16));
+    const viewer = base64url(randomBytes(32));
+    const editor = base64url(randomBytes(32));
+    const params = {roomKey: new Uint8Array(randomBytes(32)), writerPrivateKey: new Uint8Array(randomBytes(32)),
+      roomId: room, appId: 'test.room', packageDigest: base64url(randomBytes(32)), stateEpoch: 0,
+      proposedRevision: 1, previousEnvelopeDigest: base64url(new Uint8Array(32)), automergeBytes: Uint8Array.of(1)};
+    const genesis = await encryptSnapshot(params);
+    const init = await fetch(`${apiOrigin}/__phase0/rooms/${room}/init-envelope`, {method: 'POST', body: JSON.stringify({
+      viewerCapHash: capabilityHash(viewer), editorCapHash: capabilityHash(editor),
+      expiresAtMs: Date.now() + 60_000, envelope: genesis.envelope
+    })});
+    expect(init.status).toBe(201);
+    const endpoint = `${apiOrigin}/v1/rooms/${room}/state`;
+    const headers = {Origin: CONTROLLER_ORIGIN, Authorization: authorization(editor),
+      'If-Match': genesis.etag, 'Content-Type': 'application/json'};
+    const abort = new AbortController();
+    try {
+      const body = new ReadableStream<Uint8Array>({start(controller) { controller.enqueue(Uint8Array.of(123)); }});
+      const stalled = await fetch(endpoint, {method: 'PUT', headers, body, duplex: 'half', signal: abort.signal} as RequestInit);
+      expect(stalled.status).toBe(400);
+      expect((await stalled.json() as {title: string}).title).toBe('BODY_INVALID');
+    } finally { abort.abort(); }
+    const retained = await fetch(endpoint, {headers: {Origin: CONTROLLER_ORIGIN, Authorization: authorization(viewer), 'If-None-Match': genesis.etag}});
+    expect(retained.status).toBe(304);
+    const next = await encryptSnapshot({...params, proposedRevision: 2, previousEnvelopeDigest: base64url(genesis.envelopeDigest)});
+    expect((await fetch(endpoint, {method: 'PUT', headers, body: JSON.stringify(next.envelope)})).status).toBe(204);
+  }, 15_000);
   it('pins encrypted genesis and rejects raw downgrade, wrong writer/package, viewer writes, forged signatures and legacy recovery', async () => {
     const room = base64url(randomBytes(16));
     const viewer = base64url(randomBytes(32));

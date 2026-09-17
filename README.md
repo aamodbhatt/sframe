@@ -52,7 +52,7 @@ This is a product and security hypothesis, not a validated market claim.
 | Package trust and execution | Native/Wasm signature verification, digest pinning, response-CSP sandbox, private channel, watchdog and hostile fixtures | Broader adversarial coverage and independent review |
 | Personal workspaces | Approval, local edits, import/export, offline reopen; persistence before acknowledgement; atomic first approval and concurrent workspace identity creation | Coordination between active editing tabs, update/write races and restored revision handling |
 | Shared rooms | Signed encrypted genesis, authenticated invitations, real SQLite Durable Object relay under Miniflare, concurrent offline edits, CAS sync and viewer enforcement | Signed recovery, history-gap disclosure, complete device forgetting, viewer persistence and actor sequence validation |
-| Parsing and durability | Bounded incoming state, strict UTF-8/duplicate-key checks, schema/document limits, atomic editor consent and durable remote/acknowledgement promotion | Relay request-body deadlines, complete hard-limit/conflict/fuzz matrix |
+| Parsing and durability | Bounded incoming state, relay upload deadlines, strict UTF-8/duplicate-key checks, schema/document limits, atomic editor consent and durable remote/acknowledgement promotion | Complete hard-limit/conflict/fuzz matrix |
 | Release readiness | Pinned tools, automated gates and three-browser tests | Restore the 2 MiB renderer budget, release artifact notices, operational evidence and external validation |
 
 The shared-room bootstrap and publisher signer are explicitly test-only. The tests run the actual relay implementation locally; they do not demonstrate deployed Cloudflare behavior or production publisher onboarding.
@@ -71,7 +71,9 @@ As reviewed on **2026-09-17**, checkpoint [`6dae574`](https://github.com/aamodbh
 
 Its [GitHub CI run](https://github.com/aamodbhatt/sframe/actions/runs/34751897118) finished with **167 browser passes and one Firefox navigation timeout**; earlier gates passed. The preceding [wire-format](https://github.com/aamodbhatt/sframe/actions/runs/34751305832) and [strict relay JSON](https://github.com/aamodbhatt/sframe/actions/runs/34751588638) checkpoints have successful CI. The intermittent navigation cause remains unresolved. See [current CI](https://github.com/aamodbhatt/sframe/actions/workflows/ci.yml) for subsequent results; these are dated observations, not a permanent green-status claim.
 
-The subsequent workspace-pointer and Apache-2.0 checkpoint passed all nine gates locally, confirmed on **2026-09-18**: **227 unit/integration, 30 Rust and 177 browser tests**. Concurrent opens select one durable workspace identity; aborted or throwing pointer writes reject and permit retry. This does not resolve the earlier CI navigation cause.
+The subsequent workspace-pointer and Apache-2.0 checkpoint passed all nine gates locally, confirmed on **2026-09-18**: **227 unit/integration, 30 Rust and 177 browser tests**. Concurrent opens select one durable workspace identity; aborted or throwing pointer writes reject and permit retry.
+
+The relay upload deadline repair also passed all nine gates on **2026-09-18**: **246 unit/integration, 30 Rust and 177 browser tests**. A stalled upload is rejected after one five-second deadline, cancellation cannot prolong the wait, and an actual encrypted-relay regression checks that the head stays unchanged and a valid retry succeeds. Neither checkpoint establishes a cause for the earlier CI navigation timeout.
 
 Run the complete checkpoint gates:
 
@@ -93,7 +95,7 @@ Tests cover malformed packages/envelopes, signature/context substitution, aborte
 
 Codex is used to inspect existing code and CI, reproduce failures, implement bounded repairs, add adversarial regressions and run the verification gates before checkpoints. Examples include fixing persistence-before-acknowledgement ordering, reconciling the signed wire schema and testing atomic approval under aborted IndexedDB transactions. The project runtime and app contract have no AI/model dependency.
 
-The next engineering priorities are reliable CI navigation, relay body-read deadlines, persistent missed-history warnings, signed recovery, complete local secret deletion and remaining replica/multi-tab correctness. Production publishing and release readiness follow those foundations. These are open work items, not completed phases.
+The next engineering priorities are reliable CI navigation, persistent missed-history warnings, signed recovery, complete local secret deletion and remaining replica/multi-tab correctness. Production publishing and release readiness follow those foundations. These are open work items, not completed phases.
 
 ## Quick start
 

@@ -1,3 +1,4 @@
+import {readBoundedBody} from './bounded-body.js';
 import {parseUniqueJson} from '../../../packages/protocol/src/strict-json.js';
 import {DurableObject, type DurableObjectState, type HibernatableWebSocket} from 'cloudflare:workers';
 import {
@@ -102,45 +103,6 @@ const parseRoomRoute = (pathname: string): {roomId: string; action: 'meta' | 'st
 const bytesFromSql = (value: ArrayBuffer): Uint8Array => new Uint8Array(value);
 
 const asSafeInteger = (value: number): number | null => Number.isSafeInteger(value) ? value : null;
-
-type BoundedBodyResult =
-  | {kind: 'ok'; body: Uint8Array}
-  | {kind: 'too-large'}
-  | {kind: 'invalid'};
-
-const readBoundedBody = async (request: Request, maximumBytes: number): Promise<BoundedBodyResult> => {
-  if (!request.body) return {kind: 'ok', body: new Uint8Array()};
-  let reader: ReadableStreamDefaultReader<Uint8Array>;
-  try {
-    reader = request.body.getReader();
-  } catch {
-    return {kind: 'invalid'};
-  }
-  const buffer = new Uint8Array(maximumBytes + 1);
-  let length = 0;
-  try {
-    while (true) {
-      const result = await reader.read();
-      if (result.done) return {kind: 'ok', body: buffer.slice(0, length)};
-      const chunk = result.value;
-      if (!(chunk instanceof Uint8Array)) return {kind: 'invalid'};
-      if (chunk.byteLength > maximumBytes - length) {
-        try {
-          await reader.cancel('STATE_TOO_LARGE');
-        } catch {
-          // A disconnected sender is still an oversized request.
-        }
-        return {kind: 'too-large'};
-      }
-      buffer.set(chunk, length);
-      length += chunk.byteLength;
-    }
-  } catch {
-    return {kind: 'invalid'};
-  } finally {
-    reader.releaseLock();
-  }
-};
 
 export class RoomDurableObject extends DurableObject<RoomEnvironment> {
   private readonly controllerOrigin: string;
