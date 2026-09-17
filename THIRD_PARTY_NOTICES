@@ -1,0 +1,53 @@
+Smallframe third-party dependency notes
+Reviewed: 2026-09-17
+
+Scope
+-----
+The root Apache-2.0 license applies to Smallframe's original work, not to
+third-party dependencies. This review inspected package-lock.json license
+fields, cargo metadata --locked for the locked Rust graph, tracked source
+notices and Git authorship. It is a metadata/source-notice review, not an
+independent legal opinion or proof of ownership of every contribution.
+
+No vendored third-party binaries were found among tracked repository files.
+Generated artifacts, installed dependencies and downloaded toolchains are
+excluded from Git and may contain third-party code and required notices.
+
+JavaScript and local tooling
+----------------------------
+The npm lockfile declares MIT, Apache-2.0, BSD-3-Clause, ISC, 0BSD, CC0-1.0
+and combinations including LGPL-3.0-or-later. No dependency entry with a
+node_modules path lacked a license field at review time.
+
+The LGPL entries are the sharp/libvips platform packages brought in by
+Miniflare, directly and through Wrangler. They are local development/tooling
+dependencies, not Smallframe app-package dependencies. Their upstream license
+terms remain applicable if those binaries or a development environment
+containing them are redistributed. Apache-2.0 does not replace LGPL terms.
+
+Runtime/build dependencies such as Lit (BSD-3-Clause), @noble/ed25519 (MIT),
+canonicalize (Apache-2.0), and Automerge (MIT, Rust crate) retain their
+upstream notices. Review the actual generated browser/CLI artifacts before
+any binary release; this file is not a complete bundled-license collection.
+
+Rust
+----
+The locked Rust dependency graph declares permissive licenses or permissive
+alternatives: principally MIT/Apache-2.0, plus BSD variants, Unicode-3.0,
+Zlib, BSL-1.0, MIT-0 and Apache-2.0 WITH LLVM-exception alternatives.
+The r-efi entries offer MIT OR Apache-2.0 OR LGPL-2.1-or-later; LGPL is not
+the only available choice. Preserve the notices for the selected licenses,
+including Unicode data and any applicable exceptions.
+
+Release work still required
+---------------------------
+For each distributed browser bundle, Wasm module, CLI binary or tool image:
+identify the components actually included; collect their full licenses,
+copyright and NOTICE texts; satisfy source/relinking requirements where
+applicable; and carry these materials in the distribution. The existing
+scripts/generate-sbom.mjs inventories npm metadata only and does not replace
+that artifact-specific work or cover the Rust graph.
+
+Recheck when dependency versions or distribution formats change. No binary
+release, deployment or independent compliance certification is implied by
+this source-license change.

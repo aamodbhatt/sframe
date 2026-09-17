@@ -51,5 +51,6 @@
     "miniflare": {
       "undici": "7.29.0"
     }
-  }
+  },
+  "license": "Apache-2.0"
 }

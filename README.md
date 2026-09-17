@@ -15,7 +15,7 @@
 
 Smallframe is an experiment in making tiny collaborative tools portable without giving their code ambient browser authority or giving a sync relay their readable state.
 
-An immutable publisher-signed package is pinned by digest. A trusted controller owns keys, persistence, and privileged effects. App logic runs in a constrained Worker and can only emit schema-validated view nodes and state intents. The eventual shared-room protocol encrypts state in the browser before relay storage.
+An immutable publisher-signed package is pinned by digest. A trusted controller owns keys, persistence, and privileged effects. App logic runs in a constrained Worker and can only emit schema-validated view nodes and state intents. The implemented shared-room prototype encrypts and signs state in the browser before relay storage.
 
 ```text
 signed app package ──▶ verified renderer ──▶ constrained app Worker
@@ -44,29 +44,56 @@ This is a product and security hypothesis, not a validated market claim.
 
 ## Current state
 
-Candidate U is the accepted local browser architecture. The signed personal-app slice is implemented; **Phase 3 encrypted collaboration is under active repair and verification**. This is a local prototype, not a production-ready or independently reviewed service.
+**Working local prototype; Phase 3 encrypted collaboration remains under repair.** Smallframe has an executable personal-app workflow and a shared-room test environment. It is not a completed MVP, production service or independently security-reviewed runtime.
 
-The shared-room tests now use the actual SQLite Durable Object relay with a test-only, publisher-created encrypted genesis. They exercise encrypted snapshots, concurrent offline edits, viewer enforcement, local device-key wrapping, and consent. Production publisher enrollment/storage, signed recovery, complete hostile-state limits, and release readiness remain unfinished. Do not use real secrets or deploy this checkpoint.
+| Area | Implemented and exercised locally | Remaining work |
+|---|---|---|
+| App authoring | Rust CLI identity, `new`, `validate`, deterministic `pack`, `dev`; tracker, calculator and decision-board examples | Production publisher enrollment, package retrieval and room-creation workflow |
+| Package trust and execution | Native/Wasm signature verification, digest pinning, response-CSP sandbox, private channel, watchdog and hostile fixtures | Broader adversarial coverage and independent review |
+| Personal workspaces | Approval, local edits, import/export, offline reopen; persistence before acknowledgement; atomic first approval and concurrent workspace identity creation | Coordination between active editing tabs, update/write races and restored revision handling |
+| Shared rooms | Signed encrypted genesis, authenticated invitations, real SQLite Durable Object relay under Miniflare, concurrent offline edits, CAS sync and viewer enforcement | Signed recovery, history-gap disclosure, complete device forgetting, viewer persistence and actor sequence validation |
+| Parsing and durability | Bounded incoming state, strict UTF-8/duplicate-key checks, schema/document limits, atomic editor consent and durable remote/acknowledgement promotion | Relay request-body deadlines, complete hard-limit/conflict/fuzz matrix |
+| Release readiness | Pinned tools, automated gates and three-browser tests | Restore the 2 MiB renderer budget, release artifact notices, operational evidence and external validation |
 
-Shared links are parsed with strict canonical encoding and are authenticated against the verified package publisher, room path, capability, writer key, immutable expiry, relay role/configuration, and encrypted app/package context before approval or state access. The local fixture package and signer are explicitly test-only; production package retrieval and room creation remain gated work.
+The shared-room bootstrap and publisher signer are explicitly test-only. The tests run the actual relay implementation locally; they do not demonstrate deployed Cloudflare behavior or production publisher onboarding.
 
-Decrypted collaborative documents are checked in a controller-owned WebAssembly Worker for binary, change, operation, actor, head, conflict, depth, map/property, array, scalar, key, number and supported-type limits. Their complete projection is canonicalized and checked against the signed package's JSON Schema and plaintext ceiling before acceptance. A rejected remote document terminates and replaces the parser Worker while retaining the last accepted local copy.
+Candidate U remains the accepted architecture: an opaque renderer created by response CSP, one classic Blob **app Worker** with a trusted lexical prelude and private `MessageChannel`, and the exact Firefox `/sw.js` compatibility exception. The trusted controller separately owns the Wasm state-validation Worker. App packages target only [`packages/sdk`](packages/sdk/src/index.ts): one self-contained `app.worker.js`, declarative views and the explicit state API. They receive no DOM access, arbitrary networking, AI dependencies, publisher assets/CSS or server code.
 
-The renderer's local byte ceiling was raised from 2 MiB to 4 MiB while the inherited combined verifier/CRDT Wasm build is being evaluated. Splitting the state engine and restoring a measured lightweight budget remains open. A passing test suite does not close the full Phase 3–5 specification gates.
+Shared invitations bind the verified publisher/package, room path, capability, writer key, expiry and relay context before approval. Decrypted Automerge documents and merged candidates are checked for structural/history limits and against the signed JSON Schema before acceptance. Remembered room secrets and documents are wrapped with a non-extractable device key; that does not protect against compromised same-origin code or a copied browser profile.
 
-Working locally today:
+Recent repairs make rejected writes remain rejected: personal edits/imports persist before acknowledgement; shared remote state and relay acknowledgements persist before promotion; approval and initial state commit atomically. Wire envelopes now use the specified outer `revision` field and reject legacy/ambiguous names. Incompatible legacy relay heads fail closed without automatic migration or deletion.
 
-- content-addressed, Service-Worker-cached renderer response;
-- response-CSP sandboxing with an opaque renderer origin;
-- one classic Blob Worker with a trusted lexical prelude and private `MessageChannel`;
-- strict channel/session/sequence schemas, watchdog recovery, and hostile fixtures;
-- Rust native/Wasm package verification with JCS, DSSE Ed25519, SHA-256, strict JSON, bounded ZIP parsing, and deterministic STORE archives;
-- encrypted CLI identity initialization/export/import with OS credential-store abstraction;
-- `new`, `validate`, and deterministic `pack` CLI flows;
-- versioned protocol schemas and language-neutral golden vectors;
-- Chromium, Firefox, and WebKit local evidence.
+The renderer currently measures **2,876,517 bytes**, above the normative 2 MiB target. A temporary 4 MiB local ceiling remains a recorded deviation, not completion of the budget requirement.
 
-Not claimed: a completed MVP, deployed Cloudflare behavior, independent security review, market validation, or production readiness.
+## Verification evidence
+
+As reviewed on **2026-09-17**, checkpoint [`6dae574`](https://github.com/aamodbhatt/sframe/commit/6dae57452b81b80031ca4c9d93d0c20f6fe6859b) passed all nine required gates locally: **227 unit/integration tests, 30 Rust tests and 168 browser tests** across Chromium, Firefox and WebKit.
+
+Its [GitHub CI run](https://github.com/aamodbhatt/sframe/actions/runs/34751897118) finished with **167 browser passes and one Firefox navigation timeout**; earlier gates passed. The preceding [wire-format](https://github.com/aamodbhatt/sframe/actions/runs/34751305832) and [strict relay JSON](https://github.com/aamodbhatt/sframe/actions/runs/34751588638) checkpoints have successful CI. The intermittent navigation cause remains unresolved. See [current CI](https://github.com/aamodbhatt/sframe/actions/workflows/ci.yml) for subsequent results; these are dated observations, not a permanent green-status claim.
+
+The subsequent workspace-pointer and Apache-2.0 checkpoint passed all nine gates locally, confirmed on **2026-09-18**: **227 unit/integration, 30 Rust and 177 browser tests**. Concurrent opens select one durable workspace identity; aborted or throwing pointer writes reject and permit retry. This does not resolve the earlier CI navigation cause.
+
+Run the complete checkpoint gates:
+
+```bash
+npm run doctor
+npm run build
+npm run typecheck
+npm run lint
+npm run complexity
+npm test
+cargo test --locked --workspace --all-features
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+npm run test:e2e
+```
+
+Tests cover malformed packages/envelopes, signature/context substitution, aborted persistence, stale initialization, offline convergence and sandbox escape attempts. Passing them does not establish universal browser isolation, globally fresh relay history, independent security validation or market demand.
+
+## Development with Codex
+
+Codex is used to inspect existing code and CI, reproduce failures, implement bounded repairs, add adversarial regressions and run the verification gates before checkpoints. Examples include fixing persistence-before-acknowledgement ordering, reconciling the signed wire schema and testing atomic approval under aborted IndexedDB transactions. The project runtime and app contract have no AI/model dependency.
+
+The next engineering priorities are reliable CI navigation, relay body-read deadlines, persistent missed-history warnings, signed recovery, complete local secret deletion and remaining replica/multi-tab correctness. Production publishing and release readiness follow those foundations. These are open work items, not completed phases.
 
 ## Quick start
 
@@ -91,7 +118,7 @@ npm run cli -- pack ./my-small-app --output ./my-small-app.smallframe \
 
 Recovery export/import accepts an owner-only passphrase file for automation or a no-echo prompt interactively. Output files are create-new and identity recovery bundles are mode `0600` on Unix.
 
-Run the built-in signed Decision Board locally with the production Candidate U boundary:
+Run the built-in signed Decision Board locally with the Candidate U boundary:
 
 ```bash
 npm run cli -- dev
@@ -144,8 +171,6 @@ crates/smallframe-cli/   identity and package-authoring commands
 packages/protocol/       shared schemas, TypeScript boundaries, golden vectors
 packages/sdk/            constrained authoring contract
 examples/decision-board/ deterministic example package
-docs/adr/                local architecture decisions and accepted constraints
-evidence/                local reproducible gate reports
 fuzz/corpus/             bounded parser regression seeds
 ```
 
@@ -159,4 +184,6 @@ The repository is still experimental. Review the implementation boundaries and t
 
 ## License and contribution status
 
-The code is currently `UNLICENSED` while the project is in private design and validation. No permission to copy, distribute, or deploy is granted yet. Contribution and disclosure processes will be defined before any external beta.
+Smallframe's original code and documentation are licensed under **Apache-2.0**. See [LICENSE](LICENSE) and [NOTICE](NOTICE). Third-party dependencies retain their own licenses; [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES) records the dependency review and remaining artifact-specific redistribution work. The root npm package remains `private` to prevent accidental npm publication; that setting does not change the source license.
+
+Contributions should preserve the constrained SDK contract and Candidate U boundary, include adversarial coverage for behavior changes, and pass the checkpoint gates above. Keep secrets and private room data out of issues, pull requests, logs and fixtures. A formal private vulnerability-reporting channel and release governance remain to be established. No program acceptance, sponsorship or independent review is claimed.

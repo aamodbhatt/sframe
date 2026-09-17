@@ -144,3 +144,43 @@ test('a stale personal review cannot overwrite a workspace initialized by anothe
   await stale.reload({waitUntil: 'commit'});
   await expect(stale.frameLocator('iframe').getByText('1 decisions')).toBeVisible();
 });
+
+test('concurrent personal opens resolve one durable workspace identity', async ({page}) => {
+  await page.goto('/?personal=1', {waitUntil: 'commit'});
+  await expect(page.getByRole('button', {name: 'Open this exact version'})).toBeVisible();
+  const result = await page.evaluate(async () => {
+    const store = (globalThis as any).SmallframePersonalStore;
+    const ids = await Promise.all(Array.from({length: 20}, () => store.workspaceIdFor('public-test-package-pointer')));
+    const reopened = await store.workspaceIdFor('public-test-package-pointer');
+    return {identities: new Set(ids).size, allDurable: ids.every((id) => id === reopened)};
+  });
+  expect(result).toEqual({identities: 1, allDurable: true});
+});
+
+for (const failure of ['abort', 'throw'] as const) {
+  test(`personal pointer creation rejects ${failure} and permits durable retry`, async ({page}) => {
+    await page.goto('/?personal=1', {waitUntil: 'commit'});
+    await expect(page.getByRole('button', {name: 'Open this exact version'})).toBeVisible();
+    const result = await page.evaluate(async (failure) => {
+      const store = (globalThis as any).SmallframePersonalStore;
+      const add = IDBObjectStore.prototype.add;
+      IDBObjectStore.prototype.add = function(value, key) {
+        if (this.name === 'pointers') {
+          IDBObjectStore.prototype.add = add;
+          if (failure === 'throw') throw new Error('TEST_POINTER_WRITE_FAILED');
+          const request = key === undefined ? add.call(this, value) : add.call(this, value, key);
+          this.transaction.abort();
+          return request;
+        }
+        return key === undefined ? add.call(this, value) : add.call(this, value, key);
+      };
+      let rejected = false;
+      try { await store.workspaceIdFor('public-test-aborted-pointer'); }
+      catch { rejected = true; }
+      finally { IDBObjectStore.prototype.add = add; }
+      const accepted = await store.workspaceIdFor('public-test-aborted-pointer');
+      return {rejected, durable: accepted === await store.workspaceIdFor('public-test-aborted-pointer')};
+    }, failure);
+    expect(result).toEqual({rejected: true, durable: true});
+  });
+}

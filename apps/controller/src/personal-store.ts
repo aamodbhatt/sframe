@@ -76,17 +76,37 @@ const deleteRecord = async (storeName: string, key: string): Promise<void> => {
   } finally { database.close(); }
 };
 
+const workspaceIdFor = async (packageDigest: string): Promise<string> => {
+  const database = await openDatabase();
+  try {
+    return await new Promise<string>((resolve, reject) => {
+      const transaction = database.transaction('pointers', 'readwrite');
+      const pointers = transaction.objectStore('pointers');
+      let workspaceId = '';
+      transaction.oncomplete = () => resolve(workspaceId);
+      transaction.onerror = () => reject(new Error('LOCAL_STORAGE_WRITE_FAILED'));
+      transaction.onabort = () => reject(new Error('LOCAL_STORAGE_WRITE_ABORTED'));
+      const request = pointers.get(packageDigest);
+      request.onsuccess = () => {
+        try {
+          const existing = request.result as StoredPointer | undefined;
+          if (existing) { workspaceId = existing.workspaceId; return; }
+          const bytes = new Uint8Array(16);
+          crypto.getRandomValues(bytes);
+          workspaceId = btoa(String.fromCharCode(...bytes)).replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '');
+          pointers.add({packageDigest, workspaceId});
+        } catch {
+          try { transaction.abort(); } catch { /* Already aborted. */ }
+          reject(new Error('LOCAL_STORAGE_WRITE_FAILED'));
+        }
+      };
+    });
+  } finally { database.close(); }
+};
+
 const api: StoreApi = Object.freeze({
   initializeWorkspace,
-  workspaceIdFor: async (packageDigest) => {
-    const existing = await readRecord<StoredPointer>('pointers', packageDigest);
-    if (existing) return existing.workspaceId;
-    const bytes = new Uint8Array(16);
-    crypto.getRandomValues(bytes);
-    const workspaceId = btoa(String.fromCharCode(...bytes)).replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '');
-    await writeRecord('pointers', {packageDigest, workspaceId});
-    return workspaceId;
-  },
+  workspaceIdFor,
   loadWorkspace: async (workspaceId) => await readRecord<StoredWorkspace>('workspaces', workspaceId),
   saveWorkspace: async (workspace) => await writeRecord('workspaces', workspace),
   forgetWorkspace: async (workspaceId) => await deleteRecord('workspaces', workspaceId),
