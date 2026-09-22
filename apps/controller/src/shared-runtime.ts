@@ -1,5 +1,7 @@
 import {authenticateInvite, verifyInviteRelayContext} from '../../../packages/protocol/src/room-descriptor.js';
 import {validateReplicaMetadata, verifiedRelayEtag} from './replica-metadata.js';
+import {MAX_RECORDED_GAPS} from './replica-metadata.js';
+import type {LineageTuple, ReplicaLineage} from './replica-metadata.js';
 import {readBoundedJson} from './bounded-json.js';
 import {validateWireEnvelope} from './wire-envelope.js';
 import {ENVELOPE_BODY_LIMIT} from '../../../packages/protocol/src/crypto-envelope.js';
@@ -18,6 +20,7 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
     revision: number;
     envelopeDigest: string;
     etag: string;
+    lineage?: ReplicaLineage;
     dirty: boolean;
     actorId: string;
     automergeBase64?: string | undefined;
@@ -37,7 +40,7 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
   };
 
   type SharedStoreApi = {
-    loadRoom: (roomId: string) => Promise<StoredSharedRoom | undefined>;
+    loadRoom: (roomId: string, role?: 'viewer' | 'editor') => Promise<StoredSharedRoom | undefined>;
     saveRoom: (room: StoredSharedRoom, approval?: StoredSharedApproval) => Promise<void>;
     forgetRoom: (roomId: string) => Promise<void>;
     loadApproval: (approvalId: string) => Promise<StoredSharedApproval | undefined>;
@@ -252,6 +255,7 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
     let currentRevision = 1;
     let currentDigest = encodeBase64Url(new Uint8Array(32));
     let currentEtag = `"sf1.0.1.${currentDigest}"`;
+    let lineage: ReplicaLineage = {version: 1, gaps: [], lastVerifiedEdge: null, unknownPriorHistory: false};
     let isEditorHoldingLock = false;
     let activeSocket: WebSocket | undefined;
     let pollTimer = 0;
@@ -343,7 +347,10 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
 
     const setStatus = (statusText: string): void => {
       const connectivity = element('connectivity');
-      connectivity.textContent = statusText;
+      const historyNotice = lineage.gaps.length
+        ? 'Caught up after missed revisions; intervening relay history was not verified.'
+        : lineage.unknownPriorHistory ? 'Earlier relay history was not verified.' : '';
+      connectivity.textContent = historyNotice ? `${statusText} · ${historyNotice}` : statusText;
     };
 
     const updateRoleBadge = (): void => {
@@ -356,6 +363,8 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
     };
 
     type RevisionTuple = Pick<StoredSharedRoom, 'stateEpoch' | 'revision' | 'envelopeDigest' | 'etag'>;
+    const lineageTuple = (tuple: RevisionTuple): LineageTuple => ({stateEpoch: tuple.stateEpoch,
+      revision: tuple.revision, envelopeDigest: tuple.envelopeDigest});
     const revisionTuple = (): RevisionTuple => ({stateEpoch: currentEpoch, revision: currentRevision,
       envelopeDigest: currentDigest, etag: currentEtag});
     const promoteRevision = (tuple: RevisionTuple): void => {
@@ -365,8 +374,8 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
       currentEtag = tuple.etag;
     };
     const persistRoom = async (dirty: boolean, state = currentState, docBytes = localDocBytes,
-      approval?: StoredSharedApproval, tuple = revisionTuple()): Promise<void> => {
-      if ((!remembered && !approval) || !isEditorHoldingLock) return;
+      approval?: StoredSharedApproval, tuple = revisionTuple(), candidateLineage = lineage): Promise<void> => {
+      if ((!remembered && !approval) || (role === 'editor' && !isEditorHoldingLock)) return;
         await store().saveRoom({
           roomId: descriptor.roomId,
           packageDigest: descriptor.packageDigest,
@@ -376,6 +385,7 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
           writerPrivateSeed: invite.writerPrivateSeed ? encodeBase64Url(invite.writerPrivateSeed) : undefined,
           state,
           ...tuple,
+          lineage: candidateLineage,
           dirty,
           actorId: actorIdHex,
           automergeBase64: docBytes ? encodeBase64Url(docBytes) : undefined,
@@ -426,11 +436,22 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
 
             const tuple: RevisionTuple = {stateEpoch: wireEnvelope.stateEpoch, revision: wireEnvelope.revision,
               envelopeDigest: decrypted.envelopeDigest, etag: verifiedRelayEtag(res.headers.get('ETag'), decrypted.etag)};
+            let candidateLineage = lineage;
+            if (localDocBytes && wireEnvelope.revision > currentRevision) {
+              const edge = {from: lineageTuple(revisionTuple()), to: lineageTuple(tuple)};
+              if (wireEnvelope.revision === currentRevision + 1) {
+                candidateLineage = {...lineage, lastVerifiedEdge: edge};
+              } else {
+                if (lineage.gaps.length >= MAX_RECORDED_GAPS) throw new Error('HISTORY_GAP_LIMIT');
+                candidateLineage = {...lineage, gaps: [...lineage.gaps, edge]};
+              }
+            }
             // Commit the complete candidate before exposing it or advancing lineage.
-            await persistRoom(dirty, candidate.projectedState, candidate.bytes, undefined, tuple);
+            await persistRoom(dirty, candidate.projectedState, candidate.bytes, undefined, tuple, candidateLineage);
             localDocBytes = candidate.bytes;
             currentState = candidate.projectedState;
             promoteRevision(tuple);
+            lineage = candidateLineage;
             currentAppId = metadata?.appId;
             if (approved) await options.onReplaceState(structuredClone(currentState));
           } else {
@@ -460,8 +481,11 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
         if (res.ok) {
           const tuple: RevisionTuple = {stateEpoch: currentEpoch, revision: currentRevision + 1,
             envelopeDigest: encrypted.envelopeDigest, etag: encrypted.etag};
-          await persistRoom(false, currentState, localDocBytes, undefined, tuple);
+          const candidateLineage: ReplicaLineage = {...lineage,
+            lastVerifiedEdge: {from: lineageTuple(revisionTuple()), to: lineageTuple(tuple)}};
+          await persistRoom(false, currentState, localDocBytes, undefined, tuple, candidateLineage);
           promoteRevision(tuple);
+          lineage = candidateLineage;
           dirty = false;
           setStatus('Synced');
           return;
@@ -559,7 +583,7 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
           role,
           approvedAt: Date.now()
         };
-        if (isEditorHoldingLock) await persistRoom(dirty, currentState, localDocBytes, approval);
+        if (role === 'viewer' || isEditorHoldingLock) await persistRoom(dirty, currentState, localDocBytes, approval);
         else await store().saveApproval(approval);
       }
       remembered = remember;
@@ -624,7 +648,7 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
         element('trust-description').textContent = meta.description || 'No description provided.';
         updateRoleBadge();
 
-        const storedRoom = await store().loadRoom(descriptor.roomId);
+        const storedRoom = await store().loadRoom(descriptor.roomId, role);
         if (storedRoom && storedRoom.packageDigest === descriptor.packageDigest && storedRoom.role === role
           && storedRoom.capability === encodeBase64Url(invite.capability) && storedRoom.roomKey === encodeBase64Url(invite.roomKey)
           && storedRoom.writerPrivateSeed === (invite.writerPrivateSeed ? encodeBase64Url(invite.writerPrivateSeed) : undefined)) {
@@ -641,6 +665,8 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
           currentRevision = storedRoom.revision;
           currentDigest = storedRoom.envelopeDigest;
           currentEtag = storedRoom.etag;
+          lineage = storedRoom.lineage ?? {version: 1, gaps: [], lastVerifiedEdge: null, unknownPriorHistory: true};
+          if (lineage.gaps.length || lineage.unknownPriorHistory) setStatus('Saved locally');
           currentState = restored.projectedState;
           dirty = storedRoom.dirty;
           localDocBytes = restoredBytes;

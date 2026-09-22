@@ -3,6 +3,18 @@ import {randomBytes} from 'node:crypto';
 
 test.use({trace: 'off'});
 
+test.beforeEach(async ({request}) => {
+  await request.post('http://127.0.0.1:8787/__test__/navigation-diagnostics');
+});
+
+test.afterEach(async ({request}, testInfo) => {
+  if (testInfo.status === testInfo.expectedStatus) return;
+  try {
+    const response = await request.get('http://127.0.0.1:8787/__test__/navigation-diagnostics');
+    if (response.ok()) console.error('NAVIGATION_DIAGNOSTICS', JSON.stringify(await response.json()));
+  } catch { console.error('NAVIGATION_DIAGNOSTICS_UNAVAILABLE'); }
+});
+
 const abortNextWorkspaceWrite = async (page: Page): Promise<void> => {
   await page.evaluate(() => {
     const put = IDBObjectStore.prototype.put;

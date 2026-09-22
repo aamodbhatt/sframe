@@ -1,4 +1,4 @@
-import {expect, test} from '@playwright/test';
+import {expect, test, type APIRequestContext} from '@playwright/test';
 import {gotoInvite} from './invite-navigation.js';
 import {randomBytes} from 'node:crypto';
 import {readFileSync} from 'node:fs';
@@ -25,6 +25,8 @@ test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
   const makeRoomId = () => encodeBase64Url(randomBytes(16));
   let activeRoomId: string;
   let activeExpiry: number;
+  let activeGenesisDigest: string;
+  let activeGenesisEtag: string;
 
   test.beforeEach(async ({request}) => {
     [roomKey, writerPriv, viewerCap, editorCap] = Array.from({length: 4}, () => new Uint8Array(randomBytes(32)));
@@ -36,6 +38,8 @@ test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
       packageDigest: sharedFixture.packageDigest, stateEpoch: 0, proposedRevision: 1,
       previousEnvelopeDigest: encodeBase64Url(new Uint8Array(32)),
       automergeBytes: new Uint8Array(readFileSync('target/phase1-wasm/phase3-genesis.bin'))});
+    activeGenesisDigest = encodeBase64Url(genesis.envelopeDigest);
+    activeGenesisEtag = genesis.etag;
     const init = await request.post(`http://127.0.0.1:8787/__phase0/rooms/${activeRoomId}/init-envelope`, {data: {
       viewerCapHash: encodeBase64Url(await sha256(viewerCap)), editorCapHash: encodeBase64Url(await sha256(editorCap)),
       expiresAtMs: activeExpiry, envelope: genesis.envelope
@@ -43,10 +47,142 @@ test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
     expect(init.status(), (await init.text()).slice(0, 160)).toBe(201);
   });
 
+  const advanceRelay = async (request: APIRequestContext, count: number,
+    start = {revision: 1, digest: activeGenesisDigest, etag: activeGenesisEtag}): Promise<{revision: number; digest: string; etag: string}> => {
+    let {digest, etag} = start;
+    for (let revision = start.revision + 1; revision <= start.revision + count; revision += 1) {
+      const signed = await encryptSnapshot({roomKey, writerPrivateKey: writerPriv, roomId: activeRoomId,
+        appId: 'dev.example.decision-board', packageDigest: sharedFixture.packageDigest,
+        stateEpoch: 0, proposedRevision: revision, previousEnvelopeDigest: digest,
+        automergeBytes: new Uint8Array(readFileSync('target/phase1-wasm/phase3-genesis.bin'))});
+      const response = await request.put(`http://127.0.0.1:8787/v1/rooms/${activeRoomId}/state`, {
+        headers: {Authorization: `SF-Cap ${encodeBase64Url(editorCap)}`, Origin: 'http://app.localhost:4173', 'If-Match': etag},
+        data: signed.envelope
+      });
+      expect(response.status()).toBe(204);
+      digest = encodeBase64Url(signed.envelopeDigest);
+      etag = signed.etag;
+    }
+    return {revision: start.revision + count, digest, etag};
+  };
+
   test.afterEach(async ({page}) => {
     try {
       await page.goto('about:blank');
     } catch {}
+  });
+
+  for (const role of ['editor', 'viewer'] as const) {
+    test(`remembered ${role} keeps a skipped-history warning through direct sync and reopen`, async ({page, request}) => {
+      const capability = role === 'editor' ? editorCap : viewerCap;
+      const signed = await createSignedRoomDescriptor({publisherPrivateKey: publisherPriv, roomId: activeRoomId,
+        packageDigest: sharedFixture.packageDigest, publisherKeyId: sharedFixture.publisherKeyId,
+        writerPublicKey: await getPublicKeyAsync(writerPriv), capability, role, expiresAt: activeExpiry});
+      const fragment = formatInviteFragment({descriptorJcsBytes: signed.jcsBytes, descriptorSignature: signed.signature,
+        roomKey, capability, ...(role === 'editor' ? {writerPrivateSeed: writerPriv} : {})});
+      await gotoInvite(page, `/r/${activeRoomId}`, fragment);
+      await page.getByRole('button', {name: 'Open this exact version'}).click();
+      await expect(page.frameLocator('iframe').getByText('0 decisions')).toBeVisible();
+      await page.goto('/icon.svg', {waitUntil: 'commit'});
+      const jump = await advanceRelay(request, 2);
+      await gotoInvite(page, `/r/${activeRoomId}`, fragment);
+      await expect(page.locator('#connectivity')).toContainText('intervening relay history was not verified');
+      const gap = await page.evaluate(async (roomId) => {
+        const room = await (globalThis as any).SmallframeSharedStore.loadRoom(roomId);
+        return {revision: room.revision, gaps: room.lineage.gaps, unknownPriorHistory: room.lineage.unknownPriorHistory};
+      }, activeRoomId);
+      expect(gap.revision).toBe(3);
+      expect(gap.unknownPriorHistory).toBe(false);
+      expect(gap.gaps).toEqual([{from: {stateEpoch: 0, revision: 1, envelopeDigest: activeGenesisDigest},
+        to: {stateEpoch: 0, revision: 3, envelopeDigest: jump.digest}}]);
+      await page.goto('/icon.svg', {waitUntil: 'commit'});
+      await advanceRelay(request, 1, jump);
+      await gotoInvite(page, `/r/${activeRoomId}`, fragment);
+      await expect(page.locator('#connectivity')).toContainText('intervening relay history was not verified');
+      await expect.poll(async () => page.evaluate(async (roomId) =>
+        (await (globalThis as any).SmallframeSharedStore.loadRoom(roomId)).revision, activeRoomId)).toBe(4);
+      const later = await page.evaluate(async (roomId) => {
+        const room = await (globalThis as any).SmallframeSharedStore.loadRoom(roomId);
+        return {revision: room.revision, gaps: room.lineage.gaps.length, edge: room.lineage.lastVerifiedEdge};
+      }, activeRoomId);
+      expect(later.revision).toBe(4);
+      expect(later.gaps).toBe(1);
+      expect(later.edge?.from.revision).toBe(3);
+      expect(later.edge?.to.revision).toBe(4);
+      const networkControl = 'http://127.0.0.1:8787/__test__/controller-network';
+      expect((await request.post(networkControl, {data: {online: false}})).status()).toBe(204);
+      try {
+        await gotoInvite(page, `/r/${activeRoomId}`, fragment);
+        await expect(page.locator('#connectivity')).toContainText('intervening relay history was not verified');
+        await expect(page.frameLocator('iframe').getByText('0 decisions')).toBeVisible();
+      } finally {
+        expect((await request.post(networkControl, {data: {online: true}})).status()).toBe(204);
+      }
+      const stale = await page.evaluate(async ({roomId, genesisDigest, genesisEtag}) => {
+        const store = (globalThis as any).SmallframeSharedStore;
+        const room = await store.loadRoom(roomId);
+        const emptyLineage = {version: 1, gaps: [], lastVerifiedEdge: null, unknownPriorHistory: false};
+        let oldHeadRejected = false;
+        let erasedWarningRejected = false;
+        try { await store.saveRoom({...room, revision: 1, envelopeDigest: genesisDigest, etag: genesisEtag, lineage: emptyLineage}); }
+        catch { oldHeadRejected = true; }
+        try { await store.saveRoom({...room, lineage: emptyLineage}); }
+        catch { erasedWarningRejected = true; }
+        const saved = await store.loadRoom(roomId);
+        return {oldHeadRejected, erasedWarningRejected, revision: saved.revision, gaps: saved.lineage.gaps.length};
+      }, {roomId: activeRoomId, genesisDigest: activeGenesisDigest, genesisEtag: activeGenesisEtag});
+      expect(stale).toEqual({oldHeadRejected: true, erasedWarningRejected: true, revision: 4, gaps: 1});
+    });
+  }
+
+  test('a failed gap-marker write cannot advance the accepted head; an exact-next wrong predecessor still blocks', async ({page, request}) => {
+    const signed = await createSignedRoomDescriptor({publisherPrivateKey: publisherPriv, roomId: activeRoomId,
+      packageDigest: sharedFixture.packageDigest, publisherKeyId: sharedFixture.publisherKeyId,
+      writerPublicKey: await getPublicKeyAsync(writerPriv), capability: editorCap, role: 'editor', expiresAt: activeExpiry});
+    const fragment = formatInviteFragment({descriptorJcsBytes: signed.jcsBytes, descriptorSignature: signed.signature,
+      roomKey, capability: editorCap, writerPrivateSeed: writerPriv});
+    await gotoInvite(page, `/r/${activeRoomId}`, fragment);
+    await page.getByRole('button', {name: 'Open this exact version'}).click();
+    await expect(page.frameLocator('iframe').getByText('0 decisions')).toBeVisible();
+    await page.evaluate(() => {
+      const put = IDBObjectStore.prototype.put;
+      (globalThis as any).restoreGapWrite = () => { IDBObjectStore.prototype.put = put; };
+      IDBObjectStore.prototype.put = function(value, key) {
+        const result = key === undefined ? put.call(this, value) : put.call(this, value, key);
+        if (this.name === 'rooms') this.transaction.abort();
+        return result;
+      };
+    });
+    await advanceRelay(request, 2);
+    await expect(page.locator('#connectivity')).toContainText('Sync paused');
+    const before = await page.evaluate(async (roomId) => {
+      const room = await (globalThis as any).SmallframeSharedStore.loadRoom(roomId);
+      return {revision: room.revision, gaps: room.lineage.gaps.length};
+    }, activeRoomId);
+    expect(before).toEqual({revision: 1, gaps: 0});
+    await page.evaluate(() => { (globalThis as any).restoreGapWrite(); window.dispatchEvent(new Event('focus')); });
+    await expect(page.locator('#connectivity')).toContainText('intervening relay history was not verified');
+    const accepted = await page.evaluate(async (roomId) => {
+      const room = await (globalThis as any).SmallframeSharedStore.loadRoom(roomId);
+      return {revision: room.revision, gaps: room.lineage.gaps.length};
+    }, activeRoomId);
+    expect(accepted).toEqual({revision: 3, gaps: 1});
+
+    const forged = await encryptSnapshot({roomKey, writerPrivateKey: writerPriv, roomId: activeRoomId,
+      appId: 'dev.example.decision-board', packageDigest: sharedFixture.packageDigest,
+      stateEpoch: 0, proposedRevision: 4, previousEnvelopeDigest: activeGenesisDigest,
+      automergeBytes: new Uint8Array(readFileSync('target/phase1-wasm/phase3-genesis.bin'))});
+    expect((await request.post('http://127.0.0.1:8787/__test__/relay-state-fault',
+      {data: {roomId: activeRoomId, etag: forged.etag, envelope: forged.envelope}})).status()).toBe(204);
+    await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+    await expect(page.locator('#connectivity')).toContainText('Sync paused');
+    const blocked = await page.evaluate(async (roomId) => {
+      const room = await (globalThis as any).SmallframeSharedStore.loadRoom(roomId);
+      return {revision: room.revision, gaps: room.lineage.gaps.length};
+    }, activeRoomId);
+    expect(blocked).toEqual({revision: 3, gaps: 1});
+    await expect(page.locator('#connectivity')).toContainText('intervening relay history was not verified');
+    expect((await request.post('http://127.0.0.1:8787/__test__/relay-state-fault', {data: null})).status()).toBe(204);
   });
 
   test('failed invite navigation exposes only a generic diagnostic', async ({page, request}) => {
@@ -546,6 +682,11 @@ test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
 
     // Viewer receives synchronized editor state (1 decision)
     await expect(viewerApp.getByText('1 decisions')).toBeVisible();
+    await expect.poll(async () => viewerPage.evaluate(async (id) => {
+      const store = (globalThis as any).SmallframeSharedStore;
+      const [editor, viewer] = await Promise.all([store.loadRoom(id, 'editor'), store.loadRoom(id, 'viewer')]);
+      return {editor: editor?.role === 'editor', viewer: viewer?.role === 'viewer'};
+    }, activeRoomId)).toEqual({editor: true, viewer: true});
 
     // Viewer cannot add decisions
     await viewerApp.getByRole('button', {name: 'Add decision'}).click();

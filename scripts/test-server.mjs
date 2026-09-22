@@ -24,6 +24,8 @@ const relay = new Miniflare({modules: true, scriptPath: join(relayDir, 'worker.m
 const relayOrigin = (await relay.ready).origin;
 const relayNetwork = {online: true, disconnect: false};
 let relayMetadataFault = '';
+let relayStateFault = null;
+const navigationDiagnostics = {received: 0, finished: 0, closedEarly: 0, aborted: 0, lastDurationMs: null, lastStatus: null};
 const forwardRelay = async (request, response) => {
   if (!relayNetwork.online) {
     if (relayNetwork.disconnect) request.socket.destroy();
@@ -47,6 +49,11 @@ const forwardRelay = async (request, response) => {
   // fetch() has already decompressed the body; do not forward stale framing.
   for (const name of ['content-encoding', 'content-length', 'transfer-encoding']) responseHeaders.delete(name);
   let responseBody = Buffer.from(await upstream.arrayBuffer());
+  if (upstream.status === 200 && request.method === 'GET' && relayStateFault
+    && request.url === `/v1/rooms/${relayStateFault.roomId}/state`) {
+    responseBody = Buffer.from(JSON.stringify(relayStateFault.envelope));
+    responseHeaders.set('ETag', relayStateFault.etag);
+  }
   if (upstream.status === 200 && request.method === 'GET' && /^\/v1\/rooms\/[A-Za-z0-9_-]{22}$/u.test(request.url ?? '') && relayMetadataFault) {
     const metadata = JSON.parse(responseBody.toString('utf8'));
     if (relayMetadataFault === 'expiry') metadata.expiresAtMs += 1;
@@ -110,6 +117,7 @@ const resetEvidence = () => {
   relayNetwork.online = true;
   relayNetwork.disconnect = false;
   relayMetadataFault = '';
+  relayStateFault = null;
 };
 const evidenceSnapshot = () => ({...canary, rendererFallback: {...rendererFallback}, rendererMutation: {...rendererMutation}, appNetwork: {...appNetwork}, serviceWorkerRequests: [...serviceWorkerRequests]});
 const validControllerQuery = (url) => {
@@ -138,6 +146,17 @@ const staticHandler = (request, response) => {
   if (url.pathname === '/__test__/evidence/counts' && request.method === 'GET') {
     response.writeHead(200, {'Content-Type': 'application/json', 'Cache-Control': 'no-store'}).end(JSON.stringify(evidenceSnapshot()));
     return;
+  }
+  if (url.pathname === '/' && request.method === 'GET') {
+    const started = Date.now();
+    navigationDiagnostics.received += 1;
+    request.once('aborted', () => { navigationDiagnostics.aborted += 1; });
+    response.once('finish', () => {
+      navigationDiagnostics.finished += 1;
+      navigationDiagnostics.lastDurationMs = Date.now() - started;
+      navigationDiagnostics.lastStatus = response.statusCode;
+    });
+    response.once('close', () => { if (!response.writableFinished) navigationDiagnostics.closedEarly += 1; });
   }
   appNetwork.count += 1;
   appNetwork.paths.push(request.url ?? '');
@@ -201,6 +220,16 @@ const apiHandler = (request, response) => {
     return;
   }
   if (url.pathname === '/healthz') { response.writeHead(200, {'Content-Type': 'application/json'}).end('{"ok":true}'); return; }
+  if (url.pathname === '/__test__/navigation-diagnostics') {
+    if (request.method === 'POST') {
+      Object.assign(navigationDiagnostics, {received: 0, finished: 0, closedEarly: 0, aborted: 0, lastDurationMs: null, lastStatus: null});
+      response.writeHead(204, {'Cache-Control': 'no-store'}).end();
+    } else if (request.method === 'GET') {
+      response.writeHead(200, {'Content-Type': 'application/json', 'Cache-Control': 'no-store'})
+        .end(JSON.stringify({...navigationDiagnostics, controllerListening: controllerServer.listening}));
+    } else response.writeHead(405).end();
+    return;
+  }
   if (url.pathname === '/__test__/relay-network' && request.method === 'POST') {
     void bodyJson(request).then((body) => {
       relayNetwork.online = body.online === true;
@@ -215,6 +244,18 @@ const apiHandler = (request, response) => {
       relayMetadataFault = body.fault;
       response.writeHead(204).end();
     }).catch(() => response.writeHead(400).end());
+    return;
+  }
+  if (url.pathname === '/__test__/relay-state-fault' && request.method === 'POST') {
+    void bodyJson(request, 724992).then((body) => {
+      if (body === null) relayStateFault = null;
+      else if (body && /^[A-Za-z0-9_-]{22}$/u.test(body.roomId)
+        && typeof body.etag === 'string' && body.etag.length < 100
+        && body.envelope && typeof body.envelope === 'object' && !Array.isArray(body.envelope)) {
+        relayStateFault = body;
+      } else throw new Error('invalid relay-state fault');
+      response.writeHead(204, {'Cache-Control': 'no-store'}).end();
+    }).catch(() => response.writeHead(400, {'Cache-Control': 'no-store'}).end());
     return;
   }
   if (url.pathname.startsWith('/v1/') || url.pathname.startsWith('/__phase0/')) {

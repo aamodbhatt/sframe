@@ -1,4 +1,7 @@
 (() => {
+  type LineageTuple = {stateEpoch: number; revision: number; envelopeDigest: string};
+  type LineageEdge = {from: LineageTuple; to: LineageTuple};
+  type ReplicaLineage = {version: 1; gaps: LineageEdge[]; lastVerifiedEdge: LineageEdge | null; unknownPriorHistory: boolean};
   type StoredSharedRoom = {
     roomId: string;
     packageDigest: string;
@@ -11,6 +14,7 @@
     revision: number;
     envelopeDigest: string;
     etag: string;
+    lineage?: ReplicaLineage;
     dirty: boolean;
     actorId: string;
     automergeBase64?: string | undefined;
@@ -30,7 +34,7 @@
   };
 
   type SharedStoreApi = {
-    loadRoom: (roomId: string) => Promise<StoredSharedRoom | undefined>;
+    loadRoom: (roomId: string, role?: 'viewer' | 'editor') => Promise<StoredSharedRoom | undefined>;
     saveRoom: (room: StoredSharedRoom, approval?: StoredSharedApproval) => Promise<void>;
     forgetRoom: (roomId: string) => Promise<void>;
     loadApproval: (approvalId: string) => Promise<StoredSharedApproval | undefined>;
@@ -90,18 +94,29 @@
   };
 
   type WrappedRoom = {version: 1; roomId: string; nonce: Uint8Array<ArrayBuffer>; ciphertext: ArrayBuffer};
-  const roomAad = (roomId: string): Uint8Array<ArrayBuffer> => new TextEncoder().encode(`smallframe/local-room/v1:${roomId}`);
-  const loadWrappedRoom = async (roomId: string): Promise<StoredSharedRoom | undefined> => {
-    const saved = await readRecord<WrappedRoom>('rooms', roomId);
+  const storageId = (roomId: string, role: 'viewer' | 'editor'): string => role === 'viewer' ? `${roomId}:viewer` : roomId;
+  const roomAad = (id: string): Uint8Array<ArrayBuffer> => new TextEncoder().encode(`smallframe/local-room/v1:${id}`);
+  const loadExactRoom = async (roomId: string, id: string): Promise<StoredSharedRoom | undefined> => {
+    const saved = await readRecord<WrappedRoom>('rooms', id);
     if (!saved) return undefined;
     // Old prototype records are not silently blessed as encrypted storage.
     if (saved.version !== 1 || !(saved.ciphertext instanceof ArrayBuffer)) throw new Error('LEGACY_ROOM_EXPORT_REQUIRED');
-    const key = await readRecord<{key: CryptoKey}>('deviceKeys', roomId);
+    const key = await readRecord<{key: CryptoKey}>('deviceKeys', id);
     if (!key) throw new Error('LOCAL_DEVICE_KEY_MISSING');
-    const bytes = await crypto.subtle.decrypt({name: 'AES-GCM', iv: saved.nonce, additionalData: roomAad(roomId)}, key.key, saved.ciphertext);
+    const bytes = await crypto.subtle.decrypt({name: 'AES-GCM', iv: saved.nonce, additionalData: roomAad(id)}, key.key, saved.ciphertext);
     const room = JSON.parse(new TextDecoder().decode(bytes)) as StoredSharedRoom;
     if (room.roomId !== roomId) throw new Error('LOCAL_ROOM_CONTEXT_INVALID');
     return room;
+  };
+  const loadWrappedRoom = async (roomId: string, role?: 'viewer' | 'editor'): Promise<StoredSharedRoom | undefined> => {
+    if (role === 'viewer') {
+      const viewer = await loadExactRoom(roomId, storageId(roomId, 'viewer'));
+      if (viewer) return viewer.role === role ? viewer : undefined;
+    }
+    const legacy = await loadExactRoom(roomId, roomId);
+    if (legacy && (!role || legacy.role === role)) return legacy;
+    if (role) return undefined;
+    return await loadExactRoom(roomId, storageId(roomId, 'viewer'));
   };
   const commitWrappedRoom = async (room: WrappedRoom, key: CryptoKey, approval?: StoredSharedApproval): Promise<void> => {
     const database = await openDatabase();
@@ -123,17 +138,39 @@
       });
     } finally { database.close(); }
   };
+  const assertCompatibleWrite = (prior: StoredSharedRoom | undefined, room: StoredSharedRoom): void => {
+    if (!prior) return;
+    if (prior.packageDigest !== room.packageDigest || prior.role !== room.role || prior.roomKey !== room.roomKey
+      || prior.capability !== room.capability || prior.writerPrivateSeed !== room.writerPrivateSeed
+      || room.stateEpoch < prior.stateEpoch
+      || (room.stateEpoch === prior.stateEpoch && (room.revision < prior.revision
+        || (room.revision === prior.revision && room.envelopeDigest !== prior.envelopeDigest)))) {
+      throw new Error('LOCAL_STALE_WRITE');
+    }
+    if (prior.lineage?.unknownPriorHistory && !room.lineage?.unknownPriorHistory) throw new Error('LOCAL_STALE_WRITE');
+    if (!prior.lineage && !room.lineage?.unknownPriorHistory) throw new Error('LOCAL_STALE_WRITE');
+    if (prior.lineage?.gaps.some((gap, index) => JSON.stringify(room.lineage?.gaps[index]) !== JSON.stringify(gap))) {
+      throw new Error('LOCAL_STALE_WRITE');
+    }
+  };
   const saveWrappedRoom = async (room: StoredSharedRoom, approval?: StoredSharedApproval): Promise<void> => {
     if (approval && (approval.roomId !== room.roomId || approval.packageDigest !== room.packageDigest || approval.role !== room.role)) {
       throw new Error('LOCAL_APPROVAL_CONTEXT_INVALID');
     }
-    await navigator.locks.request(`smallframe:device-key:${room.roomId}`, async () => {
-      const saved = await readRecord<{roomId: string; key: CryptoKey}>('deviceKeys', room.roomId);
+    const id = storageId(room.roomId, room.role);
+    await navigator.locks.request(`smallframe:device-key:${id}`, async () => {
+      if (room.role === 'editor') {
+        const occupyingRoom = await loadExactRoom(room.roomId, room.roomId);
+        if (occupyingRoom && occupyingRoom.role !== 'editor') throw new Error('LOCAL_STORAGE_ROLE_CONFLICT');
+      }
+      const prior = await loadWrappedRoom(room.roomId, room.role);
+      assertCompatibleWrite(prior, room);
+      const saved = await readRecord<{roomId: string; key: CryptoKey}>('deviceKeys', id);
       const key = saved?.key ?? await crypto.subtle.generateKey({name: 'AES-GCM', length: 256}, false, ['encrypt', 'decrypt']);
       const nonce = crypto.getRandomValues(new Uint8Array(12));
-      const ciphertext = await crypto.subtle.encrypt({name: 'AES-GCM', iv: nonce, additionalData: roomAad(room.roomId)}, key, new TextEncoder().encode(JSON.stringify(room)));
+      const ciphertext = await crypto.subtle.encrypt({name: 'AES-GCM', iv: nonce, additionalData: roomAad(id)}, key, new TextEncoder().encode(JSON.stringify(room)));
       // Crypto runs before the transaction; key, ciphertext and consent commit together.
-      await commitWrappedRoom({version: 1, roomId: room.roomId, nonce, ciphertext}, key, approval);
+      await commitWrappedRoom({version: 1, roomId: id, nonce, ciphertext}, key, approval);
     });
   };
   const api: SharedStoreApi = Object.freeze({

@@ -21,9 +21,61 @@ export const validateReplicaMetadata = (value: unknown): void => {
     if (typeof room.actorId !== 'string' || !/^[0-9a-f]{32}$/u.test(room.actorId)) throw new Error();
     if (typeof room.dirty !== 'boolean' || !boundedInteger(room.updatedAt, 0, Number.MAX_SAFE_INTEGER)) throw new Error();
     canonicalBytes(room.automergeBase64, 475_136);
+    validateLineage(room.lineage, room.stateEpoch as number, room.revision as number, room.envelopeDigest as string);
   } catch {
     throw new Error('LOCAL_STATE_INVALID');
   }
+};
+
+export type LineageTuple = {stateEpoch: number; revision: number; envelopeDigest: string};
+export type LineageEdge = {from: LineageTuple; to: LineageTuple};
+export type ReplicaLineage = {version: 1; gaps: LineageEdge[]; lastVerifiedEdge: LineageEdge | null; unknownPriorHistory: boolean};
+export const MAX_RECORDED_GAPS = 16;
+
+const validTuple = (value: unknown): value is LineageTuple => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const tuple = value as Record<string, unknown>;
+  try {
+    return Object.keys(tuple).sort().join(',') === 'envelopeDigest,revision,stateEpoch'
+      && boundedInteger(tuple.stateEpoch, 0, 16)
+      && boundedInteger(tuple.revision, 1, Number.MAX_SAFE_INTEGER)
+      && canonicalBytes(tuple.envelopeDigest, 32).byteLength === 32;
+  } catch { return false; }
+};
+
+const validEdge = (value: unknown, minimumDistance: number, head: LineageTuple): value is LineageEdge => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const edge = value as Record<string, unknown>;
+  return Object.keys(edge).sort().join(',') === 'from,to' && validTuple(edge.from) && validTuple(edge.to)
+    && edge.from.stateEpoch === edge.to.stateEpoch
+    && edge.to.revision - edge.from.revision >= minimumDistance
+    && edge.to.stateEpoch === head.stateEpoch && edge.to.revision <= head.revision;
+};
+
+const validateGaps = (gaps: unknown[], head: LineageTuple): void => {
+  let priorRevision = 0;
+  for (const gap of gaps) {
+    if (!validEdge(gap, 2, head) || gap.from.revision < priorRevision) throw new Error('LOCAL_STATE_INVALID');
+    priorRevision = gap.to.revision;
+    if (gap.to.revision === head.revision && gap.to.envelopeDigest !== head.envelopeDigest) throw new Error('LOCAL_STATE_INVALID');
+  }
+};
+
+export const validateLineage = (value: unknown, stateEpoch: number, revision: number, envelopeDigest: string): void => {
+  if (value === undefined) return; // Older wrapped records acquire an explicit unknown-history marker on load.
+  const head = {stateEpoch, revision, envelopeDigest};
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('LOCAL_STATE_INVALID');
+  const lineage = value as Record<string, unknown>;
+  if (Object.keys(lineage).sort().join(',') !== 'gaps,lastVerifiedEdge,unknownPriorHistory,version'
+    || lineage.version !== 1 || typeof lineage.unknownPriorHistory !== 'boolean'
+    || !Array.isArray(lineage.gaps) || lineage.gaps.length > MAX_RECORDED_GAPS) throw new Error('LOCAL_STATE_INVALID');
+  validateGaps(lineage.gaps, head);
+  if (lineage.lastVerifiedEdge !== null && !validEdge(lineage.lastVerifiedEdge, 1, head)) throw new Error('LOCAL_STATE_INVALID');
+  if (lineage.lastVerifiedEdge && (lineage.lastVerifiedEdge as LineageEdge).to.revision - (lineage.lastVerifiedEdge as LineageEdge).from.revision !== 1) {
+    throw new Error('LOCAL_STATE_INVALID');
+  }
+  if (lineage.lastVerifiedEdge && (lineage.lastVerifiedEdge as LineageEdge).to.revision === head.revision
+    && (lineage.lastVerifiedEdge as LineageEdge).to.envelopeDigest !== head.envelopeDigest) throw new Error('LOCAL_STATE_INVALID');
 };
 
 export const verifiedRelayEtag = (received: string | null, verified: string): string => {
