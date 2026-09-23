@@ -41,10 +41,11 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
 
   type SharedStoreApi = {
     loadRoom: (roomId: string, role?: 'viewer' | 'editor') => Promise<StoredSharedRoom | undefined>;
-    saveRoom: (room: StoredSharedRoom, approval?: StoredSharedApproval) => Promise<void>;
+    saveRoom: (room: StoredSharedRoom, approval?: StoredSharedApproval, generation?: string) => Promise<void>;
     forgetRoom: (roomId: string) => Promise<void>;
+    generation: (roomId: string) => Promise<string>;
     loadApproval: (approvalId: string) => Promise<StoredSharedApproval | undefined>;
-    saveApproval: (approval: StoredSharedApproval) => Promise<void>;
+    saveApproval: (approval: StoredSharedApproval, generation?: string) => Promise<void>;
   };
 
   type PackageMetadata = {
@@ -77,6 +78,7 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
     apiOrigin: string;
     onApprove: (state: Record<string, unknown>, role: 'viewer' | 'editor') => void;
     onReplaceState: (state: Record<string, unknown>) => Promise<void>;
+    onForget: () => void;
   };
 
   type StateWorkerResponse = {
@@ -264,6 +266,12 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
     let approved = false;
     let authenticated = false;
     let savedApproval: StoredSharedApproval | undefined;
+    let storageGeneration = '';
+    let forgotten = false;
+    let forgetting = false;
+    const assertActive = (): void => { if (forgotten) throw new Error('LOCAL_ROOM_FORGOTTEN'); };
+    let releaseLease: (() => void) | undefined;
+    const forgetChannel = new BroadcastChannel('smallframe-shared-forget-v1');
     const descriptorDigest = encodeBase64Url(invite.descriptorDigest);
     const approvalId = `${descriptor.roomId}:${descriptorDigest}`;
     const assertNotExpired = (): void => {
@@ -316,6 +324,7 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
       try { return await action(worker); }
       catch {
         worker.stop();
+        assertActive();
         worker = new StateWorkerClient();
         throw new Error(failure);
       }
@@ -375,6 +384,7 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
     };
     const persistRoom = async (dirty: boolean, state = currentState, docBytes = localDocBytes,
       approval?: StoredSharedApproval, tuple = revisionTuple(), candidateLineage = lineage): Promise<void> => {
+      assertActive();
       if ((!remembered && !approval) || (role === 'editor' && !isEditorHoldingLock)) return;
         await store().saveRoom({
           roomId: descriptor.roomId,
@@ -390,11 +400,12 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
           actorId: actorIdHex,
           automergeBase64: docBytes ? encodeBase64Url(docBytes) : undefined,
           updatedAt: Date.now()
-        }, approval);
+        }, approval, storageGeneration);
         element('last-sync').textContent = `Saved locally: ${new Date().toLocaleTimeString()}`;
     };
 
     const fetchRemoteState = async (): Promise<void> => {
+      assertActive();
       assertNotExpired();
       try {
         const res = await fetch(`${apiOrigin}/v1/rooms/${descriptor.roomId}/state`, {
@@ -448,6 +459,7 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
             }
             // Commit the complete candidate before exposing it or advancing lineage.
             await persistRoom(dirty, candidate.projectedState, candidate.bytes, undefined, tuple, candidateLineage);
+            assertActive();
             localDocBytes = candidate.bytes;
             currentState = candidate.projectedState;
             promoteRevision(tuple);
@@ -469,8 +481,10 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
     };
 
     const syncRoom = async (): Promise<void> => {
+      if (forgotten) throw new Error('LOCAL_ROOM_FORGOTTEN');
       for (let attempt = 0; attempt < 5; attempt += 1) {
         await fetchRemoteState();
+        if (forgotten) throw new Error('LOCAL_ROOM_FORGOTTEN');
         if (!dirty || !isEditorHoldingLock || !invite.writerPrivateSeed || !localDocBytes) return;
         const encrypted = await worker.encrypt({roomKey: invite.roomKey, writerPrivateKey: invite.writerPrivateSeed,
           roomId: descriptor.roomId, ...(currentAppId ? {appId: currentAppId} : {}), packageDigest: descriptor.packageDigest, stateEpoch: currentEpoch,
@@ -496,12 +510,15 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
       setStatus('Saved locally · pending sync');
     };
     const requestSync = (): void => {
+      if (forgotten) return;
       void serialized(syncRoom).catch(() => setStatus('Sync paused · local copy retained'));
     };
+    const onFocus = (): void => { if (approved) requestSync(); };
     window.addEventListener('online', requestSync);
-    window.addEventListener('focus', () => { if (approved) requestSync(); });
+    window.addEventListener('focus', onFocus);
 
     const connectRealtime = async (): Promise<void> => {
+      if (forgotten) return;
       if (typeof WebSocket === 'undefined') return;
       try {
         const ticketRes = await fetch(`${apiOrigin}/v1/rooms/${descriptor.roomId}/events-ticket`, {
@@ -509,6 +526,7 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
           headers: {Authorization: capHeader, Origin: window.location.origin}
         });
         if (!ticketRes.ok) return;
+        if (forgotten) return;
         const {ticket} = (await ticketRes.json()) as {ticket: string};
         const wsUrl = `${apiOrigin.replace(/^http/u, 'ws')}/v1/rooms/${descriptor.roomId}/socket`;
         const ws = new WebSocket(wsUrl, ['smallframe.v1', `sf-ticket.${ticket}`]);
@@ -523,7 +541,7 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
           } catch {}
         };
         ws.onclose = () => {
-          window.setTimeout(() => { void connectRealtime(); }, 3000);
+          if (!forgotten) window.setTimeout(() => { void connectRealtime(); }, 3000);
         };
         ws.onerror = () => {
           try { ws.close(); } catch {}
@@ -551,7 +569,7 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
         isEditorHoldingLock = true;
         updateRoleBadge();
         resolveLease?.();
-        await new Promise<void>(() => {});
+        await new Promise<void>((resolve) => { releaseLease = resolve; });
       }).catch(() => {
         isEditorHoldingLock = false;
         updateRoleBadge();
@@ -562,6 +580,7 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
     }
 
     const approve = async (): Promise<void> => {
+      if (forgotten) throw new Error('LOCAL_ROOM_FORGOTTEN');
       await leasePromise;
       if (!metadata || !authenticated) throw new Error('SHARED_APPROVAL_NOT_READY');
       await checkRelayContext();
@@ -569,6 +588,7 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
       const remember = element<HTMLInputElement>('remember-approval').checked;
       try { await serialized(fetchRemoteState); }
       catch (error) { if (!localDocBytes) throw error; }
+      if (forgotten) throw new Error('LOCAL_ROOM_FORGOTTEN');
       if (!localDocBytes) throw new Error('VERIFIED_GENESIS_UNAVAILABLE');
 
       if (remember) {
@@ -584,9 +604,10 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
           approvedAt: Date.now()
         };
         if (role === 'viewer' || isEditorHoldingLock) await persistRoom(dirty, currentState, localDocBytes, approval);
-        else await store().saveApproval(approval);
+        else await store().saveApproval(approval, storageGeneration);
       }
       remembered = remember;
+      if (forgotten) throw new Error('LOCAL_ROOM_FORGOTTEN');
 
       element('trust-panel').hidden = true;
       element('runtime-panel').hidden = false;
@@ -601,6 +622,52 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
     element('approve-package').addEventListener('click', () => {
       void approve().catch((error: unknown) => {
         element('trust-description').textContent = error instanceof Error ? error.message : 'Approval failed';
+      });
+    });
+
+    const stopForgetting = (): void => {
+      if (forgotten) return;
+      forgotten = true;
+      approved = false;
+      remembered = false;
+      activeSocket?.close();
+      if (pollTimer) window.clearInterval(pollTimer);
+      window.removeEventListener('online', requestSync);
+      window.removeEventListener('focus', onFocus);
+      releaseLease?.();
+      worker.stop();
+      localDocBytes?.fill(0);
+      localDocBytes = undefined;
+      invite.roomKey.fill(0);
+      invite.capability.fill(0);
+      invite.writerPrivateSeed?.fill(0);
+      currentState = {};
+      forgetChannel.close();
+      options.onForget();
+    };
+    forgetChannel.onmessage = (event: MessageEvent) => {
+      if (event.data?.type !== 'forgotten' || event.data.roomId !== descriptor.roomId) return;
+      void store().generation(descriptor.roomId).then((generation) => {
+        if (generation !== storageGeneration) stopForgetting();
+      }).catch(() => setStatus('Forget device check unavailable'));
+    };
+    const forgetButton = element<HTMLButtonElement>('forget-workspace');
+    forgetButton.addEventListener('click', () => {
+      if (forgetting || forgotten) return;
+      if (!window.confirm('Export anything you need before forgetting this room on this device?')) return;
+      forgetting = true;
+      forgetButton.disabled = true;
+      void store().forgetRoom(descriptor.roomId).then(() => {
+        if (!forgotten) {
+          try { forgetChannel.postMessage({type: 'forgotten', roomId: descriptor.roomId}); } catch {}
+          stopForgetting();
+        }
+      }).catch(() => {
+        if (!forgotten) {
+          forgetting = false;
+          forgetButton.disabled = false;
+          setStatus('Forget device failed · local copy retained');
+        }
       });
     });
 
@@ -634,6 +701,8 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
     return {
       handleVerified: async (meta) => {
         await authenticateInvite(invite, meta, location.pathname);
+        assertActive();
+        storageGeneration = await store().generation(descriptor.roomId);
         metadata = meta;
         element('app-title').textContent = meta.appName;
         element('app-version').textContent = meta.appVersion;
@@ -677,6 +746,7 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
 
         savedApproval = await store().loadApproval(approvalId);
         await checkRelayContext();
+        assertActive();
         authenticated = true;
         if (matchesApproval(savedApproval)) {
           await approve();
@@ -687,6 +757,7 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
       },
 
       stateChanged: async (state, _rev) => serialized(async () => {
+        if (forgotten) throw new Error('LOCAL_ROOM_FORGOTTEN');
         assertNotExpired();
         await leasePromise;
         if (role !== 'editor' || !isEditorHoldingLock || !invite.writerPrivateSeed || !localDocBytes) throw new Error('READ_ONLY');

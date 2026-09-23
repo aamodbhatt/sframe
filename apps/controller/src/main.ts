@@ -582,7 +582,21 @@ const main = async (): Promise<void> => {
         localState = structuredClone(state);
         post('sf.controller.approval', {state: localState, role});
       },
-      onReplaceState: async (state: Record<string, unknown>) => replaceLocalState(structuredClone(state))
+      onReplaceState: async (state: Record<string, unknown>) => replaceLocalState(structuredClone(state)),
+      onForget: () => {
+        controllerChannelTerminal = true;
+        window.clearTimeout(rendererInitTimer);
+        port?.close();
+        port = undefined;
+        frame?.remove();
+        frame = undefined;
+        personalArchive.fill(0);
+        personalArchive = new Uint8Array();
+        localState = {};
+        parsedInvite = undefined;
+        personalSession = undefined;
+        location.replace('about:blank');
+      }
     });
   } else if (PERSONAL_MODE) {
     const binary = atob(PHASE2_PACKAGE_BASE64);

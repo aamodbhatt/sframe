@@ -35,10 +35,11 @@
 
   type SharedStoreApi = {
     loadRoom: (roomId: string, role?: 'viewer' | 'editor') => Promise<StoredSharedRoom | undefined>;
-    saveRoom: (room: StoredSharedRoom, approval?: StoredSharedApproval) => Promise<void>;
+    saveRoom: (room: StoredSharedRoom, approval?: StoredSharedApproval, generation?: string) => Promise<void>;
     forgetRoom: (roomId: string) => Promise<void>;
+    generation: (roomId: string) => Promise<string>;
     loadApproval: (approvalId: string) => Promise<StoredSharedApproval | undefined>;
-    saveApproval: (approval: StoredSharedApproval) => Promise<void>;
+    saveApproval: (approval: StoredSharedApproval, generation?: string) => Promise<void>;
   };
 
   const openDatabase = async (): Promise<IDBDatabase> => await new Promise((resolve, reject) => {
@@ -80,15 +81,43 @@
     } finally { database.close(); }
   };
 
-  const deleteRecord = async (storeName: string, key: string): Promise<void> => {
+  const generationFor = async (roomId: string): Promise<string> => {
+    const marker = await readRecord<{approvalId: string; generation: string}>('approvals', `forget:${roomId}`);
+    if (!marker) return '';
+    if (marker.approvalId !== `forget:${roomId}` || !/^[0-9a-f-]{36}$/u.test(marker.generation)) throw new Error('LOCAL_FORGET_MARKER_INVALID');
+    return marker.generation;
+  };
+
+  const assertGeneration = async (roomId: string, expected: string): Promise<void> => {
+    if (await generationFor(roomId) !== expected) throw new Error('LOCAL_ROOM_FORGOTTEN');
+  };
+
+  const forgetStoredRoom = async (roomId: string): Promise<void> => {
     const database = await openDatabase();
     try {
       await new Promise<void>((resolve, reject) => {
-        const transaction = database.transaction(storeName, 'readwrite');
-        transaction.objectStore(storeName).delete(key);
+        const transaction = database.transaction(['rooms', 'deviceKeys', 'approvals'], 'readwrite');
         transaction.oncomplete = () => resolve();
         transaction.onerror = () => reject(new Error('SHARED_STORAGE_DELETE_FAILED'));
         transaction.onabort = () => reject(new Error('SHARED_STORAGE_DELETE_ABORTED'));
+        try {
+          for (const id of [roomId, storageId(roomId, 'viewer')]) {
+            transaction.objectStore('rooms').delete(id);
+            transaction.objectStore('deviceKeys').delete(id);
+          }
+          const approvals = transaction.objectStore('approvals');
+          const keys = approvals.getAllKeys(IDBKeyRange.bound(`${roomId}:`, `${roomId}:\uffff`), 129);
+          keys.onsuccess = () => {
+            try {
+              if (keys.result.length > 128) throw new Error('SHARED_APPROVAL_LIMIT');
+              for (const key of keys.result) approvals.delete(key);
+              approvals.put({approvalId: `forget:${roomId}`, generation: crypto.randomUUID()});
+            } catch { try { transaction.abort(); } catch {} }
+          };
+        } catch {
+          try { transaction.abort(); } catch {}
+          reject(new Error('SHARED_STORAGE_DELETE_FAILED'));
+        }
       });
     } finally { database.close(); }
   };
@@ -153,32 +182,38 @@
       throw new Error('LOCAL_STALE_WRITE');
     }
   };
-  const saveWrappedRoom = async (room: StoredSharedRoom, approval?: StoredSharedApproval): Promise<void> => {
+  const saveWrappedRoom = async (room: StoredSharedRoom, approval?: StoredSharedApproval, generation = ''): Promise<void> => {
     if (approval && (approval.roomId !== room.roomId || approval.packageDigest !== room.packageDigest || approval.role !== room.role)) {
       throw new Error('LOCAL_APPROVAL_CONTEXT_INVALID');
     }
     const id = storageId(room.roomId, room.role);
-    await navigator.locks.request(`smallframe:device-key:${id}`, async () => {
-      if (room.role === 'editor') {
-        const occupyingRoom = await loadExactRoom(room.roomId, room.roomId);
-        if (occupyingRoom && occupyingRoom.role !== 'editor') throw new Error('LOCAL_STORAGE_ROLE_CONFLICT');
-      }
-      const prior = await loadWrappedRoom(room.roomId, room.role);
-      assertCompatibleWrite(prior, room);
-      const saved = await readRecord<{roomId: string; key: CryptoKey}>('deviceKeys', id);
-      const key = saved?.key ?? await crypto.subtle.generateKey({name: 'AES-GCM', length: 256}, false, ['encrypt', 'decrypt']);
-      const nonce = crypto.getRandomValues(new Uint8Array(12));
-      const ciphertext = await crypto.subtle.encrypt({name: 'AES-GCM', iv: nonce, additionalData: roomAad(id)}, key, new TextEncoder().encode(JSON.stringify(room)));
-      // Crypto runs before the transaction; key, ciphertext and consent commit together.
-      await commitWrappedRoom({version: 1, roomId: id, nonce, ciphertext}, key, approval);
+    await navigator.locks.request(`smallframe:room-storage:${room.roomId}`, async () => {
+      await assertGeneration(room.roomId, generation);
+      await navigator.locks.request(`smallframe:device-key:${id}`, async () => {
+        if (room.role === 'editor') {
+          const occupyingRoom = await loadExactRoom(room.roomId, room.roomId);
+          if (occupyingRoom && occupyingRoom.role !== 'editor') throw new Error('LOCAL_STORAGE_ROLE_CONFLICT');
+        }
+        const prior = await loadWrappedRoom(room.roomId, room.role);
+        assertCompatibleWrite(prior, room);
+        const saved = await readRecord<{roomId: string; key: CryptoKey}>('deviceKeys', id);
+        const key = saved?.key ?? await crypto.subtle.generateKey({name: 'AES-GCM', length: 256}, false, ['encrypt', 'decrypt']);
+        const nonce = crypto.getRandomValues(new Uint8Array(12));
+        const ciphertext = await crypto.subtle.encrypt({name: 'AES-GCM', iv: nonce, additionalData: roomAad(id)}, key, new TextEncoder().encode(JSON.stringify(room)));
+        // Crypto runs before the transaction; key, ciphertext and consent commit together.
+        await commitWrappedRoom({version: 1, roomId: id, nonce, ciphertext}, key, approval);
+      });
     });
   };
   const api: SharedStoreApi = Object.freeze({
     loadRoom: loadWrappedRoom,
     saveRoom: saveWrappedRoom,
-    forgetRoom: async (roomId) => await deleteRecord('rooms', roomId),
+    forgetRoom: async (roomId) => await navigator.locks.request(`smallframe:room-storage:${roomId}`,
+      async () => await forgetStoredRoom(roomId)),
+    generation: generationFor,
     loadApproval: async (approvalId) => await readRecord<StoredSharedApproval>('approvals', approvalId),
-    saveApproval: async (approval) => await writeRecord('approvals', approval)
+    saveApproval: async (approval, generation = '') => await navigator.locks.request(`smallframe:room-storage:${approval.roomId}`,
+      async () => { await assertGeneration(approval.roomId, generation); await writeRecord('approvals', approval); })
   });
 
   Object.defineProperty(globalThis, 'SmallframeSharedStore', {value: api, enumerable: false, configurable: false, writable: false});

@@ -27,8 +27,17 @@ test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
   let activeExpiry: number;
   let activeGenesisDigest: string;
   let activeGenesisEtag: string;
+  let pageCrashed = false;
+  let pageClosed = false;
+  let mainNavigations = 0;
 
-  test.beforeEach(async ({request}) => {
+  test.beforeEach(async ({request, page}) => {
+    pageCrashed = false;
+    pageClosed = false;
+    mainNavigations = 0;
+    page.on('crash', () => { pageCrashed = true; });
+    page.on('close', () => { pageClosed = true; });
+    page.on('framenavigated', (frame) => { if (frame === page.mainFrame()) mainNavigations += 1; });
     [roomKey, writerPriv, viewerCap, editorCap] = Array.from({length: 4}, () => new Uint8Array(randomBytes(32)));
     const res = await request.post('http://127.0.0.1:8787/__test__/evidence/reset');
     expect(res.status()).toBe(204);
@@ -66,7 +75,24 @@ test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
     return {revision: start.revision + count, digest, etag};
   };
 
-  test.afterEach(async ({page}) => {
+  test.afterEach(async ({page, request, browser}, testInfo) => {
+    if (testInfo.status !== testInfo.expectedStatus) {
+      let ui: unknown = null;
+      if (!page.isClosed()) {
+        try {
+          ui = await page.evaluate(() => ({readyState: document.readyState,
+            approvalPresent: Boolean(document.querySelector('#approve-package')),
+            trustVisible: Boolean(document.querySelector('#trust-panel') && !(document.querySelector('#trust-panel') as HTMLElement).hidden),
+            runtimeVisible: Boolean(document.querySelector('#runtime-panel') && !(document.querySelector('#runtime-panel') as HTMLElement).hidden),
+            iframeCount: document.querySelectorAll('iframe').length,
+            serviceWorkerControlled: Boolean(navigator.serviceWorker?.controller)}));
+        } catch { ui = 'unavailable'; }
+      }
+      let relayHealth = false;
+      try { relayHealth = (await request.get('http://127.0.0.1:8787/healthz')).ok(); } catch {}
+      console.error('SHARED_CI_DIAGNOSTICS', JSON.stringify({pageCrashed, pageClosed: pageClosed || page.isClosed(),
+        browserConnected: browser.isConnected(), mainNavigations, relayHealth, ui}));
+    }
     try {
       await page.goto('about:blank');
     } catch {}
@@ -183,6 +209,128 @@ test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
     expect(blocked).toEqual({revision: 3, gaps: 1});
     await expect(page.locator('#connectivity')).toContainText('intervening relay history was not verified');
     expect((await request.post('http://127.0.0.1:8787/__test__/relay-state-fault', {data: null})).status()).toBe(204);
+  });
+
+  test('Forget device atomically removes room authority and stops same-profile tabs', async ({page, context}) => {
+    const signed = await createSignedRoomDescriptor({publisherPrivateKey: publisherPriv, roomId: activeRoomId,
+      packageDigest: sharedFixture.packageDigest, publisherKeyId: sharedFixture.publisherKeyId,
+      writerPublicKey: await getPublicKeyAsync(writerPriv), capability: editorCap, role: 'editor', expiresAt: activeExpiry});
+    const fragment = formatInviteFragment({descriptorJcsBytes: signed.jcsBytes, descriptorSignature: signed.signature,
+      roomKey, capability: editorCap, writerPrivateSeed: writerPriv});
+    await gotoInvite(page, `/r/${activeRoomId}`, fragment);
+    await page.getByRole('button', {name: 'Open this exact version'}).click();
+    await expect(page.frameLocator('iframe').getByText('0 decisions')).toBeVisible();
+    const viewerSigned = await createSignedRoomDescriptor({publisherPrivateKey: publisherPriv, roomId: activeRoomId,
+      packageDigest: sharedFixture.packageDigest, publisherKeyId: sharedFixture.publisherKeyId,
+      writerPublicKey: await getPublicKeyAsync(writerPriv), capability: viewerCap, role: 'viewer', expiresAt: activeExpiry});
+    const viewerFragment = formatInviteFragment({descriptorJcsBytes: viewerSigned.jcsBytes,
+      descriptorSignature: viewerSigned.signature, roomKey, capability: viewerCap});
+    const second = await context.newPage();
+    const inspector = await context.newPage();
+    try {
+      await gotoInvite(second, `/r/${activeRoomId}`, viewerFragment);
+      await second.getByRole('button', {name: 'Open this exact version'}).click();
+      await expect(second.frameLocator('iframe').getByText('0 decisions')).toBeVisible();
+      await inspector.goto('/?personal=1', {waitUntil: 'commit'});
+      await inspector.waitForFunction(() => Boolean((globalThis as any).SmallframeSharedStore));
+      await inspector.evaluate(async (id) => {
+        const store = (globalThis as any).SmallframeSharedStore;
+        (globalThis as any).staleSharedRoom = await store.loadRoom(id, 'editor');
+        (globalThis as any).staleGeneration = await store.generation(id);
+        const database = await new Promise<IDBDatabase>((resolve, reject) => {
+          const request = indexedDB.open('smallframe-shared-v1', 2);
+          request.onsuccess = () => resolve(request.result);
+          request.onerror = () => reject(request.error);
+        });
+        (globalThis as any).staleApproval = await new Promise((resolve, reject) => {
+          const request = database.transaction('approvals').objectStore('approvals').getAll();
+          request.onsuccess = () => resolve(request.result.find((approval: {roomId: string}) => approval.roomId === id));
+          request.onerror = () => reject(request.error);
+        });
+        database.close();
+      }, activeRoomId);
+      page.once('dialog', (dialog) => { void dialog.accept(); });
+      await page.getByRole('button', {name: 'Workspace'}).click();
+      await page.getByRole('button', {name: 'Forget device'}).click();
+      await expect(page).toHaveURL('about:blank');
+      await expect(second).toHaveURL('about:blank');
+      const forgotten = await inspector.evaluate(async (id) => {
+        const store = (globalThis as any).SmallframeSharedStore;
+        const database = await new Promise<IDBDatabase>((resolve, reject) => {
+          const request = indexedDB.open('smallframe-shared-v1', 2);
+          request.onsuccess = () => resolve(request.result);
+          request.onerror = () => reject(request.error);
+        });
+        const keys = (name: string): Promise<IDBValidKey[]> => new Promise((resolve) => {
+          const request = database.transaction(name).objectStore(name).getAllKeys();
+          request.onsuccess = () => resolve(request.result);
+        });
+        const [rooms, deviceKeys, approvals] = await Promise.all(['rooms', 'deviceKeys', 'approvals'].map(keys));
+        database.close();
+        let staleRejected = false;
+        try { await store.saveRoom((globalThis as any).staleSharedRoom, undefined, (globalThis as any).staleGeneration); }
+        catch { staleRejected = true; }
+        let staleApprovalRejected = false;
+        try { await store.saveApproval((globalThis as any).staleApproval, (globalThis as any).staleGeneration); }
+        catch { staleApprovalRejected = true; }
+        return {rooms: rooms.length, deviceKeys: deviceKeys.length,
+          approvals: approvals.filter((key) => String(key).startsWith(`${id}:`)).length,
+          marker: approvals.includes(`forget:${id}`), staleRejected, staleApprovalRejected};
+      }, activeRoomId);
+      expect(forgotten).toEqual({rooms: 0, deviceKeys: 0, approvals: 0, marker: true,
+        staleRejected: true, staleApprovalRejected: true});
+      await gotoInvite(page, `/r/${activeRoomId}`, fragment);
+      await expect(page.getByRole('button', {name: 'Open this exact version'})).toBeVisible();
+      await page.getByRole('button', {name: 'Open this exact version'}).click();
+      await expect(page.frameLocator('iframe').getByText('0 decisions')).toBeVisible();
+    } finally {
+      await second.close();
+      await inspector.close();
+    }
+  });
+
+  test('an aborted Forget device transaction retains local authority for an explicit retry', async ({page}) => {
+    const signed = await createSignedRoomDescriptor({publisherPrivateKey: publisherPriv, roomId: activeRoomId,
+      packageDigest: sharedFixture.packageDigest, publisherKeyId: sharedFixture.publisherKeyId,
+      writerPublicKey: await getPublicKeyAsync(writerPriv), capability: editorCap, role: 'editor', expiresAt: activeExpiry});
+    const fragment = formatInviteFragment({descriptorJcsBytes: signed.jcsBytes, descriptorSignature: signed.signature,
+      roomKey, capability: editorCap, writerPrivateSeed: writerPriv});
+    await gotoInvite(page, `/r/${activeRoomId}`, fragment);
+    await page.getByRole('button', {name: 'Open this exact version'}).click();
+    await expect(page.frameLocator('iframe').getByText('0 decisions')).toBeVisible();
+    await page.evaluate(() => {
+      const original = IDBObjectStore.prototype.delete;
+      IDBObjectStore.prototype.delete = function(key) {
+        const result = original.call(this, key);
+        if (this.name === 'rooms') {
+          IDBObjectStore.prototype.delete = original;
+          this.transaction.abort();
+        }
+        return result;
+      };
+    });
+    page.once('dialog', (dialog) => { void dialog.accept(); });
+    await page.getByRole('button', {name: 'Workspace'}).click();
+    await page.getByRole('button', {name: 'Forget device'}).click();
+    await expect(page.locator('#connectivity')).toContainText('Forget device failed');
+    const preserved = await page.evaluate(async () => {
+      const database = await new Promise<IDBDatabase>((resolve, reject) => {
+        const request = indexedDB.open('smallframe-shared-v1', 2);
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+      const count = (name: string): Promise<number> => new Promise((resolve) => {
+        const request = database.transaction(name).objectStore(name).count();
+        request.onsuccess = () => resolve(request.result);
+      });
+      const counts = await Promise.all(['rooms', 'deviceKeys', 'approvals'].map(count));
+      database.close();
+      return counts;
+    });
+    expect(preserved).toEqual([1, 1, 1]);
+    page.once('dialog', (dialog) => { void dialog.accept(); });
+    await page.getByRole('button', {name: 'Forget device'}).click();
+    await expect(page).toHaveURL('about:blank');
   });
 
   test('failed invite navigation exposes only a generic diagnostic', async ({page, request}) => {
