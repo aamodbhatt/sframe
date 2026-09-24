@@ -43,6 +43,7 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
 
   type SharedStoreApi = {
     loadRoom: (roomId: string, role?: 'viewer' | 'editor') => Promise<StoredSharedRoom | undefined>;
+    loadForTakeover: (roomId: string, generation: string) => Promise<StoredSharedRoom | undefined>;
     saveRoom: (room: StoredSharedRoom, approval?: StoredSharedApproval, generation?: string) => Promise<void>;
     forgetRoom: (roomId: string) => Promise<void>;
     generation: (roomId: string) => Promise<string>;
@@ -80,6 +81,7 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
     apiOrigin: string;
     onApprove: (state: Record<string, unknown>, role: 'viewer' | 'editor') => void;
     onReplaceState: (state: Record<string, unknown>) => Promise<void>;
+    onPromoteEditor: (state: Record<string, unknown>) => Promise<void>;
     onForget: () => void;
   };
 
@@ -277,6 +279,7 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
     let forgetting = false;
     const assertActive = (): void => { if (forgotten) throw new Error('LOCAL_ROOM_FORGOTTEN'); };
     let releaseLease: (() => void) | undefined;
+    let takeoverQueued = false;
     const forgetChannel = new BroadcastChannel('smallframe-shared-forget-v1');
     const descriptorDigest = encodeBase64Url(invite.descriptorDigest);
     const approvalId = `${descriptor.roomId}:${descriptorDigest}`;
@@ -627,6 +630,7 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
       options.onApprove(structuredClone(currentState), role === 'editor' && isEditorHoldingLock ? 'editor' : 'viewer');
 
       void connectRealtime();
+      if (role === 'editor' && remembered && !isEditorHoldingLock) queueTakeover();
       if (dirty) window.setTimeout(requestSync, 0);
     };
 
@@ -722,6 +726,52 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
         lineage: room.lineage ?? {version: 1, gaps: [], lastVerifiedEdge: null, unknownPriorHistory: true}},
       undefined, storageGeneration);
     };
+    const matchesStoredRoom = (room: StoredSharedRoom | undefined): room is StoredSharedRoom => Boolean(room
+      && room.packageDigest === descriptor.packageDigest && room.role === role
+      && room.capability === encodeBase64Url(invite.capability) && room.roomKey === encodeBase64Url(invite.roomKey)
+      && room.writerPrivateSeed === (invite.writerPrivateSeed ? encodeBase64Url(invite.writerPrivateSeed) : undefined));
+    const reloadForTakeover = async (): Promise<void> => {
+      assertActive();
+      const verifiedMetadata = metadata;
+      if (!verifiedMetadata || !approved || !remembered) throw new Error('TAKEOVER_NOT_READY');
+      const room = await store().loadForTakeover(descriptor.roomId, storageGeneration);
+      if (!matchesStoredRoom(room) || !room.automergeBase64) throw new Error('LOCAL_STATE_INVALID');
+      validateReplicaMetadata(room);
+      let bytes: Uint8Array;
+      try { bytes = decodeBase64Url(room.automergeBase64); }
+      catch { throw new Error('LOCAL_STATE_INVALID'); }
+      const restored = await guardedState(async (active) => active.validate(
+        bytes, stableJson(verifiedMetadata.stateSchema), verifiedMetadata.maxPlaintextBytes), 'LOCAL_STATE_INVALID');
+      await ensureStoredActorMetadata(room, bytes);
+      assertActive();
+      localDocBytes?.fill(0);
+      localDocBytes = bytes;
+      actorIdHex = room.actorId;
+      currentState = restored.projectedState;
+      promoteRevision(room);
+      lineage = room.lineage ?? {version: 1, gaps: [], lastVerifiedEdge: null, unknownPriorHistory: true};
+      dirty = room.dirty;
+      isEditorHoldingLock = true;
+      await options.onPromoteEditor(structuredClone(currentState));
+      updateRoleBadge();
+      setStatus(dirty ? 'Saved locally · pending sync' : 'Saved locally');
+      requestSync();
+    };
+    const queueTakeover = (): void => {
+      if (takeoverQueued || forgotten || role !== 'editor' || !navigator.locks) return;
+      takeoverQueued = true;
+      void navigator.locks.request(`smallframe:room:${descriptor.roomId}`, async (lock) => {
+        if (!lock || forgotten) return;
+        try {
+          await serialized(reloadForTakeover);
+          await new Promise<void>((resolve) => { releaseLease = resolve; if (forgotten) resolve(); });
+        } catch {
+          isEditorHoldingLock = false;
+          updateRoleBadge();
+          setStatus('Takeover unavailable · local copy retained');
+        }
+      }).catch(() => setStatus('Takeover unavailable · local copy retained'));
+    };
 
     return {
       handleVerified: async (meta) => {
@@ -743,9 +793,7 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
         updateRoleBadge();
 
         const storedRoom = await store().loadRoom(descriptor.roomId, role);
-        if (storedRoom && storedRoom.packageDigest === descriptor.packageDigest && storedRoom.role === role
-          && storedRoom.capability === encodeBase64Url(invite.capability) && storedRoom.roomKey === encodeBase64Url(invite.roomKey)
-          && storedRoom.writerPrivateSeed === (invite.writerPrivateSeed ? encodeBase64Url(invite.writerPrivateSeed) : undefined)) {
+        if (matchesStoredRoom(storedRoom)) {
           validateReplicaMetadata(storedRoom);
           if (!storedRoom.automergeBase64) throw new Error('LOCAL_STATE_INVALID');
           let restoredBytes: Uint8Array;

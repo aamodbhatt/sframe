@@ -236,11 +236,14 @@ test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
     const viewerFragment = formatInviteFragment({descriptorJcsBytes: viewerSigned.jcsBytes,
       descriptorSignature: viewerSigned.signature, roomKey, capability: viewerCap});
     const second = await context.newPage();
+    const waitingEditor = await context.newPage();
     const inspector = await context.newPage();
     try {
       await gotoInvite(second, `/r/${activeRoomId}`, viewerFragment);
       await second.getByRole('button', {name: 'Open this exact version'}).click();
       await expect(second.frameLocator('iframe').getByText('0 decisions')).toBeVisible();
+      await gotoInvite(waitingEditor, `/r/${activeRoomId}`, fragment);
+      await expect(waitingEditor.locator('#role')).toHaveText('editor (read-only lease)');
       await inspector.goto('/?personal=1', {waitUntil: 'commit'});
       await inspector.waitForFunction(() => Boolean((globalThis as any).SmallframeSharedStore));
       await inspector.evaluate(async (id) => {
@@ -264,6 +267,7 @@ test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
       await page.getByRole('button', {name: 'Forget device'}).click();
       await expect(page).toHaveURL('about:blank');
       await expect(second).toHaveURL('about:blank');
+      await expect(waitingEditor).toHaveURL('about:blank');
       const forgotten = await inspector.evaluate(async (id) => {
         const store = (globalThis as any).SmallframeSharedStore;
         const database = await new Promise<IDBDatabase>((resolve, reject) => {
@@ -295,6 +299,7 @@ test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
       await expect(page.frameLocator('iframe').getByText('0 decisions')).toBeVisible();
     } finally {
       await second.close();
+      await waitingEditor.close();
       await inspector.close();
     }
   });
@@ -1037,7 +1042,53 @@ test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
       (await (globalThis as any).SmallframeSharedStore.loadRoom(id, 'editor')).revision, roomId);
     expect(savedRevision).toBe(1);
 
+    await page.close();
+    await expect(tab2.locator('#role')).toHaveText('editor');
+    await expect(secondApp.getByText('0 decisions')).toBeVisible();
+    await secondApp.getByRole('button', {name: 'Add decision'}).click();
+    await expect(secondApp.getByText('1 decisions')).toBeVisible();
+    await expect.poll(async () => tab2.evaluate(async (id) =>
+      (await (globalThis as any).SmallframeSharedStore.loadRoom(id, 'editor')).actorSequence, roomId)).toBe(1);
+
     await tab2.close();
+  });
+
+  test('a failed editor takeover read stays read-only and preserves the saved actor', async ({page, context}) => {
+    const signed = await createSignedRoomDescriptor({publisherPrivateKey: publisherPriv, roomId: activeRoomId,
+      packageDigest: sharedFixture.packageDigest, publisherKeyId: sharedFixture.publisherKeyId,
+      writerPublicKey: await getPublicKeyAsync(writerPriv), capability: editorCap, role: 'editor', expiresAt: activeExpiry});
+    const fragment = formatInviteFragment({descriptorJcsBytes: signed.jcsBytes, descriptorSignature: signed.signature,
+      roomKey, capability: editorCap, writerPrivateSeed: writerPriv});
+    await gotoInvite(page, `/r/${activeRoomId}`, fragment);
+    await page.getByRole('button', {name: 'Open this exact version'}).click();
+    await expect(page.frameLocator('iframe').getByText('0 decisions')).toBeVisible();
+    const waiting = await context.newPage();
+    try {
+      await gotoInvite(waiting, `/r/${activeRoomId}`, fragment);
+      await expect(waiting.locator('#role')).toHaveText('editor (read-only lease)');
+      await expect(waiting.frameLocator('iframe').getByText('0 decisions')).toBeVisible();
+      await waiting.evaluate(() => {
+        const original = IDBObjectStore.prototype.get;
+        IDBObjectStore.prototype.get = function(key) {
+          if (this.name === 'rooms') {
+            IDBObjectStore.prototype.get = original;
+            throw new DOMException('TEST_ONLY', 'InvalidStateError');
+          }
+          return original.call(this, key);
+        };
+      });
+      await page.close();
+      await expect(waiting.locator('#connectivity')).toContainText('Takeover unavailable');
+      await expect(waiting.locator('#role')).toHaveText('editor (read-only lease)');
+      const app = waiting.frameLocator('iframe');
+      await app.getByRole('button', {name: 'Add decision'}).click();
+      await expect(app.getByText('0 decisions')).toBeVisible();
+      const saved = await waiting.evaluate(async (id) => {
+        const room = await (globalThis as any).SmallframeSharedStore.loadRoom(id, 'editor');
+        return {revision: room.revision, actorSequence: room.actorSequence};
+      }, activeRoomId);
+      expect(saved).toEqual({revision: 1, actorSequence: 0});
+    } finally { await waiting.close(); }
   });
 
   test('two editors share genesis, edit offline concurrently, and converge through the real relay', async ({browser, request}) => {

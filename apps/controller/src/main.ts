@@ -583,6 +583,15 @@ const main = async (): Promise<void> => {
         post('sf.controller.approval', {state: localState, role});
       },
       onReplaceState: async (state: Record<string, unknown>) => replaceLocalState(structuredClone(state)),
+      onPromoteEditor: async (state: Record<string, unknown>) => {
+        const previousRole = sharedExecutionRole;
+        try {
+          await replaceLocalState(structuredClone(state), async () => { sharedExecutionRole = 'editor'; });
+        } catch (error) {
+          sharedExecutionRole = previousRole;
+          throw error;
+        }
+      },
       onForget: () => {
         controllerChannelTerminal = true;
         window.clearTimeout(rendererInitTimer);

@@ -37,6 +37,7 @@
 
   type SharedStoreApi = {
     loadRoom: (roomId: string, role?: 'viewer' | 'editor') => Promise<StoredSharedRoom | undefined>;
+    loadForTakeover: (roomId: string, generation: string) => Promise<StoredSharedRoom | undefined>;
     saveRoom: (room: StoredSharedRoom, approval?: StoredSharedApproval, generation?: string) => Promise<void>;
     forgetRoom: (roomId: string) => Promise<void>;
     generation: (roomId: string) => Promise<string>;
@@ -214,6 +215,8 @@
   };
   const api: SharedStoreApi = Object.freeze({
     loadRoom: loadWrappedRoom,
+    loadForTakeover: async (roomId, generation) => await navigator.locks.request(`smallframe:room-storage:${roomId}`,
+      async () => { await assertGeneration(roomId, generation); return await loadWrappedRoom(roomId, 'editor'); }),
     saveRoom: saveWrappedRoom,
     forgetRoom: async (roomId) => await navigator.locks.request(`smallframe:room-storage:${roomId}`,
       async () => await forgetStoredRoom(roomId)),
