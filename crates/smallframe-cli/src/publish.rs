@@ -27,12 +27,14 @@ fn http_post_json(
     url: &str,
     body: &serde_json::Value,
     auth_header: Option<&str>,
+    if_match: Option<&str>,
 ) -> Result<serde_json::Value, String> {
     let body_str = serde_json::to_string(body).map_err(|e| format!("SERIALIZE_FAILED: {e}"))?;
     let mut cmd = ProcessCommand::new("curl");
     cmd.args([
         "-s",
         "-S",
+        "-f",
         "-X",
         "POST",
         url,
@@ -43,6 +45,9 @@ fn http_post_json(
     ]);
     if let Some(auth) = auth_header {
         cmd.args(["-H", &format!("Authorization: {auth}")]);
+    }
+    if let Some(etag) = if_match {
+        cmd.args(["-H", &format!("If-Match: {etag}")]);
     }
     cmd.args(["--data-raw", &body_str]);
 
@@ -184,7 +189,7 @@ pub fn enroll_publisher(
     });
 
     let enroll_url = format!("{}/v1/enroll", api_url.trim_end_matches('/'));
-    let response = http_post_json(&enroll_url, &request_body, None)?;
+    let response = http_post_json(&enroll_url, &request_body, None, None)?;
 
     let token_str = Base64UrlUnpadded::encode_string(&raw_token);
     ctx.save_api_token(&token_str)?;
@@ -303,6 +308,7 @@ pub fn publish_package(
         &rooms_url,
         &room_creation_body,
         Some(&format!("Bearer {token}")),
+        None,
     )?;
 
     // 6. Save room secrets in vault
@@ -406,7 +412,7 @@ pub fn room_rotate_links(
         api_url.trim_end_matches('/'),
         room_id
     );
-    http_post_json(&url, &body, Some(&format!("SF-Cap {old_editor_cap}")))
+    http_post_json(&url, &body, Some(&format!("SF-Cap {old_editor_cap}")), None)
 }
 
 pub fn room_revoke(
@@ -424,15 +430,48 @@ pub fn room_revoke(
         api_url.trim_end_matches('/'),
         room_id
     );
-    http_post_json(&url, &json!({}), Some(&format!("SF-Cap {old_editor_cap}")))
+    http_post_json(
+        &url,
+        &json!({}),
+        Some(&format!("SF-Cap {old_editor_cap}")),
+        None,
+    )
+}
+
+fn validate_repair_etag(etag: &str) -> Result<(), String> {
+    let inner = etag
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .ok_or("EXPECTED_ETAG_INVALID")?;
+    let fields: Vec<_> = inner.split('.').collect();
+    if fields.len() != 4
+        || fields[0] != "sf1"
+        || fields[1]
+            .parse::<u64>()
+            .ok()
+            .is_none_or(|v| v > 16 || v.to_string() != fields[1])
+        || fields[2]
+            .parse::<u64>()
+            .ok()
+            .is_none_or(|v| v == 0 || v.to_string() != fields[2])
+        || Base64UrlUnpadded::decode_vec(fields[3])
+            .ok()
+            .is_none_or(|v| v.len() != 32)
+        || fields[3].len() != 43
+    {
+        return Err("EXPECTED_ETAG_INVALID".to_owned());
+    }
+    Ok(())
 }
 
 pub fn room_request_repair(
     ctx: &IdentityContext,
     room_id: &str,
-    _expected_etag: Option<&str>,
+    expected_etag: Option<&str>,
     api_url: &str,
 ) -> Result<serde_json::Value, String> {
+    let etag = expected_etag.ok_or("EXPECTED_ETAG_REQUIRED")?;
+    validate_repair_etag(etag)?;
     let room_rec = ctx.load_room_record(room_id)?;
     let old_editor_cap = room_rec
         .get("editorCapability")
@@ -443,5 +482,36 @@ pub fn room_request_repair(
         api_url.trim_end_matches('/'),
         room_id
     );
-    http_post_json(&url, &json!({}), Some(&format!("SF-Cap {old_editor_cap}")))
+    http_post_json(
+        &url,
+        &json!({}),
+        Some(&format!("SF-Cap {old_editor_cap}")),
+        Some(etag),
+    )
+}
+
+#[cfg(test)]
+mod repair_tests {
+    use super::validate_repair_etag;
+    use base64ct::{Base64UrlUnpadded, Encoding};
+
+    #[test]
+    fn expected_etag_requires_exact_canonical_head() {
+        let digest = Base64UrlUnpadded::encode_string(&[7_u8; 32]);
+        let valid = format!("\"sf1.0.42.{digest}\"");
+        assert!(validate_repair_etag(&valid).is_ok());
+        for invalid in [
+            valid.trim_matches('"').to_owned(),
+            format!("W/{valid}"),
+            format!("\"sf1.00.42.{digest}\""),
+            format!("\"sf1.0.042.{digest}\""),
+            format!("\"sf1.17.42.{digest}\""),
+            format!("\"sf1.0.0.{digest}\""),
+            format!("\"sf1.0.42.{}\"", &digest[..42]),
+            format!("\"sf1.0.42.{digest}=\""),
+            format!("\"sf1.0.42.{digest}.extra\""),
+        ] {
+            assert!(validate_repair_etag(&invalid).is_err());
+        }
+    }
 }

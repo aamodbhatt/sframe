@@ -137,6 +137,11 @@ describe('SQLite Durable Object Phase 3 Protocol & Lifecycle', () => {
     expect((await put(wrongPackage.envelope)).status).toBe(403);
     const winners = await Promise.all([put(next.envelope), put(next.envelope)]);
     expect(winners.map((r) => r.status).sort()).toEqual([204, 409]);
+    const unsignedRepair = await fetch(`${apiOrigin}/v1/rooms/${room}/request-repair`, {method: 'POST',
+      headers: {Origin: CONTROLLER_ORIGIN, Authorization: authorization(editor), 'If-Match': next.etag},
+      body: '{}'});
+    expect(unsignedRepair.status).toBe(503);
+    expect((await read(next.etag)).status).toBe(304);
     const recovery = await fetch(`${apiOrigin}/v1/rooms/${room}/recover`, {method: 'POST',
       headers: {Origin: CONTROLLER_ORIGIN, Authorization: authorization(editor)}, body: '{}'});
     expect(recovery.status).toBe(503);
@@ -285,34 +290,48 @@ describe('SQLite Durable Object Phase 3 Protocol & Lifecycle', () => {
     const editor = capability(0x83);
 
     await initializeRoom(room, viewer, editor, Uint8Array.of(1, 2, 3));
+    const stateUrl = `${apiOrigin}/v1/rooms/${room}/state`;
+    const initial = await fetch(stateUrl, {headers: {Authorization: authorization(viewer), Origin: CONTROLLER_ORIGIN}});
+    const initialEtag = initial.headers.get('ETag');
+    expect(initialEtag).toBeTruthy();
+    const repairUrl = `${apiOrigin}/v1/rooms/${room}/request-repair`;
+    const repairHeaders = {Authorization: authorization(editor), Origin: CONTROLLER_ORIGIN, 'If-Match': initialEtag!};
+    expect((await fetch(repairUrl, {method: 'POST', headers: {Authorization: authorization(viewer), Origin: CONTROLLER_ORIGIN, 'If-Match': initialEtag!}})).status).toBe(403);
+    expect((await fetch(repairUrl, {method: 'POST', headers: {Authorization: authorization(editor), Origin: CONTROLLER_ORIGIN}})).status).toBe(409);
+    expect((await fetch(repairUrl, {method: 'POST', headers: {...repairHeaders, 'If-Match': '"stale"'}})).status).toBe(409);
+    expect((await fetch(stateUrl, {headers: {Authorization: authorization(viewer), Origin: CONTROLLER_ORIGIN, 'If-None-Match': initialEtag!}})).status).toBe(304);
+    const recoverUrl = `${apiOrigin}/v1/rooms/${room}/recover`;
+    const recoveryHeaders = {Authorization: authorization(editor), 'Content-Type': 'application/json', Origin: CONTROLLER_ORIGIN, 'If-Match': initialEtag!};
+    const recoveryBody = {newEpoch: 1, ciphertext: base64url(Uint8Array.of(9, 9, 9))};
+    expect((await fetch(recoverUrl, {method: 'POST', headers: recoveryHeaders, body: JSON.stringify(recoveryBody)})).status).toBe(409);
 
     // Request repair
-    const repairRes = await fetch(`${apiOrigin}/v1/rooms/${room}/request-repair`, {
+    const repairRes = await fetch(repairUrl, {
       method: 'POST',
-      headers: {
-        Authorization: authorization(editor),
-        Origin: CONTROLLER_ORIGIN,
-      },
+      headers: repairHeaders,
     });
     expect(repairRes.status).toBe(200);
+    expect((await fetch(repairUrl, {method: 'POST', headers: repairHeaders})).status).toBe(409);
+    for (const body of [
+      {...recoveryBody, newEpoch: 3},
+      {...recoveryBody, extra: true},
+      {...recoveryBody, ciphertext: 'AAAA='},
+    ]) {
+      expect((await fetch(recoverUrl, {method: 'POST', headers: recoveryHeaders, body: JSON.stringify(body)})).status).toBe(400);
+    }
+    expect((await fetch(recoverUrl, {method: 'POST', headers: {...recoveryHeaders, 'If-Match': '"stale"'}, body: JSON.stringify(recoveryBody)})).status).toBe(409);
 
     // Recover forward to epoch 1
-    const recoverRes = await fetch(`${apiOrigin}/v1/rooms/${room}/recover`, {
+    const recoverRes = await fetch(recoverUrl, {
       method: 'POST',
-      headers: {
-        Authorization: authorization(editor),
-        'Content-Type': 'application/json',
-        Origin: CONTROLLER_ORIGIN,
-      },
-      body: JSON.stringify({
-        newEpoch: 1,
-        ciphertext: base64url(Uint8Array.of(9, 9, 9)),
-      }),
+      headers: recoveryHeaders,
+      body: JSON.stringify(recoveryBody),
     });
     expect(recoverRes.status).toBe(200);
     const recovered = await recoverRes.json();
     expect(recovered.epoch).toBe(1);
     expect(recovered.revision).toBe(1);
+    expect((await fetch(recoverUrl, {method: 'POST', headers: recoveryHeaders, body: JSON.stringify(recoveryBody)})).status).toBe(409);
 
     // Read state in new epoch
     const stateRes = await fetch(`${apiOrigin}/v1/rooms/${room}/state`, {

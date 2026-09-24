@@ -312,10 +312,23 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
 
   private async requestRepair(request: Request, room: RoomRow): Promise<Response> {
     if (!await this.authorize(request, room, true)) return problem(403, 'ROOM_AUTH_INVALID');
-    this.ctx.storage.sql.exec(
-      `UPDATE room_state SET recovery_status = 'RECOVERY_REQUIRED' WHERE singleton = 1 AND room_id = ?`,
-      room.room_id
-    ).toArray();
+    // Encrypted rooms need the publisher's signed exact-head statement. An
+    // editor capability alone must never freeze a room while that flow is absent.
+    if (room.aad_json || this.env.ENVIRONMENT !== 'local') return problem(503, 'SIGNED_REPAIR_NOT_IMPLEMENTED');
+    const frozen = this.ctx.storage.transactionSync(() => {
+      const current = this.loadRoom(room.room_id);
+      if (!current || !this.isActive(current)) return 'unavailable';
+      if (request.headers.get('If-Match') !== current.etag) return 'stale';
+      if (current.recovery_status !== 'ACTIVE') return 'frozen';
+      this.ctx.storage.sql.exec(
+        `UPDATE room_state SET recovery_status = 'RECOVERY_REQUIRED' WHERE singleton = 1 AND room_id = ?`,
+        room.room_id
+      ).toArray();
+      return 'ok';
+    });
+    if (frozen === 'unavailable') return problem(403, 'ROOM_AUTH_INVALID');
+    if (frozen === 'stale') return problem(409, 'REVISION_CONFLICT');
+    if (frozen === 'frozen') return problem(409, 'RECOVERY_REQUIRED');
 
     for (const socket of this.ctx.getWebSockets()) {
       try { socket.close(1008, 'recovery required'); } catch {}
@@ -327,27 +340,40 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
     if (!await this.authorize(request, room, true)) return problem(403, 'ROOM_AUTH_INVALID');
     // Signed epoch recovery is not implemented yet. Do not allow the legacy
     // opaque-byte test hook to reset an encrypted room without its signatures.
-    if (room.aad_json) return problem(503, 'SIGNED_RECOVERY_NOT_IMPLEMENTED');
-    let body: any;
+    if (room.aad_json || this.env.ENVIRONMENT !== 'local') return problem(503, 'SIGNED_RECOVERY_NOT_IMPLEMENTED');
+    if (request.headers.get('If-Match') !== room.etag) return problem(409, 'REVISION_CONFLICT');
+    if (room.recovery_status !== 'RECOVERY_REQUIRED') return problem(409, 'RECOVERY_STATE_INVALID');
+    const bounded = await readBoundedBody(request, 724_992);
+    if (bounded.kind !== 'ok') return problem(400, 'BODY_INVALID');
+    let body: unknown;
     try {
-      body = await request.json();
+      body = parseUniqueJson(new TextDecoder('utf-8', {fatal: true}).decode(bounded.body));
     } catch {
       return problem(400, 'BODY_INVALID');
     }
-    const newEpoch = typeof body?.newEpoch === 'number' ? body.newEpoch : room.state_epoch + 1;
-    const ciphertext = typeof body?.ciphertext === 'string' ? decodeBase64Url(body.ciphertext, MAX_STATE_BYTES) : null;
-    if (!ciphertext) return problem(400, 'BODY_INVALID');
+    if (!body || typeof body !== 'object' || Array.isArray(body)) return problem(400, 'BODY_INVALID');
+    const fields = body as Record<string, unknown>;
+    if (Object.keys(fields).sort().join() !== 'ciphertext,newEpoch' || !Number.isSafeInteger(fields.newEpoch)
+      || fields.newEpoch !== room.state_epoch + 1 || typeof fields.ciphertext !== 'string') return problem(400, 'BODY_INVALID');
+    const ciphertext = decodeBase64Url(fields.ciphertext, MAX_STATE_BYTES);
+    if (!ciphertext || encodeBase64Url(ciphertext) !== fields.ciphertext) return problem(400, 'BODY_INVALID');
+    const newEpoch = fields.newEpoch as number;
     const digest = encodeBase64Url(await sha256(ciphertext));
     const etag = this.etag(newEpoch, 1, digest);
-
-    this.ctx.storage.sql.exec(
-      `UPDATE room_state SET state_epoch = ?, revision = 1, envelope_digest = ?, ciphertext = ?, etag = ?, recovery_status = 'ACTIVE' WHERE singleton = 1 AND room_id = ?`,
-      newEpoch,
-      digest,
-      exactArrayBuffer(ciphertext),
-      etag,
-      room.room_id
-    ).toArray();
+    const committed = this.ctx.storage.transactionSync(() => {
+      const current = this.loadRoom(room.room_id);
+      if (!current || !this.isActive(current)) return 'unavailable';
+      if (request.headers.get('If-Match') !== current.etag) return 'stale';
+      if (current.recovery_status !== 'RECOVERY_REQUIRED' || current.state_epoch + 1 !== newEpoch) return 'wrong-state';
+      this.ctx.storage.sql.exec(
+        `UPDATE room_state SET state_epoch = ?, revision = 1, envelope_digest = ?, ciphertext = ?, etag = ?, recovery_status = 'ACTIVE' WHERE singleton = 1 AND room_id = ?`,
+        newEpoch, digest, exactArrayBuffer(ciphertext), etag, room.room_id
+      ).toArray();
+      return 'ok';
+    });
+    if (committed === 'unavailable') return problem(403, 'ROOM_AUTH_INVALID');
+    if (committed === 'stale') return problem(409, 'REVISION_CONFLICT');
+    if (committed === 'wrong-state') return problem(409, 'RECOVERY_STATE_INVALID');
 
     const hint: RevisionHint = {type: 'revision', epoch: newEpoch, revision: 1, envelopeDigest: digest};
     this.publishHint(hint);
