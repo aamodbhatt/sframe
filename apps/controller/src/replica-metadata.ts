@@ -10,6 +10,18 @@ const canonicalBytes = (value: unknown, maximumBytes: number): Uint8Array => {
   return bytes;
 };
 
+const validateActorMetadata = (room: Record<string, unknown>): void => {
+  if ((room.actorSequence === undefined) !== (room.automergeHeads === undefined)) throw new Error();
+  if (room.actorSequence === undefined) return;
+  if (!boundedInteger(room.actorSequence, 0, 10_000) || !Array.isArray(room.automergeHeads)
+    || room.automergeHeads.length > 128) throw new Error();
+  let previous = '';
+  for (const head of room.automergeHeads) {
+    if (typeof head !== 'string' || !/^[0-9a-f]{64}$/u.test(head) || head <= previous) throw new Error();
+    previous = head;
+  }
+};
+
 // Document/schema validation still runs separately inside the state Worker.
 export const validateReplicaMetadata = (value: unknown): void => {
   try {
@@ -19,6 +31,7 @@ export const validateReplicaMetadata = (value: unknown): void => {
     const digest = canonicalBytes(room.envelopeDigest, 32);
     if (digest.byteLength !== 32 || room.etag !== computeEtag(room.stateEpoch, room.revision, digest)) throw new Error();
     if (typeof room.actorId !== 'string' || !/^[0-9a-f]{32}$/u.test(room.actorId)) throw new Error();
+    validateActorMetadata(room);
     if (typeof room.dirty !== 'boolean' || !boundedInteger(room.updatedAt, 0, Number.MAX_SAFE_INTEGER)) throw new Error();
     canonicalBytes(room.automergeBase64, 475_136);
     validateLineage(room.lineage, room.stateEpoch as number, room.revision as number, room.envelopeDigest as string);

@@ -23,6 +23,8 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
     lineage?: ReplicaLineage;
     dirty: boolean;
     actorId: string;
+    actorSequence?: number;
+    automergeHeads?: string[];
     automergeBase64?: string | undefined;
     updatedAt: number;
   };
@@ -141,6 +143,10 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
 
     async validate(docBytes: Uint8Array, stateSchemaJson: string, maxPlaintextBytes: number): Promise<{projectedState: Record<string, unknown>}> {
       return this.call('validate', {docBytes, stateSchemaJson, maxPlaintextBytes});
+    }
+
+    async actorMetadata(docBytes: Uint8Array, actorIdHex: string): Promise<{actorSequence: number; heads: string[]}> {
+      return this.call('actor_metadata', {docBytes, actorIdHex});
     }
 
     async encrypt(params: {
@@ -385,7 +391,10 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
     const persistRoom = async (dirty: boolean, state = currentState, docBytes = localDocBytes,
       approval?: StoredSharedApproval, tuple = revisionTuple(), candidateLineage = lineage): Promise<void> => {
       assertActive();
-      if ((!remembered && !approval) || (role === 'editor' && !isEditorHoldingLock)) return;
+      if (!remembered && !approval) return;
+      if (role === 'editor' && !isEditorHoldingLock) throw new Error('READ_ONLY_LEASE');
+      if (!docBytes) throw new Error('LOCAL_STATE_INVALID');
+      const actorMetadata = await guardedState(async (active) => active.actorMetadata(docBytes, actorIdHex), 'LOCAL_STATE_INVALID');
         await store().saveRoom({
           roomId: descriptor.roomId,
           packageDigest: descriptor.packageDigest,
@@ -398,6 +407,8 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
           lineage: candidateLineage,
           dirty,
           actorId: actorIdHex,
+          actorSequence: actorMetadata.actorSequence,
+          automergeHeads: actorMetadata.heads,
           automergeBase64: docBytes ? encodeBase64Url(docBytes) : undefined,
           updatedAt: Date.now()
         }, approval, storageGeneration);
@@ -698,6 +709,20 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
     element('review-export').addEventListener('click', exportPackage);
     element('leave-package').addEventListener('click', () => { window.location.href = 'about:blank'; });
 
+    const ensureStoredActorMetadata = async (room: StoredSharedRoom, bytes: Uint8Array): Promise<void> => {
+      const actual = await guardedState(async (active) => active.actorMetadata(bytes, room.actorId), 'LOCAL_STATE_INVALID');
+      if (room.actorSequence !== undefined) {
+        if (room.actorSequence !== actual.actorSequence || stableJson(room.automergeHeads) !== stableJson(actual.heads)) {
+          throw new Error('LOCAL_STATE_INVALID');
+        }
+        return;
+      }
+      // Upgrade an older authenticated local record before making it editable.
+      await store().saveRoom({...room, actorSequence: actual.actorSequence, automergeHeads: actual.heads,
+        lineage: room.lineage ?? {version: 1, gaps: [], lastVerifiedEdge: null, unknownPriorHistory: true}},
+      undefined, storageGeneration);
+    };
+
     return {
       handleVerified: async (meta) => {
         await authenticateInvite(invite, meta, location.pathname);
@@ -729,6 +754,7 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
           const restored = await guardedState(async (active) => active.validate(
             restoredBytes, stableJson(meta.stateSchema), meta.maxPlaintextBytes
           ), 'LOCAL_STATE_INVALID');
+          await ensureStoredActorMetadata(storedRoom, restoredBytes);
           actorIdHex = storedRoom.actorId;
           currentEpoch = storedRoom.stateEpoch;
           currentRevision = storedRoom.revision;

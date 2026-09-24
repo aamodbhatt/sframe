@@ -389,9 +389,57 @@ pub fn validate_document(doc_bytes: &[u8], max_bytes: usize) -> Result<(), Strin
     Ok(())
 }
 
+pub fn actor_document_metadata(
+    doc_bytes: &[u8],
+    actor_id_bytes: &[u8],
+) -> Result<(u64, Vec<String>), String> {
+    if actor_id_bytes.len() != 16 {
+        return Err("ACTOR_ID_INVALID".into());
+    }
+    validate_document(doc_bytes, MAX_AUTOMERGE_BYTES)?;
+    let doc = Automerge::load(doc_bytes).map_err(|_| "AUTOMERGE_CORRUPT".to_string())?;
+    let actor = ActorId::from(actor_id_bytes);
+    let sequence = doc
+        .get_changes(&[])
+        .iter()
+        .filter(|change| change.actor_id() == &actor)
+        .map(|change| change.seq())
+        .max()
+        .unwrap_or(0);
+    if sequence > MAX_CHANGES as u64 {
+        return Err("MAX_ACTOR_SEQUENCE_EXCEEDED".into());
+    }
+    let mut heads: Vec<String> = doc.get_heads().iter().map(ToString::to_string).collect();
+    heads.sort_unstable();
+    Ok((sequence, heads))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn actor_metadata_tracks_local_sequence_and_merged_heads() {
+        let local_actor = [0x42u8; 16];
+        let remote_actor = [0x43u8; 16];
+        let genesis = create_genesis_document(r#"{"a":1}"#, &local_actor).expect("genesis");
+        let (initial_sequence, initial_heads) =
+            actor_document_metadata(&genesis, &local_actor).expect("metadata");
+        assert_eq!(initial_sequence, 1);
+        assert_eq!(initial_heads.len(), 1);
+        let local = apply_patch_to_document(&genesis, r#"{"a":2}"#, &local_actor).expect("local");
+        let remote =
+            apply_patch_to_document(&genesis, r#"{"a":1,"b":3}"#, &remote_actor).expect("remote");
+        let merged = merge_documents(&local, &remote).expect("merge");
+        let (sequence, heads) = actor_document_metadata(&merged, &local_actor).expect("metadata");
+        assert_eq!(sequence, 2);
+        assert_eq!(heads.len(), 2);
+        assert!(heads.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(
+            actor_document_metadata(&merged, &[0; 15]),
+            Err("ACTOR_ID_INVALID".into())
+        );
+    }
 
     #[test]
     fn atomic_arrays_do_not_collide_with_user_strings() {

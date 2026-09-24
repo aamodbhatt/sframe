@@ -82,6 +82,8 @@ test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
         try {
           ui = await page.evaluate(() => ({readyState: document.readyState,
             approvalPresent: Boolean(document.querySelector('#approve-package')),
+            trustErrorCode: /^[A-Z_]{3,64}$/u.test(document.querySelector('#trust-description')?.textContent?.trim() ?? '')
+              ? document.querySelector('#trust-description')?.textContent?.trim() : null,
             trustVisible: Boolean(document.querySelector('#trust-panel') && !(document.querySelector('#trust-panel') as HTMLElement).hidden),
             runtimeVisible: Boolean(document.querySelector('#runtime-panel') && !(document.querySelector('#runtime-panel') as HTMLElement).hidden),
             iframeCount: document.querySelectorAll('iframe').length,
@@ -110,6 +112,10 @@ test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
       await page.getByRole('button', {name: 'Open this exact version'}).click();
       await expect(page.frameLocator('iframe').getByText('0 decisions')).toBeVisible();
       await page.goto('/icon.svg', {waitUntil: 'commit'});
+      if (role === 'editor') await page.waitForFunction(async (roomId) => {
+        const locks = await navigator.locks.query();
+        return !locks.held?.some((lock) => lock.name === `smallframe:room:${roomId}`);
+      }, activeRoomId);
       const jump = await advanceRelay(request, 2);
       await gotoInvite(page, `/r/${activeRoomId}`, fragment);
       await expect(page.locator('#connectivity')).toContainText('intervening relay history was not verified');
@@ -122,6 +128,10 @@ test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
       expect(gap.gaps).toEqual([{from: {stateEpoch: 0, revision: 1, envelopeDigest: activeGenesisDigest},
         to: {stateEpoch: 0, revision: 3, envelopeDigest: jump.digest}}]);
       await page.goto('/icon.svg', {waitUntil: 'commit'});
+      if (role === 'editor') await page.waitForFunction(async (roomId) => {
+        const locks = await navigator.locks.query();
+        return !locks.held?.some((lock) => lock.name === `smallframe:room:${roomId}`);
+      }, activeRoomId);
       await advanceRelay(request, 1, jump);
       await gotoInvite(page, `/r/${activeRoomId}`, fragment);
       await expect(page.locator('#connectivity')).toContainText('intervening relay history was not verified');
@@ -605,7 +615,7 @@ test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
     });
   }
 
-  for (const field of ['revision', 'etag', 'actorId', 'dirty', 'automergeBase64'] as const) {
+  for (const field of ['revision', 'etag', 'actorId', 'actorSequence', 'automergeHeads', 'dirty', 'automergeBase64'] as const) {
     test(`rejects authenticated local corruption in ${field} before state access`, async ({page}) => {
       const signed = await createSignedRoomDescriptor({publisherPrivateKey: publisherPriv, roomId: activeRoomId,
         packageDigest: sharedFixture.packageDigest, publisherKeyId: sharedFixture.publisherKeyId,
@@ -633,7 +643,8 @@ test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
         const aad = new TextEncoder().encode(`smallframe/local-room/v1:${roomId}`);
         const plaintext = await crypto.subtle.decrypt({name: 'AES-GCM', iv: wrapped.nonce, additionalData: aad}, device.key, wrapped.ciphertext);
         const room = JSON.parse(new TextDecoder().decode(plaintext));
-        const invalid = {revision: 0, etag: '*', actorId: 'g'.repeat(32), dirty: 'false', automergeBase64: 'AB'};
+        const invalid = {revision: 0, etag: '*', actorId: 'g'.repeat(32), actorSequence: 1,
+          automergeHeads: ['0'.repeat(64)], dirty: 'false', automergeBase64: 'AB'};
         room[field] = invalid[field];
         const nonce = crypto.getRandomValues(new Uint8Array(12));
         const ciphertext = await crypto.subtle.encrypt({name: 'AES-GCM', iv: nonce, additionalData: aad}, device.key,
@@ -654,6 +665,74 @@ test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
       expect(stateRequests).toBe(0);
     });
   }
+
+  test('commits actor sequence and Automerge heads with local edits and checks them on reopen', async ({page}) => {
+    const signed = await createSignedRoomDescriptor({publisherPrivateKey: publisherPriv, roomId: activeRoomId,
+      packageDigest: sharedFixture.packageDigest, publisherKeyId: sharedFixture.publisherKeyId,
+      writerPublicKey: await getPublicKeyAsync(writerPriv), capability: editorCap, role: 'editor', expiresAt: activeExpiry});
+    const fragment = formatInviteFragment({descriptorJcsBytes: signed.jcsBytes, descriptorSignature: signed.signature,
+      roomKey, capability: editorCap, writerPrivateSeed: writerPriv});
+    await gotoInvite(page, `/r/${activeRoomId}`, fragment);
+    await page.getByRole('button', {name: 'Open this exact version'}).click();
+    const app = page.frameLocator('iframe');
+    await expect(app.getByText('0 decisions')).toBeVisible();
+    const metadata = async () => page.evaluate(async (roomId) => {
+      const room = await (globalThis as any).SmallframeSharedStore.loadRoom(roomId, 'editor');
+      return {actorSequence: room.actorSequence, heads: room.automergeHeads};
+    }, activeRoomId);
+    const initial = await metadata();
+    expect(initial.actorSequence).toBe(0);
+    expect(initial.heads).toHaveLength(1);
+    await page.goto('/icon.svg', {waitUntil: 'commit'});
+    await page.evaluate(async (roomId) => {
+      const database = await new Promise<IDBDatabase>((resolve, reject) => {
+        const request = indexedDB.open('smallframe-shared-v1', 2);
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+      const read = (name: string): Promise<any> => new Promise((resolve) => {
+        const request = database.transaction(name).objectStore(name).get(roomId);
+        request.onsuccess = () => resolve(request.result);
+      });
+      const [wrapped, device] = await Promise.all([read('rooms'), read('deviceKeys')]);
+      const aad = new TextEncoder().encode(`smallframe/local-room/v1:${roomId}`);
+      const plaintext = await crypto.subtle.decrypt({name: 'AES-GCM', iv: wrapped.nonce, additionalData: aad},
+        device.key, wrapped.ciphertext);
+      const room = JSON.parse(new TextDecoder().decode(plaintext));
+      delete room.actorSequence;
+      delete room.automergeHeads;
+      const nonce = crypto.getRandomValues(new Uint8Array(12));
+      const ciphertext = await crypto.subtle.encrypt({name: 'AES-GCM', iv: nonce, additionalData: aad}, device.key,
+        new TextEncoder().encode(JSON.stringify(room)));
+      await new Promise<void>((resolve, reject) => {
+        const transaction = database.transaction('rooms', 'readwrite');
+        transaction.objectStore('rooms').put({version: 1, roomId, nonce, ciphertext});
+        transaction.oncomplete = () => resolve();
+        transaction.onabort = () => reject(transaction.error);
+      });
+      database.close();
+    }, activeRoomId);
+    await gotoInvite(page, `/r/${activeRoomId}`, fragment);
+    await expect(page.frameLocator('iframe').getByText('0 decisions')).toBeVisible();
+    expect(await metadata()).toEqual(initial);
+    await app.getByRole('button', {name: 'Add decision'}).click();
+    await expect(app.getByText('1 decisions')).toBeVisible();
+    await expect.poll(async () => (await metadata()).actorSequence).toBe(1);
+    const edited = await metadata();
+    expect(edited.heads).toHaveLength(1);
+    expect(edited.heads).not.toEqual(initial.heads);
+    const staleSequenceRejected = await page.evaluate(async (roomId) => {
+      const store = (globalThis as any).SmallframeSharedStore;
+      const room = await store.loadRoom(roomId, 'editor');
+      try { await store.saveRoom({...room, actorSequence: 0}); return false; }
+      catch { return true; }
+    }, activeRoomId);
+    expect(staleSequenceRejected).toBe(true);
+    await page.goto('/icon.svg', {waitUntil: 'commit'});
+    await gotoInvite(page, `/r/${activeRoomId}`, fragment);
+    await expect(page.frameLocator('iframe').getByText('1 decisions')).toBeVisible();
+    expect((await metadata()).actorSequence).toBe(1);
+  });
 
   test('rejects a relay ETag that differs from the authenticated envelope', async ({page}) => {
     const signed = await createSignedRoomDescriptor({publisherPrivateKey: publisherPriv, roomId: activeRoomId,
@@ -904,7 +983,7 @@ test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
     expect(interceptedPutBody.includes('Untitled')).toBe(false);
   });
 
-  test('enforces single-editor web lock lease within the same profile', async ({page, context}) => {
+  test('enforces single-editor web lock lease within the same profile', async ({page, context, request}) => {
     const roomId = activeRoomId;
     const packageDigest = sharedFixture.packageDigest;
     const publisherKeyId = sharedFixture.publisherKeyId;
@@ -947,6 +1026,16 @@ test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
     const secondApp = tab2.frameLocator('iframe');
     await secondApp.getByRole('button', {name: 'Add decision'}).click();
     await expect(secondApp.getByText('0 decisions')).toBeVisible();
+
+    // A read-only editor must not publish a newer head only to memory while
+    // the lock owner still holds the durable actor/document record.
+    await page.route('**/v1/rooms/*/state', (route) => route.fulfill({status: 503}));
+    await advanceRelay(request, 2);
+    await tab2.evaluate(() => window.dispatchEvent(new Event('focus')));
+    await expect(tab2.locator('#connectivity')).toContainText('Sync paused');
+    const savedRevision = await tab2.evaluate(async (id) =>
+      (await (globalThis as any).SmallframeSharedStore.loadRoom(id, 'editor')).revision, roomId);
+    expect(savedRevision).toBe(1);
 
     await tab2.close();
   });

@@ -336,6 +336,11 @@ self.onmessage = async (event) => {
       const {docBytes, stateSchemaJson, maxPlaintextBytes} = event.data;
       const projectedState = validateProjectedDocument(docBytes, stateSchemaJson, maxPlaintextBytes);
       self.postMessage({id, ok: true, projectedState});
+    } else if (type === 'actor_metadata') {
+      const {docBytes, actorIdHex} = event.data;
+      const metadata = JSON.parse(wasm_automerge_actor_metadata(docBytes, actorIdHex));
+      if (!metadata.ok) throw new Error(metadata.error?.code || 'LOCAL_STATE_INVALID');
+      self.postMessage({id, ok: true, actorSequence: metadata.actorSequence, heads: metadata.heads});
     } else if (type === 'encrypt') {
       const result = await encryptSnapshot(event.data);
       self.postMessage({id, ok: true, ...result});

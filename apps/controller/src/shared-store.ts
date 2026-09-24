@@ -17,6 +17,8 @@
     lineage?: ReplicaLineage;
     dirty: boolean;
     actorId: string;
+    actorSequence?: number;
+    automergeHeads?: string[];
     automergeBase64?: string | undefined;
     updatedAt: number;
   };
@@ -181,6 +183,11 @@
     if (prior.lineage?.gaps.some((gap, index) => JSON.stringify(room.lineage?.gaps[index]) !== JSON.stringify(gap))) {
       throw new Error('LOCAL_STALE_WRITE');
     }
+    assertActorWrite(prior, room);
+  };
+  const assertActorWrite = (prior: StoredSharedRoom, room: StoredSharedRoom): void => {
+    if (prior.actorId !== room.actorId || (prior.actorSequence !== undefined
+      && (room.actorSequence === undefined || room.actorSequence < prior.actorSequence))) throw new Error('LOCAL_STALE_WRITE');
   };
   const saveWrappedRoom = async (room: StoredSharedRoom, approval?: StoredSharedApproval, generation = ''): Promise<void> => {
     if (approval && (approval.roomId !== room.roomId || approval.packageDigest !== room.packageDigest || approval.role !== room.role)) {

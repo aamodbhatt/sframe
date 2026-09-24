@@ -10,6 +10,18 @@ const valid = () => ({stateEpoch: 0, revision: 1, envelopeDigest: 'A'.repeat(43)
 describe('restored replica metadata', () => {
   it('accepts structurally valid metadata for separate document validation', () => {
     expect(() => validateReplicaMetadata(valid())).not.toThrow();
+    expect(() => validateReplicaMetadata({...valid(), actorSequence: 1, automergeHeads: ['a'.repeat(64)]})).not.toThrow();
+  });
+  it('bounds and validates actor sequence and document heads together', () => {
+    const base = {...valid(), actorSequence: 1, automergeHeads: ['a'.repeat(64)]};
+    for (const malformed of [
+      {...base, actorSequence: -1}, {...base, actorSequence: 10_001},
+      {...base, actorSequence: 1.5}, {...base, actorSequence: undefined},
+      {...base, automergeHeads: undefined}, {...base, automergeHeads: ['A'.repeat(64)]},
+      {...base, automergeHeads: ['a'.repeat(64), 'a'.repeat(64)]},
+      {...base, automergeHeads: ['b'.repeat(64), 'a'.repeat(64)]},
+      {...base, automergeHeads: Array.from({length: 129}, (_, i) => i.toString(16).padStart(64, '0'))}
+    ]) expect(() => validateReplicaMetadata(malformed)).toThrow('LOCAL_STATE_INVALID');
   });
   const invalid: [string, unknown][] = [
     ['stateEpoch', -1], ['stateEpoch', 17], ['stateEpoch', '0'], ['stateEpoch', 0.5],

@@ -174,3 +174,16 @@ pub fn wasm_automerge_validate(doc_bytes: &[u8], max_bytes: u32) -> String {
         Err(e) => json!({"ok": false, "error": {"code": e}}).to_string(),
     }
 }
+
+#[wasm_bindgen]
+pub fn wasm_automerge_actor_metadata(doc_bytes: &[u8], actor_id_hex: &str) -> String {
+    let result = decode_hex_actor(actor_id_hex)
+        .map_err(|_| "ACTOR_ID_HEX_INVALID".to_string())
+        .and_then(|actor| crate::crdt::actor_document_metadata(doc_bytes, &actor));
+    match result {
+        Ok((actor_sequence, heads)) => {
+            json!({"ok": true, "actorSequence": actor_sequence, "heads": heads}).to_string()
+        }
+        Err(error) => json!({"ok": false, "error": {"code": error}}).to_string(),
+    }
+}
