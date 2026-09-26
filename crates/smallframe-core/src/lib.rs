@@ -27,8 +27,10 @@ pub use package::{
     package_digest, sha256, validate_source_files, verify_package_archive, verify_package_files,
 };
 pub use recovery::{
-    MAX_REPAIR_RECORD_BYTES, POISONED_HEAD_PAYLOAD_TYPE, PoisonedHeadRepairRecord,
-    parse_poisoned_head_repair, verify_poisoned_head_repair,
+    MAX_RECOVERY_TRANSITION_BYTES, MAX_REPAIR_RECORD_BYTES, POISONED_HEAD_PAYLOAD_TYPE,
+    PoisonedHeadRepairRecord, RECOVERY_TRANSITION_PAYLOAD_TYPE, RecoveryTransitionRecord,
+    parse_poisoned_head_repair, parse_recovery_transition, verify_poisoned_head_repair,
+    verify_recovery_transition,
 };
 
 #[cfg(feature = "wasm")]

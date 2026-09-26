@@ -1,12 +1,14 @@
 import {randomBytes} from 'node:crypto';
 import {readFileSync} from 'node:fs';
 import canonicalize from 'canonicalize';
-import {getPublicKeyAsync, signAsync} from '@noble/ed25519';
+import {getPublicKeyAsync, signAsync, verifyAsync} from '@noble/ed25519';
 import {describe, expect, it} from 'vitest';
 import {decodeBase64Url, encodeBase64Url, sha256} from '../packages/protocol/src/crypto-envelope.js';
 import {dssePae} from '../packages/protocol/src/room-descriptor.js';
 import {MAX_REPAIR_RECORD_BYTES, POISONED_HEAD_PAYLOAD_TYPE, parsePoisonedHeadRepairRecord,
-  signPoisonedHeadRepair, verifyPoisonedHeadRepair, type PoisonedHeadRepairRecord} from '../packages/protocol/src/recovery.js';
+  signPoisonedHeadRepair, verifyPoisonedHeadRepair, type PoisonedHeadRepairRecord,
+  MAX_RECOVERY_TRANSITION_BYTES, RECOVERY_TRANSITION_PAYLOAD_TYPE, parseRecoveryTransitionRecord,
+  signRecoveryTransition, verifyRecoveryTransition, type RecoveryTransitionRecord} from '../packages/protocol/src/recovery.js';
 
 const vector = JSON.parse(readFileSync(new URL('../packages/protocol/vectors/poisoned-head-repair-v1.json', import.meta.url), 'utf8')) as {
   record: PoisonedHeadRepairRecord; jcsBase64Url: string; paeSha256: string; publisherPublicKey: string; signature: string;
@@ -76,4 +78,98 @@ describe('bounded exact-head publisher repair records', () => {
     expect(await verifyPoisonedHeadRepair(immutable, publicKey)).toBe(true);
     seed.fill(0);
   });
+});
+
+describe('ADR-0011 bounded recovery transition records', () => {
+  const transitionVector = JSON.parse(readFileSync(new URL('../packages/protocol/vectors/recovery-transition-v1.json', import.meta.url), 'utf8')) as {
+    record: RecoveryTransitionRecord; jcsBase64Url: string; paeSha256: string; writerPublicKey: string; signature: string;
+  };
+  const zero = encodeBase64Url(new Uint8Array(32));
+
+  it('matches the shared native JCS/DSSE vector and rejects every field and signature mutation', async () => {
+    const canonical = decodeBase64Url(transitionVector.jcsBase64Url);
+    const publicKey = decodeBase64Url(transitionVector.writerPublicKey);
+    expect(parseRecoveryTransitionRecord(canonical)).toEqual(transitionVector.record);
+    expect(encodeBase64Url(await sha256(dssePae(RECOVERY_TRANSITION_PAYLOAD_TYPE, canonical)))).toBe(transitionVector.paeSha256);
+    expect(await verifyRecoveryTransition({record: transitionVector.record, signature: transitionVector.signature}, publicKey)).toBe(true);
+    for (const [field, value] of Object.entries(transitionVector.record)) {
+      const changed = typeof value === 'number' ? value + 1 : typeof value === 'boolean' ? !value
+        : field === 'reason' ? 'POISONED_HEAD' : mutateEncoding(value);
+      expect(await verifyRecoveryTransition({record: {...transitionVector.record, [field]: changed}, signature: transitionVector.signature}, publicKey)).toBe(false);
+    }
+    for (let index = 0; index < 64; index += 1) {
+      const signature = decodeBase64Url(transitionVector.signature);
+      signature[index] = signature[index]! ^ 1;
+      expect(await verifyRecoveryTransition({record: transitionVector.record, signature: encodeBase64Url(signature)}, publicKey)).toBe(false);
+    }
+    expect(await verifyRecoveryTransition({record: transitionVector.record, signature: transitionVector.signature + '='}, publicKey)).toBe(false);
+    expect(await verifyRecoveryTransition({record: transitionVector.record, signature: transitionVector.signature, extra: true}, publicKey)).toBe(false);
+    expect(await verifyRecoveryTransition(null, publicKey)).toBe(false);
+    expect(await verifyRecoveryTransition({record: transitionVector.record, signature: transitionVector.signature}, new Uint8Array(32))).toBe(false);
+  });
+
+  it('rejects schema drift, duplicate/noncanonical JCS, invalid epoch relations and zero predecessor misuse', () => {
+    const canonical = new TextDecoder().decode(decodeBase64Url(transitionVector.jcsBase64Url));
+    for (const input of ['{"newStateEpoch":1,' + canonical.slice(1), '{"\\u006eewStateEpoch":1,' + canonical.slice(1),
+      ' ' + canonical, canonical.replace('"candidateStateEpoch":0', '"candidateStateEpoch":-0')]) {
+      expect(() => parseRecoveryTransitionRecord(new TextEncoder().encode(input))).toThrow('RECOVERY_TRANSITION_INVALID');
+    }
+    expect(() => parseRecoveryTransitionRecord(new Uint8Array(MAX_RECOVERY_TRANSITION_BYTES + 1))).toThrow('RECOVERY_TRANSITION_INVALID');
+    expect(() => parseRecoveryTransitionRecord(Uint8Array.of(123, 255, 125))).toThrow('RECOVERY_TRANSITION_INVALID');
+    for (const change of [{priorEpoch: 0}, {reason: 'DISASTER_RESTORE'}, {discardedKnownRevisions: 1},
+      {newStateEpoch: 2}, {newStateEpoch: 0}, {candidateStateEpoch: 16, newStateEpoch: 17}, {highestObservedStateEpoch: 17},
+      {candidateRevision: 0}, {highestObservedRevision: Number.MAX_SAFE_INTEGER + 1}, {createdAt: -1},
+      {createdAt: Number.MAX_SAFE_INTEGER + 1}, {writerPublicKey: transitionVector.writerPublicKey + '='},
+      {priorTransitionDigest: transitionVector.record.packageDigest}, {candidateStateEpoch: 1, newStateEpoch: 2}]) {
+      expect(() => parseRecoveryTransitionRecord(bytes({...transitionVector.record, ...change}))).toThrow('RECOVERY_TRANSITION_INVALID');
+    }
+    for (const epochs of [{candidateStateEpoch: 15, highestObservedStateEpoch: 0}, {candidateStateEpoch: 0, highestObservedStateEpoch: 15}]) {
+      const record = {...transitionVector.record, ...epochs, newStateEpoch: 16, priorTransitionDigest: transitionVector.record.packageDigest,
+        candidateRevision: Number.MAX_SAFE_INTEGER, highestObservedRevision: Number.MAX_SAFE_INTEGER, createdAt: Number.MAX_SAFE_INTEGER};
+      expect(parseRecoveryTransitionRecord(bytes(record)).newStateEpoch).toBe(16);
+      expect(() => parseRecoveryTransitionRecord(bytes({...record, priorTransitionDigest: zero}))).toThrow('RECOVERY_TRANSITION_INVALID');
+    }
+  });
+
+  it('rejects valid signatures over invalid transitions, binds the writer and snapshots signing inputs', async () => {
+    const seed = new Uint8Array(randomBytes(32));
+    try {
+      const publicKey = await getPublicKeyAsync(seed);
+      const record = {...transitionVector.record, writerPublicKey: encodeBase64Url(publicKey)};
+      expect(await verifyRecoveryTransition(await signRecoveryTransition(record, seed), publicKey)).toBe(true);
+      for (const change of [{newStateEpoch: 3}, {unknown: true}, {writerPublicKey: zero}]) {
+        const invalid = {...record, ...change};
+        const signature = encodeBase64Url(await signAsync(dssePae(RECOVERY_TRANSITION_PAYLOAD_TYPE, bytes(invalid)), seed));
+        expect(await verifyRecoveryTransition({record: invalid, signature}, publicKey)).toBe(false);
+        await expect(signRecoveryTransition(invalid, seed)).rejects.toThrow();
+      }
+      const wrongPayload = encodeBase64Url(await signAsync(dssePae(POISONED_HEAD_PAYLOAD_TYPE, bytes(record)), seed));
+      expect(await verifyRecoveryTransition({record, signature: wrongPayload}, publicKey)).toBe(false);
+      await expect(signRecoveryTransition(transitionVector.record, seed)).rejects.toThrow('RECOVERY_WRITER_MISMATCH');
+      const pending = signRecoveryTransition(record, seed);
+      record.highestObservedRevision += 1;
+      const signed = await pending;
+      expect(signed.record.highestObservedRevision).toBe(transitionVector.record.highestObservedRevision);
+      expect(await verifyRecoveryTransition(signed, publicKey)).toBe(true);
+    } finally { seed.fill(0); }
+  });
+});
+
+it('rejects malicious signer point vectors that the JS cofactored verifier accepts', async () => {
+  for (const [name, payloadType, verify] of [
+    ['poisoned-head-repair-v1', POISONED_HEAD_PAYLOAD_TYPE, verifyPoisonedHeadRepair],
+    ['recovery-transition-v1', RECOVERY_TRANSITION_PAYLOAD_TYPE, verifyRecoveryTransition],
+  ] as const) {
+    const fixture = JSON.parse(readFileSync(new URL(`../packages/protocol/vectors/${name}.json`, import.meta.url), 'utf8')) as {
+      rejectedPointVectors: Array<{kind: string; record: unknown; jcsBase64Url: string; publicKey: string; signature: string}>;
+    };
+    expect(fixture.rejectedPointVectors.map((item) => item.kind)).toEqual(['small-order-R', 'mixed-order-R', 'mixed-order-public-key']);
+    for (const item of fixture.rejectedPointVectors) {
+      const publicKey = decodeBase64Url(item.publicKey);
+      const signature = decodeBase64Url(item.signature);
+      const pae = dssePae(payloadType, decodeBase64Url(item.jcsBase64Url));
+      expect(await verifyAsync(signature, pae, publicKey, {zip215: false})).toBe(true);
+      expect(await verify({record: item.record, signature: item.signature}, publicKey)).toBe(false);
+    }
+  }
 });
