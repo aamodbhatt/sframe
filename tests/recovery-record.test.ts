@@ -173,3 +173,57 @@ it('rejects malicious signer point vectors that the JS cofactored verifier accep
     }
   }
 });
+
+it('rejects recovery/repair accessors and inherited serializers without invoking them', async () => {
+  let calls = 0;
+  for (const [name, verify, sign] of [
+    ['poisoned-head-repair-v1', verifyPoisonedHeadRepair, signPoisonedHeadRepair],
+    ['recovery-transition-v1', verifyRecoveryTransition, signRecoveryTransition],
+  ] as const) {
+    const fixture = JSON.parse(readFileSync(new URL(`../packages/protocol/vectors/${name}.json`, import.meta.url), 'utf8')) as {
+      record: PoisonedHeadRepairRecord & RecoveryTransitionRecord; signature: string; publisherPublicKey?: string; writerPublicKey?: string;
+    };
+    const publicKey = decodeBase64Url((fixture.publisherPublicKey ?? fixture.writerPublicKey)!);
+    const seed = new Uint8Array(randomBytes(32));
+    try {
+      const inherited = Object.assign(Object.create({toJSON: () => { calls += 1; throw new Error('sensitive'); }}), fixture.record);
+      const accessor = {...fixture.record};
+      Object.defineProperty(accessor, 'roomId', {enumerable: true, get: () => { calls += 1; throw new Error('sensitive'); }});
+      for (const record of [inherited, accessor, {...fixture.record, [Symbol('unknown')]: true}]) {
+        expect(await verify({record, signature: fixture.signature}, publicKey)).toBe(false);
+        await expect(sign(record, seed)).rejects.toThrow(/REPAIR_RECORD_INVALID|RECOVERY_TRANSITION_INVALID/u);
+      }
+      const outer = {record: fixture.record, signature: fixture.signature};
+      Object.defineProperty(outer, 'signature', {enumerable: true, get: () => { calls += 1; throw new Error('sensitive'); }});
+      expect(await verify(outer, publicKey)).toBe(false);
+    } finally { seed.fill(0); }
+  }
+  expect(calls).toBe(0);
+});
+
+it('copies Buffer key inputs before signing or verification can await', async () => {
+  const seed = randomBytes(32);
+  try {
+    const publicKey = await getPublicKeyAsync(new Uint8Array(seed));
+    const repairRecord = {...vector.record, publisherKeyId: `sha256:${encodeBase64Url(await sha256(publicKey))}`};
+    const transitionVector = JSON.parse(readFileSync(new URL('../packages/protocol/vectors/recovery-transition-v1.json', import.meta.url), 'utf8')) as {
+      record: RecoveryTransitionRecord;
+    };
+    const transitionRecord = {...transitionVector.record, writerPublicKey: encodeBase64Url(publicKey)};
+    const repairSeed = Buffer.from(seed);
+    const transitionSeed = Buffer.from(seed);
+    const repairPending = signPoisonedHeadRepair(repairRecord, repairSeed);
+    const transitionPending = signRecoveryTransition(transitionRecord, transitionSeed);
+    repairSeed.fill(0);
+    transitionSeed.fill(0);
+    const [repair, transition] = await Promise.all([repairPending, transitionPending]);
+    const repairKey = Buffer.from(publicKey);
+    const transitionKey = Buffer.from(publicKey);
+    const repairVerification = verifyPoisonedHeadRepair(repair, repairKey);
+    const transitionVerification = verifyRecoveryTransition(transition, transitionKey);
+    repairKey.fill(0);
+    transitionKey.fill(0);
+    expect(await repairVerification).toBe(true);
+    expect(await transitionVerification).toBe(true);
+  } finally { seed.fill(0); }
+});

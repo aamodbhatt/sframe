@@ -215,6 +215,12 @@ pub fn verify_recovery_transition(
     Ok(record)
 }
 
+// Byte identity only: callers still need the detached signature and context.
+pub fn recovery_transition_digest(input: &[u8]) -> Result<[u8; 32]> {
+    parse_recovery_transition(input)?;
+    Ok(crate::sha256(input))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -3,6 +3,7 @@ import canonicalize from 'canonicalize';
 import {encodeBase64Url, decodeBase64Url, sha256} from './crypto-envelope.js';
 import {parseUniqueJson} from './strict-json.js';
 import {dssePae} from './room-descriptor.js';
+import {recoveryDataRecord} from './recovery-snapshot.js';
 
 export const POISONED_HEAD_PAYLOAD_TYPE = 'application/vnd.smallframe.poisoned-head-repair.v1+json';
 export const RECOVERY_TRANSITION_PAYLOAD_TYPE = 'application/vnd.smallframe.recovery-transition.v1+json';
@@ -66,9 +67,7 @@ const boundedInteger = (value: unknown, minimum: number, maximum = Number.MAX_SA
   typeof value === 'number' && Number.isSafeInteger(value) && value >= minimum && value <= maximum;
 const repairRecordBytes = (value: unknown): Uint8Array => {
   const invalid = (): never => { throw new Error('REPAIR_RECORD_INVALID'); };
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return invalid();
-  const record = value as Record<string, unknown>;
-  if (Object.keys(record).length !== repairFields.length || !repairFields.every((field) => Object.hasOwn(record, field))) return invalid();
+  const record = recoveryDataRecord(value, repairFields, 'REPAIR_RECORD_INVALID');
   if (record.protocolVersion !== 1 || record.reason !== 'POISONED_HEAD') return invalid();
   if (!boundedInteger(record.expectedStateEpoch, 0, 16) || !boundedInteger(record.expectedRevision, 1)
     || !boundedInteger(record.createdAt, 0)) return invalid();
@@ -89,7 +88,7 @@ export const parsePoisonedHeadRepairRecord = (bytes: Uint8Array): PoisonedHeadRe
     const record = parseUniqueJson(new TextDecoder('utf-8', {fatal: true, ignoreBOM: true}).decode(bytes));
     const canonical = repairRecordBytes(record);
     if (canonical.length !== bytes.length || !canonical.every((byte, index) => byte === bytes[index])) throw new Error();
-    return record as PoisonedHeadRepairRecord;
+    return recoveryDataRecord(record, repairFields, 'REPAIR_RECORD_INVALID') as PoisonedHeadRepairRecord;
   } catch { throw new Error('REPAIR_RECORD_INVALID'); }
 };
 
@@ -115,7 +114,7 @@ export const signPoisonedHeadRepair = async (
   const canonical = repairRecordBytes(record);
   const snapshot = parsePoisonedHeadRepairRecord(canonical);
   if (publisherPrivateKey.length !== 32) throw new Error('REPAIR_PUBLISHER_MISMATCH');
-  const seed = publisherPrivateKey.slice();
+  const seed = new Uint8Array(publisherPrivateKey);
   try {
     if (!await repairPublisherMatches(snapshot, await getPublicKeyAsync(seed))) throw new Error('REPAIR_PUBLISHER_MISMATCH');
     const sig = await signAsync(dssePae(POISONED_HEAD_PAYLOAD_TYPE, canonical), seed);
@@ -129,13 +128,11 @@ export const verifyPoisonedHeadRepair = async (
 ): Promise<boolean> => {
   try {
     if (publisherPublicKey.length !== 32) return false;
-    const publicKey = publisherPublicKey.slice();
-    if (!signed || typeof signed !== 'object' || Array.isArray(signed)
-      || Object.keys(signed).sort().join() !== 'record,signature') return false;
-    const {record, signature} = signed as SignedPoisonedHeadRepair;
+    const publicKey = new Uint8Array(publisherPublicKey);
+    const {record, signature} = recoveryDataRecord(signed, ['record', 'signature'], 'REPAIR_RECORD_INVALID');
     const canonical = repairRecordBytes(record);
     if (!fixedEncoding(signature, 64) || !await repairPublisherMatches(parsePoisonedHeadRepairRecord(canonical), publicKey)) return false;
-    const sigBytes = decodeBase64Url(signature);
+    const sigBytes = decodeBase64Url(signature as string);
     if (!strictRecoveryPoints(sigBytes, publicKey)) return false;
     const pae = dssePae(POISONED_HEAD_PAYLOAD_TYPE, canonical);
     return await verifyAsync(sigBytes, pae, publicKey, {zip215: false});
@@ -155,9 +152,7 @@ const transitionNumbersValid = (record: Record<string, unknown>): boolean => {
 };
 const transitionRecordBytes = (value: unknown): Uint8Array => {
   const invalid = (): never => { throw new Error('RECOVERY_TRANSITION_INVALID'); };
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return invalid();
-  const record = value as Record<string, unknown>;
-  if (Object.keys(record).length !== transitionFields.length || !transitionFields.every((field) => Object.hasOwn(record, field))) return invalid();
+  const record = recoveryDataRecord(value, transitionFields, 'RECOVERY_TRANSITION_INVALID');
   if (record.protocolVersion !== 1 || !['OPERATOR_RESTORE', 'POISONED_HEAD'].includes(record.reason as string)
     || typeof record.discardedKnownRevisions !== 'boolean' || !transitionNumbersValid(record)) return invalid();
   if (!fixedEncoding(record.roomId, 16) || !['packageDigest', 'writerPublicKey', 'candidateEnvelopeDigest',
@@ -177,7 +172,7 @@ export const parseRecoveryTransitionRecord = (bytes: Uint8Array): RecoveryTransi
     const record = parseUniqueJson(new TextDecoder('utf-8', {fatal: true, ignoreBOM: true}).decode(bytes));
     const canonical = transitionRecordBytes(record);
     if (canonical.length !== bytes.length || !canonical.every((byte, index) => byte === bytes[index])) throw new Error();
-    return record as RecoveryTransitionRecord;
+    return recoveryDataRecord(record, transitionFields, 'RECOVERY_TRANSITION_INVALID') as RecoveryTransitionRecord;
   } catch { throw new Error('RECOVERY_TRANSITION_INVALID'); }
 };
 
@@ -188,12 +183,28 @@ export const signRecoveryTransition = async (
   const canonical = transitionRecordBytes(record);
   const snapshot = parseRecoveryTransitionRecord(canonical);
   if (writerPrivateKey.length !== 32) throw new Error('RECOVERY_WRITER_MISMATCH');
-  const seed = writerPrivateKey.slice();
+  const seed = new Uint8Array(writerPrivateKey);
   try {
     if (snapshot.writerPublicKey !== encodeBase64Url(await getPublicKeyAsync(seed))) throw new Error('RECOVERY_WRITER_MISMATCH');
     const sig = await signAsync(dssePae(RECOVERY_TRANSITION_PAYLOAD_TYPE, canonical), seed);
     return {record: snapshot, signature: encodeBase64Url(sig)};
   } finally { seed.fill(0); }
+};
+
+// No await: callers can capture an entire bounded import before verification.
+export const snapshotSignedRecoveryTransition = (signed: unknown): SignedRecoveryTransition => {
+  const {record, signature} = recoveryDataRecord(signed, ['record', 'signature'], 'RECOVERY_TRANSITION_INVALID');
+  if (!fixedEncoding(signature, 64)) throw new Error('RECOVERY_TRANSITION_INVALID');
+  return {record: parseRecoveryTransitionRecord(transitionRecordBytes(record)), signature: signature as string};
+};
+
+// A digest is a byte identity, not evidence of writer authority. Chain callers
+// must independently verify the detached signature and immutable context.
+export const recoveryTransitionDigest = async (input: Uint8Array): Promise<Uint8Array> => {
+  if (input.byteLength > MAX_RECOVERY_TRANSITION_BYTES) throw new Error('RECOVERY_TRANSITION_INVALID');
+  const bytes = new Uint8Array(input);
+  parseRecoveryTransitionRecord(bytes);
+  return sha256(bytes);
 };
 
 export const verifyRecoveryTransition = async (
@@ -202,10 +213,8 @@ export const verifyRecoveryTransition = async (
 ): Promise<boolean> => {
   try {
     if (writerPublicKey.length !== 32) return false;
-    const publicKey = writerPublicKey.slice();
-    if (!signed || typeof signed !== 'object' || Array.isArray(signed)
-      || Object.keys(signed).sort().join() !== 'record,signature') return false;
-    const {record, signature} = signed as SignedRecoveryTransition;
+    const publicKey = new Uint8Array(writerPublicKey);
+    const {record, signature} = snapshotSignedRecoveryTransition(signed);
     const canonical = transitionRecordBytes(record);
     if (!fixedEncoding(signature, 64) || parseRecoveryTransitionRecord(canonical).writerPublicKey !== encodeBase64Url(publicKey)) return false;
     const sigBytes = decodeBase64Url(signature);

@@ -10,6 +10,7 @@ mod manifest;
 mod module_source;
 mod package;
 mod recovery;
+mod recovery_chain;
 mod state_schema;
 
 pub(crate) use archive::read_zip_bounded;
@@ -29,8 +30,13 @@ pub use package::{
 pub use recovery::{
     MAX_RECOVERY_TRANSITION_BYTES, MAX_REPAIR_RECORD_BYTES, POISONED_HEAD_PAYLOAD_TYPE,
     PoisonedHeadRepairRecord, RECOVERY_TRANSITION_PAYLOAD_TYPE, RecoveryTransitionRecord,
-    parse_poisoned_head_repair, parse_recovery_transition, verify_poisoned_head_repair,
-    verify_recovery_transition,
+    parse_poisoned_head_repair, parse_recovery_transition, recovery_transition_digest,
+    verify_poisoned_head_repair, verify_recovery_transition,
+};
+pub use recovery_chain::{
+    MAX_RECOVERY_TRANSITIONS, RecoveryChainContext, RecoveryEpochDigest,
+    SignedRecoveryTransitionBytes, VerifiedRecoveryChain, VerifiedRecoveryTransition,
+    verify_recovery_transition_chain,
 };
 
 #[cfg(feature = "wasm")]
