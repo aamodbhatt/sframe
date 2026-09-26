@@ -1,4 +1,4 @@
-import {expect, test, type APIRequestContext} from '@playwright/test';
+import {expect, test, type APIRequestContext} from './test-base.js';
 import {gotoInvite} from './invite-navigation.js';
 import {randomBytes} from 'node:crypto';
 import {readFileSync} from 'node:fs';

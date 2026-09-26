@@ -1,4 +1,4 @@
-import {expect, test} from '@playwright/test';
+import {expect, test} from './test-base.js';
 
 test.describe('Phase 2 hostile-package, tampered-package, malformed-state, storage-corruption, and resource bounds', () => {
   test.beforeEach(async ({context}) => {

@@ -1,4 +1,4 @@
-import {expect, test} from '@playwright/test';
+import {expect, test} from './test-base.js';
 
 test.describe('Phase 2 signed controller release pinning and safe update behavior', () => {
   test.beforeEach(async ({context}) => {

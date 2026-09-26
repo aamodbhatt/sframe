@@ -1,4 +1,4 @@
-import {expect, test} from '@playwright/test';
+import {expect, test} from './test-base.js';
 
 const candidate = process.env.SMALLFRAME_CANDIDATE ?? 'original';
 const wasmCsp = process.env.SMALLFRAME_U_WASM_CSP ?? 'allow';

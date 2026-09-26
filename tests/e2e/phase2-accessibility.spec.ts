@@ -1,4 +1,4 @@
-import {expect, test} from '@playwright/test';
+import {expect, test} from './test-base.js';
 
 test.describe('Phase 2 automated accessibility checks across fixtures', () => {
   test.beforeEach(async ({context}) => {

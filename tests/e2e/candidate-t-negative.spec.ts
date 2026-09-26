@@ -1,4 +1,4 @@
-import {expect, test} from '@playwright/test';
+import {expect, test} from './test-base.js';
 
 const candidate = process.env.SMALLFRAME_CANDIDATE ?? 'original';
 const fixture = process.env.SMALLFRAME_T_FIXTURE ?? '';

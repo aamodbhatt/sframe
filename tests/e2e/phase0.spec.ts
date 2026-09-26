@@ -1,6 +1,5 @@
-import {chromium, expect, firefox, test, webkit} from '@playwright/test';
+import {chromium, expect, firefox, test, webkit} from './test-base.js';
 import {createHash} from 'node:crypto';
-import {observeShellNavigation} from './shell-navigation.js';
 import {readFileSync} from 'node:fs';
 import {join} from 'node:path';
 import {WebSocket as NodeWebSocket} from 'ws';
@@ -15,22 +14,9 @@ const phase1WasmDigest = createHash('sha256').update(phase1WasmArtifact).digest(
 const phase1PackageVector = candidate === 'U' ? readFileSync(join(process.cwd(), 'packages', 'protocol', 'vectors', 'canonical-package-v1.zip.b64'), 'utf8').trim() : '';
 type PageLike = Parameters<Parameters<typeof test>[1]>[0]['page'];
 
-let browserNavigation: ReturnType<typeof observeShellNavigation> | undefined;
-test.beforeEach(async ({request, page}) => {
-  browserNavigation = observeShellNavigation(page);
-  const diagnostics = await request.post('http://127.0.0.1:8787/__test__/navigation-diagnostics');
-  expect(diagnostics.status()).toBe(204);
+test.beforeEach(async ({request}) => {
   const response = await request.post('http://127.0.0.1:8787/__test__/evidence/reset');
   expect(response.status()).toBe(204);
-});
-
-test.afterEach(async ({request, browser}, testInfo) => {
-  if (testInfo.status === testInfo.expectedStatus) return;
-  console.error('BROWSER_NAVIGATION_DIAGNOSTICS', JSON.stringify({...browserNavigation, browserConnected: browser.isConnected()}));
-  try {
-    const response = await request.get('http://127.0.0.1:8787/__test__/navigation-diagnostics', {timeout: 4_000});
-    if (response.ok()) console.error('NAVIGATION_DIAGNOSTICS', JSON.stringify(await response.json()));
-  } catch { console.error('NAVIGATION_DIAGNOSTICS_UNAVAILABLE'); }
 });
 
 const evidenceCounts = async (request: Parameters<Parameters<typeof test>[1]>[0]['request']) => {
