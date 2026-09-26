@@ -3,12 +3,32 @@ import {randomBytes} from 'node:crypto';
 
 test.use({trace: 'off'});
 
-test.beforeEach(async ({request}) => {
+const browserNavigation = {requests: 0, responses: 0, finished: 0, failed: 0,
+  commits: 0, responseStatus: 0, fromServiceWorker: false, crashed: false, closed: false};
+test.beforeEach(async ({request, page}) => {
+  Object.assign(browserNavigation, {requests: 0, responses: 0, finished: 0, failed: 0,
+    commits: 0, responseStatus: 0, fromServiceWorker: false, crashed: false, closed: false});
+  const isShellNavigation = (url: string, navigation: boolean): boolean => navigation && new URL(url).pathname === '/';
+  page.on('request', (req) => { if (isShellNavigation(req.url(), req.isNavigationRequest())) browserNavigation.requests += 1; });
+  page.on('response', (res) => {
+    if (isShellNavigation(res.url(), res.request().isNavigationRequest())) {
+      browserNavigation.responses += 1;
+      browserNavigation.responseStatus = res.status();
+      browserNavigation.fromServiceWorker = res.fromServiceWorker();
+    }
+  });
+  page.on('requestfinished', (req) => { if (isShellNavigation(req.url(), req.isNavigationRequest())) browserNavigation.finished += 1; });
+  page.on('requestfailed', (req) => { if (isShellNavigation(req.url(), req.isNavigationRequest())) browserNavigation.failed += 1; });
+  page.on('framenavigated', (frame) => { if (frame === page.mainFrame()) browserNavigation.commits += 1; });
+  page.on('crash', () => { browserNavigation.crashed = true; });
+  page.on('close', () => { browserNavigation.closed = true; });
   await request.post('http://127.0.0.1:8787/__test__/navigation-diagnostics');
 });
 
-test.afterEach(async ({request}, testInfo) => {
+test.afterEach(async ({request, browser}, testInfo) => {
   if (testInfo.status === testInfo.expectedStatus) return;
+  // Counts/status only: never retain URLs, response bodies, console text or state.
+  console.error('BROWSER_NAVIGATION_DIAGNOSTICS', JSON.stringify({...browserNavigation, browserConnected: browser.isConnected()}));
   try {
     const response = await request.get('http://127.0.0.1:8787/__test__/navigation-diagnostics');
     if (response.ok()) console.error('NAVIGATION_DIAGNOSTICS', JSON.stringify(await response.json()));

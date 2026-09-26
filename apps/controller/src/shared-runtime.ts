@@ -822,7 +822,11 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
         await checkRelayContext();
         assertActive();
         authenticated = true;
-        if (matchesApproval(savedApproval)) {
+        const previouslyApproved = matchesApproval(savedApproval);
+        // A restored, previously approved room is already remembered. Its
+        // first remote fetch must commit before promoting the in-memory head.
+        remembered = Boolean(matchesStoredRoom(storedRoom) && previouslyApproved);
+        if (previouslyApproved) {
           await approve();
         } else {
           element('trust-panel').hidden = false;

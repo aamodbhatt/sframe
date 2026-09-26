@@ -101,6 +101,57 @@ test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
   });
 
   for (const role of ['editor', 'viewer'] as const) {
+    test(`remembered ${role} rejects an aborted first remote commit on reopen`, async ({page, request}) => {
+      const capability = role === 'editor' ? editorCap : viewerCap;
+      const signed = await createSignedRoomDescriptor({publisherPrivateKey: publisherPriv, roomId: activeRoomId,
+        packageDigest: sharedFixture.packageDigest, publisherKeyId: sharedFixture.publisherKeyId,
+        writerPublicKey: await getPublicKeyAsync(writerPriv), capability, role, expiresAt: activeExpiry});
+      const fragment = formatInviteFragment({descriptorJcsBytes: signed.jcsBytes, descriptorSignature: signed.signature,
+        roomKey, capability, ...(role === 'editor' ? {writerPrivateSeed: writerPriv} : {})});
+      await gotoInvite(page, `/r/${activeRoomId}`, fragment);
+      await page.getByRole('button', {name: 'Open this exact version'}).click();
+      await expect(page.frameLocator('iframe').getByText('0 decisions')).toBeVisible();
+      await page.goto('/icon.svg', {waitUntil: 'commit'});
+      if (role === 'editor') await page.waitForFunction(async (roomId) => {
+        const locks = await navigator.locks.query();
+        return !locks.held?.some((lock) => lock.name === `smallframe:room:${roomId}`);
+      }, activeRoomId);
+      await advanceRelay(request, 2);
+      await page.addInitScript(() => {
+        const originalFetch = window.fetch;
+        let stateReads = 0;
+        window.fetch = async (input, init) => {
+          const url = new URL(input instanceof Request ? input.url : String(input), location.href);
+          if (url.pathname.endsWith('/state') && ++stateReads > 1) return new Response(null, {status: 503});
+          return originalFetch(input, init);
+        };
+        (globalThis as any).restoreReopenFetch = () => { window.fetch = originalFetch; };
+        const originalPut = IDBObjectStore.prototype.put;
+        IDBObjectStore.prototype.put = function(value, key) {
+          const result = key === undefined ? originalPut.call(this, value) : originalPut.call(this, value, key);
+          if (this.name === 'rooms') {
+            IDBObjectStore.prototype.put = originalPut;
+            this.transaction.abort();
+          }
+          return result;
+        };
+      });
+      await gotoInvite(page, `/r/${activeRoomId}`, fragment);
+      await expect(page.frameLocator('iframe').getByText('0 decisions')).toBeVisible();
+      expect(await page.evaluate(async (id) => {
+        const room = await (globalThis as any).SmallframeSharedStore.loadRoom(id);
+        return {revision: room.revision, gaps: room.lineage.gaps.length};
+      }, activeRoomId)).toEqual({revision: 1, gaps: 0});
+      await expect(page.locator('#connectivity')).not.toContainText('intervening relay history was not verified');
+      await page.evaluate(() => {
+        (globalThis as any).restoreReopenFetch();
+        window.dispatchEvent(new Event('focus'));
+      });
+      await expect(page.locator('#connectivity')).toContainText('intervening relay history was not verified');
+      expect(await page.evaluate(async (id) =>
+        (await (globalThis as any).SmallframeSharedStore.loadRoom(id)).revision, activeRoomId)).toBe(3);
+    });
+
     test(`remembered ${role} keeps a skipped-history warning through direct sync and reopen`, async ({page, request}) => {
       const capability = role === 'editor' ? editorCap : viewerCap;
       const signed = await createSignedRoomDescriptor({publisherPrivateKey: publisherPriv, roomId: activeRoomId,
@@ -1017,6 +1068,7 @@ test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
     await gotoInvite(page, `/r/${activeRoomId}`, fragment);
     await page.getByRole('button', {name: 'Open this exact version'}).click();
     await expect(page.locator('#role')).toHaveText('editor');
+    await expect(page.frameLocator('iframe').getByText('0 decisions')).toBeVisible();
 
     // Tab 2 in same browser profile opens same editor invite
     const tab2 = await context.newPage();
@@ -1034,7 +1086,15 @@ test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
 
     // A read-only editor must not publish a newer head only to memory while
     // the lock owner still holds the durable actor/document record.
-    await page.route('**/v1/rooms/*/state', (route) => route.fulfill({status: 503}));
+    // Page routing cannot reliably intercept a service-worker-controlled fetch.
+    // Block the owner's runtime fetch directly before advancing the relay.
+    await page.evaluate(() => {
+      const originalFetch = window.fetch;
+      window.fetch = async (input, init) => {
+        const url = new URL(input instanceof Request ? input.url : String(input), location.href);
+        return url.pathname.endsWith('/state') ? new Response(null, {status: 503}) : originalFetch(input, init);
+      };
+    });
     await advanceRelay(request, 2);
     await tab2.evaluate(() => window.dispatchEvent(new Event('focus')));
     await expect(tab2.locator('#connectivity')).toContainText('Sync paused');

@@ -43,6 +43,39 @@ const initializeRoom = async (
 );
 
 describe('SQLite Durable Object Phase 3 Protocol & Lifecycle', () => {
+  it('returns a frozen encrypted candidate only to room members and rejects a corrupted stored candidate', async () => {
+    const room = roomId(0x91);
+    const viewer = capability(0x92);
+    const editor = capability(0x93);
+    const params = {roomKey: new Uint8Array(randomBytes(32)), writerPrivateKey: new Uint8Array(randomBytes(32)),
+      roomId: room, appId: 'test.room', packageDigest: base64url(randomBytes(32)), stateEpoch: 0,
+      proposedRevision: 1, previousEnvelopeDigest: base64url(new Uint8Array(32)), automergeBytes: Uint8Array.of(1, 2, 3)};
+    const genesis = await encryptSnapshot(params);
+    const init = await fetch(`${apiOrigin}/__phase0/rooms/${room}/init-envelope`, {method: 'POST', body: JSON.stringify({
+      viewerCapHash: capabilityHash(viewer), editorCapHash: capabilityHash(editor),
+      expiresAtMs: Date.now() + 60_000, envelope: genesis.envelope
+    })});
+    expect(init.status).toBe(201);
+    const storage = await miniflare.unsafeGetDurableObjectStorage(WORKER_NAME, DO_CLASS, {name: room});
+    await storage.exec("UPDATE room_state SET recovery_status = 'RECOVERY_REQUIRED'");
+    const url = `${apiOrigin}/v1/rooms/${room}/state`;
+    const headers = {Origin: CONTROLLER_ORIGIN, Authorization: authorization(viewer), 'If-None-Match': genesis.etag};
+    expect((await fetch(url, {headers: {Origin: CONTROLLER_ORIGIN}})).status).toBe(403);
+    const frozen = await fetch(url, {headers});
+    expect(frozen.status).toBe(503);
+    expect(frozen.headers.get('ETag')).toBe(genesis.etag);
+    const response = await frozen.json() as Record<string, unknown>;
+    expect(response).toMatchObject({status: 'RECOVERY_REQUIRED', stateEpoch: 0, revision: 1,
+      envelopeDigest: base64url(genesis.envelopeDigest), etag: genesis.etag,
+      candidateEnvelope: genesis.envelope, repairStatement: null});
+    const next = await encryptSnapshot({...params, proposedRevision: 2, previousEnvelopeDigest: base64url(genesis.envelopeDigest)});
+    expect((await fetch(url, {method: 'PUT', headers: {Origin: CONTROLLER_ORIGIN,
+      Authorization: authorization(editor), 'If-Match': genesis.etag, 'Content-Type': 'application/json'},
+    body: JSON.stringify(next.envelope)})).status).toBe(503);
+    await storage.exec('UPDATE room_state SET envelope_digest = ?', base64url(randomBytes(32)));
+    expect((await fetch(url, {headers})).status).toBe(409);
+  });
+
   it('rejects a stalled encrypted upload without advancing the head and permits a valid retry', async () => {
     const room = base64url(randomBytes(16));
     const viewer = base64url(randomBytes(32));

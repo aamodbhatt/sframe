@@ -547,12 +547,16 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
 
   private async getState(request: Request, room: RoomRow): Promise<Response> {
     if (!await this.authorize(request, room)) return problem(403, 'ROOM_AUTH_INVALID');
+    if (!await this.storedWireDigestMatches(room)) return problem(409, 'STORED_ENVELOPE_FORMAT_INVALID');
     if (room.recovery_status === 'RECOVERY_REQUIRED') {
       return new Response(JSON.stringify({
         status: 'RECOVERY_REQUIRED',
         stateEpoch: room.state_epoch,
         revision: room.revision,
+        envelopeDigest: room.envelope_digest,
         etag: room.etag,
+        candidateEnvelope: room.aad_json ? this.storedWireEnvelope(room) : null,
+        repairStatement: null,
       }), {
         status: 503,
         headers: {
@@ -574,7 +578,6 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
       'X-Smallframe-Revision': String(room.revision),
       'X-Smallframe-Envelope-Digest': room.envelope_digest,
     };
-    if (!await this.storedWireDigestMatches(room)) return problem(409, 'STORED_ENVELOPE_FORMAT_INVALID');
     if (request.headers.get('If-None-Match') === room.etag) return new Response(null, {status: 304, headers});
 
     if (room.aad_json) {
