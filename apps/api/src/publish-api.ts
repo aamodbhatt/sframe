@@ -168,10 +168,11 @@ export const authenticatePublisher = async (
 ): Promise<StoredPublisher | null> => {
   const auth = request.headers.get('Authorization') ?? '';
   if (!auth.startsWith('Bearer ')) return null;
-  const token = auth.slice(7).trim();
-  if (!token) return null;
+  const token = auth.slice(7);
+  if (!/^[A-Za-z0-9_-]{43}$/u.test(token)) return null;
 
   const tokenBytes = decodeBase64Url(token);
+  if (tokenBytes.length !== 32 || encodeBase64Url(tokenBytes) !== token) return null;
   const hash = await crypto.subtle.digest('SHA-256', tokenBytes);
   const tokenHash = encodeBase64Url(new Uint8Array(hash));
 
@@ -227,6 +228,11 @@ export const handlePackageUpload = async (request: Request, store = globalPublis
 export const handleGetPackage = async (packageDigest: string, store = globalPublishStore): Promise<Response> => {
   const record = store.packages.get(packageDigest);
   if (!record) return problem(404, 'PACKAGE_NOT_FOUND');
+  if (record.packageDigest !== packageDigest || record.bytes.byteLength !== record.byteLength
+    || record.byteLength > 1_310_720 || record.byteLength < 100
+    || encodeBase64Url(new Uint8Array(await crypto.subtle.digest('SHA-256', record.bytes))) !== packageDigest) {
+    return problem(409, 'STORED_PACKAGE_INVALID');
+  }
 
   return new Response(record.bytes, {
     status: 200,
@@ -234,9 +240,17 @@ export const handleGetPackage = async (packageDigest: string, store = globalPubl
       'Content-Type': 'application/vnd.smallframe.package',
       'X-Smallframe-Package-Digest': record.packageDigest,
       'X-Smallframe-Publisher-Key-Id': record.publisherKeyId,
-      'Cache-Control': 'public, max-age=31536000, immutable'
+      'Access-Control-Expose-Headers': 'X-Smallframe-Package-Digest, X-Smallframe-Publisher-Key-Id',
+      'Cache-Control': 'private, no-store'
     }
   });
+};
+
+export const handlePublisherGetPackage = async (request: Request, packageDigest: string, store = globalPublishStore): Promise<Response> => {
+  const publisher = await authenticatePublisher(request, store);
+  if (!publisher) return problem(401, 'UNAUTHORIZED');
+  if (store.packages.get(packageDigest)?.publisherKeyId !== publisher.publisherKeyId) return problem(404, 'PACKAGE_NOT_FOUND');
+  return handleGetPackage(packageDigest, store);
 };
 
 export const handleRoomCreationSaga = async (

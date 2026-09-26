@@ -1,21 +1,22 @@
 import type {DurableObjectNamespace} from 'cloudflare:workers';
-import {ROOM_ID_RE} from './do-crypto.js';
+import {ROOM_ID_RE, decodeBase64Url, decodeFixed32} from './do-crypto.js';
 import {RoomDurableObject, type RoomEnvironment} from './do-room.js';
 import {readApiRuntimeConfig, secureApiResponse} from './runtime-config.js';
 import {
   handleAdminCreateInvite,
   handleEnrollment,
   handleGetPackage,
+  handlePublisherGetPackage,
   handlePackageUpload,
   handleRoomCreationSaga,
-  globalPublishStore
 } from './publish-api.js';
 
 type WorkerEnvironment = RoomEnvironment & {
   ROOMS: DurableObjectNamespace;
 };
 
-const PUBLIC_ROOM_ROUTE = /^\/v1\/rooms\/([A-Za-z0-9_-]{22})(?:\/(state|events|events-ticket|socket|rotate-links|revoke|request-repair|recover|package))?$/u;
+const PUBLIC_ROOM_ROUTE = /^\/v1\/rooms\/([A-Za-z0-9_-]{22})(?:\/(state|events|events-ticket|socket|rotate-links|revoke|request-repair|recover))?$/u;
+const ROOM_PACKAGE_ROUTE = /^\/v1\/rooms\/([A-Za-z0-9_-]{22})\/packages\/([A-Za-z0-9_-]{43})$/u;
 const PREFLIGHT_METHODS: Record<string, Set<string>> = Object.freeze({
   '': new Set(['GET']),
   state: new Set(['GET', 'PUT']),
@@ -69,7 +70,7 @@ const handlePublishRoute = async (pathname: string, request: Request, env: Worke
   }
   if (pathname.startsWith('/v1/packages/') && request.method === 'GET') {
     const pkgDigest = pathname.slice('/v1/packages/'.length);
-    return handleGetPackage(pkgDigest);
+    return handlePublisherGetPackage(request, pkgDigest);
   }
   if (pathname === '/v1/rooms' && request.method === 'POST') {
     return handleRoomCreationSaga(request, env);
@@ -90,6 +91,22 @@ const worker = {
     const publishRes = await handlePublishRoute(url.pathname, request, env);
     if (publishRes) return respond(publishRes);
 
+    const packageRoute = ROOM_PACKAGE_ROUTE.exec(url.pathname);
+    if (packageRoute) {
+      if (request.method === 'OPTIONS') return respond(handleCorsPreflight(request, config, 'package'));
+      if (request.method !== 'GET') return respond(problem(405, 'METHOD_NOT_ALLOWED'));
+      const [, packageRoomId, digest] = packageRoute;
+      if (url.search || !digest || !decodeFixed32(digest) || !packageRoomId
+        || decodeBase64Url(packageRoomId, 16)?.byteLength !== 16) return respond(problem(400, 'PACKAGE_PATH_INVALID'));
+      const object = env.ROOMS.get(env.ROOMS.idFromName(packageRoomId));
+      const metadataUrl = new URL(`/v1/rooms/${packageRoomId}`, url.origin);
+      const metadataResponse = await object.fetch(new Request(metadataUrl, {headers: request.headers}));
+      if (!metadataResponse.ok) return respond(metadataResponse);
+      const metadata = await metadataResponse.json() as {packageDigest?: unknown};
+      if (metadata.packageDigest !== digest) return respond(problem(409, 'ROOM_PACKAGE_CONTEXT_INVALID'));
+      return respond(await handleGetPackage(digest));
+    }
+
     const match = PUBLIC_ROOM_ROUTE.exec(url.pathname);
     const roomId = match?.[1];
     if (!roomId || !ROOM_ID_RE.test(roomId)) return respond(problem(404, 'NOT_FOUND'));
@@ -97,13 +114,6 @@ const worker = {
     const action = match?.[2] ?? '';
     if (request.method === 'OPTIONS') {
       return respond(handleCorsPreflight(request, config, action));
-    }
-
-    if (action === 'package' && request.method === 'GET') {
-      const room = globalPublishStore.rooms.get(roomId);
-      if (room) {
-        return respond(await handleGetPackage(room.packageDigest));
-      }
     }
 
     const object = env.ROOMS.get(env.ROOMS.idFromName(roomId));

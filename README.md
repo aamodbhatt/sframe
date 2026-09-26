@@ -75,6 +75,8 @@ Encrypted rooms now reject the unfinished unsigned `request-repair` path, so an 
 
 If an encrypted room is already marked `RECOVERY_REQUIRED` by a trusted restore, an authenticated room member can retrieve the stored signed/encrypted candidate envelope and its tuple in the `503` state response, even with a matching `If-None-Match`. The relay checks the stored envelope digest before returning it and refuses normal writes. The controller does not yet offer the export-first recovery choices or verify a transition chain, and the response has no publisher repair statement until that protocol exists.
 
+Room package retrieval uses `/v1/rooms/:roomId/packages/:digest`, authenticates the capability in that room DO, and requires its immutable pinned digest, including during recovery. Revoked or expired rooms cannot retrieve bytes; responses are `private, no-store`. The old unauthenticated room alias is closed, publisher retrieval requires the package owner's canonical token, and stored bytes are rehashed before serving. Package storage remains an in-memory local prototype; upload signature/ZIP validation, the production publishing saga and controller package-cache lifecycle remain unfinished. Raw legacy rooms without a pinned package context fail closed.
+
 The renderer currently measures **2,887,003 bytes**, above the normative 2 MiB target. A temporary 4 MiB local ceiling remains a recorded deviation, not completion of the budget requirement.
 
 ## Verification evidence

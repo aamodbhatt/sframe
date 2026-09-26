@@ -9,7 +9,8 @@ import {
   createSignedEnrollment,
   createSignedRoomDescriptor,
   encodeBase64Url,
-  decodeBase64Url
+  decodeBase64Url,
+  encryptSnapshot,
 } from '../packages/protocol/src/index.js';
 
 const ROOT = resolve(import.meta.dirname, '..');
@@ -43,6 +44,7 @@ describe('Phase 4 signed publish API integration', () => {
     });
 
     miniflare = new Miniflare({
+      unsafeInspectDurableObjects: true,
       modules: true,
       scriptPath: entry,
       name: WORKER_NAME,
@@ -145,9 +147,11 @@ describe('Phase 4 signed publish API integration', () => {
     const pkgUploadData = (await pkgUploadRes.json()) as {ok: boolean; packageDigest: string};
     expect(pkgUploadData.packageDigest).toBe(expectedPkgDigest);
 
-    // 5. Retrieve package by digest
+    // 5. Publisher retrieval requires its authenticated token.
+    expect((await fetch(`${apiOrigin}/v1/packages/${expectedPkgDigest}`)).status).toBe(401);
+    expect((await fetch(`${apiOrigin}/v1/packages/${expectedPkgDigest}`, {headers: {Authorization: 'Bearer malformed'}})).status).toBe(401);
     const getPkgRes = await fetch(`${apiOrigin}/v1/packages/${expectedPkgDigest}`, {
-      headers: {Origin: CONTROLLER_ORIGIN}
+      headers: {Origin: CONTROLLER_ORIGIN, Authorization: `Bearer ${apiTokenBase64Url}`}
     });
     expect(getPkgRes.status).toBe(200);
     const downloadedBytes = new Uint8Array(await getPkgRes.arrayBuffer());
@@ -210,12 +214,52 @@ describe('Phase 4 signed publish API integration', () => {
     expect(roomData.ok).toBe(true);
     expect(roomData.roomId).toBe(roomId);
 
-    // 7. Retrieve package via room endpoint
+    // The old unauthenticated alias is no longer routable.
     const roomPkgRes = await fetch(`${apiOrigin}/v1/rooms/${roomId}/package`, {
       headers: {Origin: CONTROLLER_ORIGIN}
     });
-    expect(roomPkgRes.status).toBe(200);
-    const roomPkgBytes = new Uint8Array(await roomPkgRes.arrayBuffer());
-    expect(roomPkgBytes.byteLength).toBe(1024);
+    expect(roomPkgRes.status).toBe(404);
+    const roomHeaders = {Origin: CONTROLLER_ORIGIN, Authorization: `SF-Cap ${encodeBase64Url(viewerCap)}`};
+    // The unfinished raw publisher saga has no DO-pinned package context.
+    expect((await fetch(`${apiOrigin}/v1/rooms/${roomId}/packages/${expectedPkgDigest}`, {headers: roomHeaders})).status).toBe(409);
+
+    // Test-only encrypted genesis pins the package in authoritative DO state.
+    const encryptedRoomId = encodeBase64Url(randomBytes(16));
+    const genesis = await encryptSnapshot({roomKey: new Uint8Array(randomBytes(32)), writerPrivateKey: writerPriv,
+      roomId: encryptedRoomId, appId: 'test.package', packageDigest: expectedPkgDigest, stateEpoch: 0,
+      proposedRevision: 1, previousEnvelopeDigest: encodeBase64Url(new Uint8Array(32)), automergeBytes: Uint8Array.of(1)});
+    const init = await fetch(`${apiOrigin}/__phase0/rooms/${encryptedRoomId}/init-envelope`, {method: 'POST', body: JSON.stringify({
+      viewerCapHash: viewerDesc.descriptor.capabilityHash, editorCapHash: editorDesc.descriptor.capabilityHash,
+      expiresAtMs: Date.now() + 60_000, envelope: genesis.envelope
+    })});
+    expect(init.status).toBe(201);
+    const packageUrl = `${apiOrigin}/v1/rooms/${encryptedRoomId}/packages/${expectedPkgDigest}`;
+    expect((await fetch(packageUrl, {method: 'POST', headers: roomHeaders})).status).toBe(405);
+    expect((await fetch(packageUrl, {method: 'OPTIONS', headers: {Origin: CONTROLLER_ORIGIN,
+      'Access-Control-Request-Method': 'GET', 'Access-Control-Request-Headers': 'authorization'}})).status).toBe(204);
+    expect((await fetch(packageUrl, {method: 'OPTIONS', headers: {Origin: CONTROLLER_ORIGIN,
+      'Access-Control-Request-Method': 'GET', 'Access-Control-Request-Headers': 'x-untrusted'}})).status).toBe(403);
+    expect((await fetch(packageUrl, {headers: {Origin: CONTROLLER_ORIGIN}})).status).toBe(403);
+    expect((await fetch(packageUrl, {headers: {...roomHeaders, Origin: 'http://untrusted.localhost'}})).status).toBe(403);
+    expect((await fetch(packageUrl, {headers: {...roomHeaders, Authorization: `SF-Cap ${encodeBase64Url(randomBytes(32))}`}})).status).toBe(403);
+    expect((await fetch(packageUrl + '?cap=invalid', {headers: roomHeaders})).status).toBe(400);
+    const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+    const alternateDigest = expectedPkgDigest.slice(0, -1) + alphabet[alphabet.indexOf(expectedPkgDigest.at(-1)!) + 1];
+    expect((await fetch(`${apiOrigin}/v1/rooms/${encryptedRoomId}/packages/${alternateDigest}`, {headers: roomHeaders})).status).toBe(400);
+    expect((await fetch(`${apiOrigin}/v1/rooms/${encryptedRoomId}/packages/${encodeBase64Url(randomBytes(32))}`, {headers: roomHeaders})).status).toBe(409);
+    for (const cap of [viewerCap, editorCap]) {
+      const memberPackage = await fetch(packageUrl, {headers: {...roomHeaders, Authorization: `SF-Cap ${encodeBase64Url(cap)}`}});
+      expect(memberPackage.status).toBe(200);
+      expect(memberPackage.headers.get('Cache-Control')).toBe('private, no-store');
+      expect(memberPackage.headers.get('X-Smallframe-Package-Digest')).toBe(expectedPkgDigest);
+      expect(new Uint8Array(await memberPackage.arrayBuffer()).byteLength).toBe(1024);
+    }
+    const storage = await miniflare.unsafeGetDurableObjectStorage(WORKER_NAME, DO_CLASS, {name: encryptedRoomId});
+    await storage.exec("UPDATE room_state SET recovery_status = 'RECOVERY_REQUIRED'");
+    expect((await fetch(packageUrl, {headers: roomHeaders})).status).toBe(200);
+    await storage.exec('UPDATE room_state SET revoked_at_ms = ?', Date.now());
+    expect((await fetch(packageUrl, {headers: roomHeaders})).status).toBe(403);
+    await storage.exec('UPDATE room_state SET revoked_at_ms = NULL, expires_at_ms = ?', Date.now() - 1);
+    expect((await fetch(packageUrl, {headers: roomHeaders})).status).toBe(403);
   });
 });
