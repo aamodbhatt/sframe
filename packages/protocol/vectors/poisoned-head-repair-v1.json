@@ -1,0 +1,22 @@
+{
+  "description": "Public verification vector only; signer seed was ephemeral and discarded.",
+  "payloadType": "application/vnd.smallframe.poisoned-head-repair.v1+json",
+  "record": {
+    "protocolVersion": 1,
+    "roomId": "SyeEX-amcUMUKMoTQlp2Ig",
+    "packageDigest": "sXcARKwQEQ7aXQke82Iqw5y2T9Sx-Je70FpOd6APaiY",
+    "publisherKeyId": "sha256:JSYCmuo1Y2foaXx9Uf10Cc4OElLxvGHjQxsrOibMmRE",
+    "expectedStateEpoch": 0,
+    "expectedRevision": 42,
+    "expectedEnvelopeDigest": "Be-vXa5SsxGzy0sD1-7OOkBMKM4i39IfK7m6FFtVL5w",
+    "viewerDescriptorDigest": "mOAGzZodwZrJYdD2Olf-eepQyn64lFLX_mvH2gYdW9M",
+    "editorDescriptorDigest": "gsKUv2ah52QbULxHGNuNF-zfl9fONCe9AAAxlwXJA_U",
+    "reason": "POISONED_HEAD",
+    "operationId": "HKouIkjNjptaYNxFcZt9fQ",
+    "createdAt": 1780000000000
+  },
+  "jcsBase64Url": "eyJjcmVhdGVkQXQiOjE3ODAwMDAwMDAwMDAsImVkaXRvckRlc2NyaXB0b3JEaWdlc3QiOiJnc0tVdjJhaDUyUWJVTHhIR051TkYtemZsOWZPTkNlOUFBQXhsd1hKQV9VIiwiZXhwZWN0ZWRFbnZlbG9wZURpZ2VzdCI6IkJlLXZYYTVTc3hHenkwc0QxLTdPT2tCTUtNNGkzOUlmSzdtNkZGdFZMNXciLCJleHBlY3RlZFJldmlzaW9uIjo0MiwiZXhwZWN0ZWRTdGF0ZUVwb2NoIjowLCJvcGVyYXRpb25JZCI6IkhLb3VJa2pOanB0YVlOeEZjWnQ5ZlEiLCJwYWNrYWdlRGlnZXN0Ijoic1hjQVJLd1FFUTdhWFFrZTgySXF3NXkyVDlTeC1KZTcwRnBPZDZBUGFpWSIsInByb3RvY29sVmVyc2lvbiI6MSwicHVibGlzaGVyS2V5SWQiOiJzaGEyNTY6SlNZQ211bzFZMmZvYVh4OVVmMTBDYzRPRWxMeHZHSGpReHNyT2liTW1SRSIsInJlYXNvbiI6IlBPSVNPTkVEX0hFQUQiLCJyb29tSWQiOiJTeWVFWC1hbWNVTVVLTW9UUWxwMklnIiwidmlld2VyRGVzY3JpcHRvckRpZ2VzdCI6Im1PQUd6Wm9kd1pySllkRDJPbGYtZWVwUXluNjRsRkxYX212SDJnWWRXOU0ifQ",
+  "paeSha256": "L05NO2IjX-j-ZZtGi8AdgyTzutiarL_RLt7UK-A0fms",
+  "publisherPublicKey": "aXVSgIolCHumwdM1zFkSsWYNFAZlzTUjjjoLHtjUnRE",
+  "signature": "nPqIDFZ_wp-mCCLu4JqYIm543iAaXhqjj3P7mggjv1IhmZeQnqRoEqIPIL7mvJSGGYG_Ntghmi9sNdKxF3vWBg"
+}

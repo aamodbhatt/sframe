@@ -453,7 +453,7 @@ fn validate_repair_etag(etag: &str) -> Result<(), String> {
         || fields[2]
             .parse::<u64>()
             .ok()
-            .is_none_or(|v| v == 0 || v.to_string() != fields[2])
+            .is_none_or(|v| v == 0 || v > 9_007_199_254_740_991 || v.to_string() != fields[2])
         || Base64UrlUnpadded::decode_vec(fields[3])
             .ok()
             .is_none_or(|v| v.len() != 32)
@@ -507,6 +507,8 @@ mod repair_tests {
             format!("\"sf1.0.042.{digest}\""),
             format!("\"sf1.17.42.{digest}\""),
             format!("\"sf1.0.0.{digest}\""),
+            format!("\"sf1.0.9007199254740992.{digest}\""),
+            format!("\"sf1.0.18446744073709551616.{digest}\""),
             format!("\"sf1.0.42.{}\"", &digest[..42]),
             format!("\"sf1.0.42.{digest}=\""),
             format!("\"sf1.0.42.{digest}.extra\""),

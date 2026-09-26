@@ -9,6 +9,7 @@ mod json;
 mod manifest;
 mod module_source;
 mod package;
+mod recovery;
 mod state_schema;
 
 pub(crate) use archive::read_zip_bounded;
@@ -24,6 +25,10 @@ pub use module_source::{prepare_classic_module_source, validate_module_source};
 pub use package::{
     ValidatedSource, VerifiedPackage, artifact_digest, build_signed_package, hex_digest, key_id,
     package_digest, sha256, validate_source_files, verify_package_archive, verify_package_files,
+};
+pub use recovery::{
+    MAX_REPAIR_RECORD_BYTES, POISONED_HEAD_PAYLOAD_TYPE, PoisonedHeadRepairRecord,
+    parse_poisoned_head_repair, verify_poisoned_head_repair,
 };
 
 #[cfg(feature = "wasm")]
