@@ -98,14 +98,23 @@ describe('local publishing prototype and capability-scoped package retrieval', (
           const parsed = JSON.parse(stderr) as {error?: {code?: unknown}};
           if (typeof parsed.error?.code === 'string' && /^[A-Z_]+$/u.test(parsed.error.code)) code = parsed.error.code;
         } catch { /* Failures never include request bodies or secret URLs. */ }
+        if (code === 'CLI_COMMAND_FAILED') {
+          const detail = error as {stderr?: unknown; stdout?: unknown; code?: unknown; signal?: unknown};
+          const stderr = String(detail.stderr ?? '');
+          throw new Error(`CLI_COMMAND_FAILED:${stderr.length}:${stderr.trimStart().startsWith('{')}:${String(detail.code)}:${String(detail.signal)}:${String(detail.stdout ?? '').length}`);
+        }
         throw new Error(code);
       }
     };
     await run('identity', 'init');
+    const inviteCode = randomBytes(24).toString('base64url');
+    const inviteFile = join(store, 'test-invite.txt');
+    await writeFile(inviteFile, inviteCode, {mode: 0o600});
     const invite = await fetch(`${apiOrigin}/v1/admin/invite`, {method: 'POST', headers: {Origin: CONTROLLER_ORIGIN,
-      'Content-Type': 'application/json'}, body: JSON.stringify({code: 'BETA_INVITE_TEST_123'})});
+      'Content-Type': 'application/json'}, body: JSON.stringify({code: inviteCode})});
     expect(invite.status).toBe(201);
-    await run('enroll', '--api-url', apiOrigin);
+    await run('enroll', '--invite-file', inviteFile, '--api-url', apiOrigin);
+    await rm(inviteFile);
     const source = join(temporaryDirectory, 'publish-source');
     await cp(join(ROOT, 'examples', 'decision-board', 'package'), source, {recursive: true});
     const published = await run('publish', source,
@@ -183,10 +192,11 @@ describe('local publishing prototype and capability-scoped package retrieval', (
 
   it('creates an encrypted local room from authenticated descriptors and pins its package for members', async () => {
     // 1. Admin creates an invite code
+    const inviteCode = randomBytes(24).toString('base64url');
     const adminRes = await fetch(`${apiOrigin}/v1/admin/invite`, {
       method: 'POST',
       headers: {'Content-Type': 'application/json', Origin: CONTROLLER_ORIGIN},
-      body: JSON.stringify({code: 'BETA_INVITE_TEST_123'})
+      body: JSON.stringify({code: inviteCode})
     });
     expect(adminRes.status).toBe(201);
     const adminData = (await adminRes.json()) as {ok: boolean; codeHash: string};
@@ -201,7 +211,7 @@ describe('local publishing prototype and capability-scoped package retrieval', (
     const rawToken = randomBytes(32);
     const tokenHash = createHash('sha256').update(rawToken).digest();
     const operationId = randomBytes(16);
-    const inviteCodeHash = createHash('sha256').update('BETA_INVITE_TEST_123').digest();
+    const inviteCodeHash = createHash('sha256').update(inviteCode).digest();
 
     const signedEnrollment = await createSignedEnrollment({
       publisherPrivateKey: publisherPriv,

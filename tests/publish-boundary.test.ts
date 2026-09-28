@@ -1,7 +1,10 @@
 import {createHash, randomBytes} from 'node:crypto';
 import {afterEach, describe, expect, it, vi} from 'vitest';
 import {handlePublishRoute} from '../apps/api/src/publish-router.js';
-import {handlePackageUpload, MAX_PACKAGE_UPLOAD_BYTES, globalPublishStore, type PublishStore} from '../apps/api/src/publish-api.js';
+import {handleAdminCreateInvite, handleEnrollment, handlePackageUpload, MAX_PACKAGE_UPLOAD_BYTES,
+  globalPublishStore, type PublishStore} from '../apps/api/src/publish-api.js';
+import {createSignedEnrollment, encodeBase64Url} from '../packages/protocol/src/index.js';
+import {utils} from '@noble/ed25519';
 
 const hash = (bytes: Uint8Array): string => createHash('sha256').update(bytes).digest('base64url');
 const fixture = () => {
@@ -18,6 +21,89 @@ const fixture = () => {
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
 
 describe('local publishing prototype boundary', () => {
+  it('bounds and strictly parses invite and enrollment requests before any state change', async () => {
+    const {store} = fixture();
+    const request = (path: string, body: BodyInit) => new Request(`http://api.localhost${path}`,
+      {method: 'POST', body, duplex: 'half', headers: {'Content-Type': 'application/json'}} as RequestInit);
+    const counts = () => [store.invites.size, store.publishers.size, store.operations.size];
+    const initial = counts();
+    const code = randomBytes(24).toString('base64url');
+    expect((await handleAdminCreateInvite(new Request('http://api.localhost/v1/admin/invite',
+      {method: 'POST', body: JSON.stringify({code})}), store)).status).toBe(415);
+    expect(counts()).toEqual(initial);
+    for (const body of [
+      JSON.stringify({code, expiresInMs: 0}),
+      JSON.stringify({code, expiresInMs: 7 * 86_400_000 + 1}),
+      JSON.stringify({code, extra: true}),
+      `{"code":"${code}","co\\u0064e":"${code}"}`,
+      JSON.stringify({code: 'short'}),
+    ]) {
+      expect((await handleAdminCreateInvite(request('/v1/admin/invite', body), store)).status).toBe(400);
+      expect(counts()).toEqual(initial);
+    }
+    expect((await handleAdminCreateInvite(request('/v1/admin/invite', new Uint8Array(1_025)), store)).status).toBe(413);
+    expect(counts()).toEqual(initial);
+    const invite = await handleAdminCreateInvite(request('/v1/admin/invite', JSON.stringify({code})), store);
+    expect(invite.status).toBe(201);
+    const inviteHash = (await invite.json() as {codeHash: string}).codeHash;
+    const inviteCount = counts();
+
+    const publisherPrivateKey = utils.randomPrivateKey();
+    const signed = await createSignedEnrollment({publisherPrivateKey,
+      tokenHash: randomBytes(32), operationId: randomBytes(16), inviteCodeHash: createHash('sha256').update(code).digest()});
+    const jcsBytes = encodeBase64Url(signed.jcsBytes);
+    const signature = encodeBase64Url(signed.signature);
+    expect((await handleEnrollment(new Request('http://api.localhost/v1/enroll',
+      {method: 'POST', body: JSON.stringify({jcsBytes, signature})}), store)).status).toBe(415);
+    expect(counts()).toEqual(inviteCount);
+    for (const body of [
+      `{"jcsBytes":"${jcsBytes}","signature":"${signature}","signature":"${signature}"}`,
+      JSON.stringify({jcsBytes, signature, extra: true}),
+      JSON.stringify({jcsBytes: `${jcsBytes}=`, signature}),
+      JSON.stringify({jcsBytes, signature: `${signature}=`}),
+      new Uint8Array([0xff]),
+    ]) {
+      expect((await handleEnrollment(request('/v1/enroll', body), store)).status).toBe(400);
+      expect(counts()).toEqual(inviteCount);
+    }
+    expect((await handleEnrollment(request('/v1/enroll', new Uint8Array(2_049)), store)).status).toBe(413);
+    expect(counts()).toEqual(inviteCount);
+    const valid = request('/v1/enroll', JSON.stringify({jcsBytes, signature}));
+    expect((await handleEnrollment(valid, store)).status).toBe(201);
+    expect(store.operations.size).toBe(1);
+    expect((await handleEnrollment(request('/v1/enroll', JSON.stringify({jcsBytes, signature})), store)).status).toBe(200);
+    expect((await handleEnrollment(request('/v1/enroll', `{"signature":"${signature}","jcsBytes":"${jcsBytes}"}`), store)).status).toBe(409);
+    expect(store.operations.size).toBe(1);
+    const consumedAt = store.invites.get(inviteHash)?.usedAt;
+    expect(consumedAt).toBeTypeOf('number');
+    expect((await handleAdminCreateInvite(request('/v1/admin/invite', JSON.stringify({code})), store)).status).toBe(409);
+    expect(store.invites.get(inviteHash)?.usedAt).toBe(consumedAt);
+    const second = await createSignedEnrollment({publisherPrivateKey,
+      tokenHash: randomBytes(32), operationId: randomBytes(16), inviteCodeHash: createHash('sha256').update(code).digest()});
+    expect((await handleEnrollment(request('/v1/enroll', JSON.stringify({
+      jcsBytes: encodeBase64Url(second.jcsBytes), signature: encodeBase64Url(second.signature),
+    })), store)).status).toBe(403);
+    expect(store.operations.size).toBe(1);
+  });
+
+  it('bounds a stalled enrollment body with one deadline and leaves the invite unconsumed', async () => {
+    const {store} = fixture();
+    const cancel = vi.fn(() => new Promise<void>(() => {}));
+    const stalled = new Request('http://api.localhost/v1/enroll', {method: 'POST',
+      body: new ReadableStream<Uint8Array>({cancel}), duplex: 'half',
+      headers: {'Content-Type': 'application/json'}} as RequestInit);
+    vi.useFakeTimers();
+    const reader = vi.spyOn(stalled.body!, 'getReader');
+    const pending = handleEnrollment(stalled, store);
+    await vi.waitFor(() => expect(reader).toHaveBeenCalledOnce(), {interval: 1, timeout: 1_000});
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect((await pending).status).toBe(400);
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(store.invites.size).toBe(0);
+    expect(store.operations.size).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it.each(['staging', 'production'] as const)('rejects every publisher prototype path in %s before touching credentials, bodies, stores or DOs', async (ENVIRONMENT) => {
     let touched = 0;
     const forbidden = (): never => { touched += 1; throw new Error('untrusted detail'); };

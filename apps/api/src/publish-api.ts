@@ -12,6 +12,8 @@ import canonicalize from 'canonicalize';
 import {readBoundedBody} from './bounded-body.js';
 
 export const MAX_PACKAGE_UPLOAD_BYTES = 1_048_576;
+const MAX_ENROLLMENT_BODY_BYTES = 2_048;
+const MAX_ADMIN_INVITE_BODY_BYTES = 1_024;
 
 export type StoredInvite = {
   codeHash: string;
@@ -87,15 +89,17 @@ const problem = (status: number, code: string): Response =>
 
 export const handleAdminCreateInvite = async (request: Request, store = globalPublishStore): Promise<Response> => {
   try {
-    const rawBody = (await request.json()) as {code: string; expiresInMs?: number};
-    if (!rawBody?.code || typeof rawBody.code !== 'string') return problem(400, 'INVITE_CODE_REQUIRED');
-
-    const codeBytes = new TextEncoder().encode(rawBody.code);
+    if (request.headers.get('Content-Type') !== 'application/json') return problem(415, 'UNSUPPORTED_MEDIA_TYPE');
+    const bounded = await readBoundedBody(request, MAX_ADMIN_INVITE_BODY_BYTES);
+    if (bounded.kind === 'too-large') return problem(413, 'ADMIN_INVITE_SIZE_LIMIT');
+    if (bounded.kind !== 'ok') return problem(400, 'ADMIN_INVITE_INVALID');
+    const {codeBytes, duration} = parseAdminInviteRequest(bounded.body);
     const hash = await crypto.subtle.digest('SHA-256', codeBytes);
     const codeHash = encodeBase64Url(new Uint8Array(hash));
+    if (store.invites.has(codeHash)) return problem(409, 'INVITE_CODE_ALREADY_EXISTS');
 
     const now = Date.now();
-    const expiresAt = now + (rawBody.expiresInMs ?? 7 * 86_400_000);
+    const expiresAt = now + duration;
 
     store.invites.set(codeHash, {
       codeHash,
@@ -109,19 +113,35 @@ export const handleAdminCreateInvite = async (request: Request, store = globalPu
   }
 };
 
+const parseAdminInviteRequest = (bytes: Uint8Array): {codeBytes: Uint8Array; duration: number} => {
+  const rawBody = parseUniqueJson(new TextDecoder('utf-8', {fatal: true}).decode(bytes)) as Record<string, unknown>;
+  if (!rawBody || typeof rawBody !== 'object' || Array.isArray(rawBody)
+    || Object.keys(rawBody).length < 1 || Object.keys(rawBody).length > 2
+    || !Object.hasOwn(rawBody, 'code')
+    || Object.keys(rawBody).some((key) => key !== 'code' && key !== 'expiresInMs')
+    || typeof rawBody.code !== 'string') throw new Error('ADMIN_INVITE_INVALID');
+
+  const codeBytes = new TextEncoder().encode(rawBody.code);
+  const duration = rawBody.expiresInMs ?? 7 * 86_400_000;
+  if (codeBytes.byteLength < 16 || codeBytes.byteLength > 256
+    || typeof duration !== 'number' || !Number.isSafeInteger(duration) || duration < 1 || duration > 7 * 86_400_000) {
+    throw new Error('ADMIN_INVITE_INVALID');
+  }
+  return {codeBytes, duration};
+};
+
 export const handleEnrollment = async (request: Request, store = globalPublishStore): Promise<Response> => {
   try {
-    const rawBody = (await request.json()) as {jcsBytes: string; signature: string};
-    if (!rawBody?.jcsBytes || !rawBody?.signature) return problem(400, 'ENROLLMENT_PAYLOAD_MISSING');
-
-    const jcsBytes = decodeBase64Url(rawBody.jcsBytes);
-    const signature = decodeBase64Url(rawBody.signature);
+    if (request.headers.get('Content-Type') !== 'application/json') return problem(415, 'UNSUPPORTED_MEDIA_TYPE');
+    const bounded = await readBoundedBody(request, MAX_ENROLLMENT_BODY_BYTES);
+    if (bounded.kind === 'too-large') return problem(413, 'ENROLLMENT_SIZE_LIMIT');
+    if (bounded.kind !== 'ok') return problem(400, 'ENROLLMENT_PAYLOAD_INVALID');
+    const {jcsBytes, signature} = parseEnrollmentRequest(bounded.body);
 
     const record = await verifyPublisherEnrollment(jcsBytes, signature);
 
     // Check existing operation for idempotency
-    const requestDigest = encodeBase64Url(new Uint8Array(await crypto.subtle.digest('SHA-256',
-      new TextEncoder().encode(`${rawBody.jcsBytes}.${rawBody.signature}`))));
+    const requestDigest = encodeBase64Url(new Uint8Array(await crypto.subtle.digest('SHA-256', bounded.body)));
     const operationKey = `enroll:${record.publisherKeyId}:${record.operationId}`;
     const existingOp = store.operations.get(operationKey);
     if (existingOp) {
@@ -136,7 +156,7 @@ export const handleEnrollment = async (request: Request, store = globalPublishSt
     // Check invite code
     const invite = store.invites.get(record.inviteCodeHash);
     if (!invite) return problem(403, 'INVITE_CODE_NOT_FOUND');
-    if (invite.usedAt && invite.usedByPublisherKeyId !== record.publisherKeyId) {
+    if (invite.usedAt !== undefined) {
       return problem(403, 'INVITE_CODE_ALREADY_USED');
     }
     if (Date.now() > invite.expiresAt) return problem(403, 'INVITE_CODE_EXPIRED');
@@ -172,6 +192,21 @@ export const handleEnrollment = async (request: Request, store = globalPublishSt
     const msg = err instanceof Error ? err.message : 'ENROLLMENT_FAILED';
     return problem(400, msg);
   }
+};
+
+const parseEnrollmentRequest = (bytes: Uint8Array): {jcsBytes: Uint8Array; signature: Uint8Array} => {
+  const rawBody = parseUniqueJson(new TextDecoder('utf-8', {fatal: true}).decode(bytes)) as Record<string, unknown>;
+  if (!rawBody || typeof rawBody !== 'object' || Array.isArray(rawBody)
+    || Object.keys(rawBody).length !== 2 || !Object.hasOwn(rawBody, 'jcsBytes')
+    || !Object.hasOwn(rawBody, 'signature') || typeof rawBody.jcsBytes !== 'string'
+    || rawBody.jcsBytes.length > 1_366 || !canonicalBytes(rawBody.signature, 64)) {
+    throw new Error('ENROLLMENT_PAYLOAD_INVALID');
+  }
+  const jcsBytes = decodeBase64Url(rawBody.jcsBytes);
+  if (jcsBytes.byteLength > 1_024 || encodeBase64Url(jcsBytes) !== rawBody.jcsBytes) {
+    throw new Error('ENROLLMENT_PAYLOAD_INVALID');
+  }
+  return {jcsBytes, signature: decodeBase64Url(rawBody.signature)};
 };
 
 export const authenticatePublisher = async (
