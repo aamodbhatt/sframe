@@ -295,6 +295,14 @@ test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
       await expect(second.frameLocator('iframe').getByText('0 decisions')).toBeVisible();
       await gotoInvite(waitingEditor, `/r/${activeRoomId}`, fragment);
       await expect(waitingEditor.locator('#role')).toHaveText('editor (read-only lease)');
+      await expect(waitingEditor.frameLocator('iframe').getByText('0 decisions')).toBeVisible();
+      await waitingEditor.evaluate(() => {
+        const original = IDBFactory.prototype.open;
+        IDBFactory.prototype.open = function(name: string, version?: number) {
+          if (name === 'smallframe-shared-v1') throw new Error('SIMULATED_FORGET_LOOKUP_FAILURE');
+          return version === undefined ? original.call(this, name) : original.call(this, name, version);
+        };
+      });
       await inspector.goto('/?personal=1', {waitUntil: 'commit'});
       await inspector.waitForFunction(() => Boolean((globalThis as any).SmallframeSharedStore));
       await inspector.evaluate(async (id) => {

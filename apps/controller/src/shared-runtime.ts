@@ -662,9 +662,10 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
     };
     forgetChannel.onmessage = (event: MessageEvent) => {
       if (event.data?.type !== 'forgotten' || event.data.roomId !== descriptor.roomId) return;
-      void store().generation(descriptor.roomId).then((generation) => {
-        if (generation !== storageGeneration) stopForgetting();
-      }).catch(() => setStatus('Forget device check unavailable'));
+      // The sender posts only after the delete transaction commits. A second
+      // lookup can fail or see the new generation during this tab's startup;
+      // neither outcome may leave its old capability alive in memory.
+      stopForgetting();
     };
     const forgetButton = element<HTMLButtonElement>('forget-workspace');
     forgetButton.addEventListener('click', () => {
