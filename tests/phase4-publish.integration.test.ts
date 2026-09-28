@@ -1,7 +1,7 @@
-import {createHash, randomBytes} from 'node:crypto';
+import {createCipheriv, createDecipheriv, createHash, randomBytes} from 'node:crypto';
 import {execFile, spawnSync} from 'node:child_process';
 import {promisify} from 'node:util';
-import {mkdir, mkdtemp, readFile, rm} from 'node:fs/promises';
+import {cp, mkdir, mkdtemp, readFile, rm, writeFile} from 'node:fs/promises';
 import {join, resolve} from 'node:path';
 import {pathToFileURL} from 'node:url';
 import {describe, expect, it, beforeAll, afterAll} from 'vitest';
@@ -91,8 +91,14 @@ describe('local publishing prototype and capability-scoped package retrieval', (
         const result = await promisify(execFile)(binary, ['--json', '--test-store', store, ...args],
           {cwd: ROOT, encoding: 'utf8', maxBuffer: 32_768});
         return JSON.parse(result.stdout) as Record<string, any>;
-      } catch {
-        throw new Error('CLI_COMMAND_FAILED');
+      } catch (error) {
+        let code = 'CLI_COMMAND_FAILED';
+        try {
+          const stderr = String((error as {stderr?: unknown}).stderr ?? '');
+          const parsed = JSON.parse(stderr) as {error?: {code?: unknown}};
+          if (typeof parsed.error?.code === 'string' && /^[A-Z_]+$/u.test(parsed.error.code)) code = parsed.error.code;
+        } catch { /* Failures never include request bodies or secret URLs. */ }
+        throw new Error(code);
       }
     };
     await run('identity', 'init');
@@ -100,7 +106,9 @@ describe('local publishing prototype and capability-scoped package retrieval', (
       'Content-Type': 'application/json'}, body: JSON.stringify({code: 'BETA_INVITE_TEST_123'})});
     expect(invite.status).toBe(201);
     await run('enroll', '--api-url', apiOrigin);
-    const published = await run('publish', join(ROOT, 'examples', 'decision-board', 'package'),
+    const source = join(temporaryDirectory, 'publish-source');
+    await cp(join(ROOT, 'examples', 'decision-board', 'package'), source, {recursive: true});
+    const published = await run('publish', source,
       '--api-url', apiOrigin, '--show-secrets');
     expect(published.ok).toBe(true);
     const viewer = await parseInviteFragment(new URL(published.viewerInviteUrl).hash);
@@ -129,6 +137,48 @@ describe('local publishing prototype and capability-scoped package retrieval', (
     const stored = await readFile(join(store, `room-${published.roomId}.json`), 'utf8');
     expect(stored.includes('roomKey')).toBe(false);
     expect(stored.includes('creationRequest')).toBe(false);
+    expect((await run('operations', 'status', published.operationRef)).localStatus).toBe('CONFIRMED');
+    await writeFile(join(source, 'app.worker.js'), 'source changed after publication');
+    const roomFile = join(store, `room-${published.roomId}.json`);
+    const unlock = await readFile(join(store, 'unlock.key'));
+    const sealed = JSON.parse(stored) as {nonce: string; ciphertext: string; schemaVersion: number};
+    const aad = Buffer.from(`smallframe/local-secret/v1\0room:${published.roomId}`);
+    const encrypted = Buffer.from(sealed.ciphertext, 'base64url');
+    const decipher = createDecipheriv('aes-256-gcm', unlock, Buffer.from(sealed.nonce, 'base64url'));
+    decipher.setAAD(aad);
+    decipher.setAuthTag(encrypted.subarray(-16));
+    const record = JSON.parse(Buffer.concat([decipher.update(encrypted.subarray(0, -16)), decipher.final()]).toString()) as Record<string, any>;
+    record.status = 'PENDING';
+    const saveRecord = async () => {
+      const nonce = randomBytes(12);
+      const cipher = createCipheriv('aes-256-gcm', unlock, nonce);
+      cipher.setAAD(aad);
+      const resealed = Buffer.concat([cipher.update(JSON.stringify(record)), cipher.final(), cipher.getAuthTag()]);
+      await writeFile(roomFile, JSON.stringify({schemaVersion: 1, nonce: nonce.toString('base64url'),
+        ciphertext: resealed.toString('base64url')}));
+    };
+    const originalRequest = record.creationRequestBytes;
+    const originalDigest = record.creationRequestSha256;
+    const changed = JSON.parse(Buffer.from(originalRequest, 'base64url').toString()) as Record<string, any>;
+    changed.envelope.aad.appId = 'changed-after-commit';
+    const changedBytes = Buffer.from(JSON.stringify(changed));
+    record.creationRequestBytes = changedBytes.toString('base64url');
+    record.creationRequestSha256 = createHash('sha256').update(changedBytes).digest('base64url');
+    await saveRecord();
+    await expect(run('operations', 'resume', published.operationRef)).rejects.toThrow('OPERATION_STILL_PENDING');
+    record.creationRequestBytes = originalRequest;
+    record.creationRequestSha256 = originalDigest;
+    await saveRecord();
+    expect((await run('operations', 'status', published.operationRef)).localStatus).toBe('PENDING');
+    const resumed = await run('operations', 'resume', published.operationRef, '--show-secrets');
+    expect(resumed.ok).toBe(true);
+    const fingerprint = (value: string) => createHash('sha256').update(value).digest('hex');
+    expect(fingerprint(resumed.viewerInviteUrl)).toBe(fingerprint(published.viewerInviteUrl));
+    expect(fingerprint(resumed.editorInviteUrl)).toBe(fingerprint(published.editorInviteUrl));
+    expect((await run('operations', 'status', published.operationRef)).localStatus).toBe('CONFIRMED');
+    await expect(run('operations', 'abandon', published.operationRef)).rejects.toThrow('OPERATION_ABANDON_REQUIRES_SERVER_RECONCILIATION');
+    await expect(run('export', 'package', published.packageDigest, '--output', join(temporaryDirectory, 'unused-package')))
+      .rejects.toThrow('PACKAGE_EXPORT_NOT_IMPLEMENTED');
   }, 180_000);
 
   it('creates an encrypted local room from authenticated descriptors and pins its package for members', async () => {

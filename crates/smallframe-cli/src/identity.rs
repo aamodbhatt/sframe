@@ -298,6 +298,34 @@ impl IdentityContext {
         serde_json::from_slice(&bytes).map_err(|_| "ROOM_RECORD_INVALID".to_owned())
     }
 
+    pub fn replace_room_record(
+        &self,
+        room_id: &str,
+        record: &serde_json::Value,
+    ) -> Result<(), String> {
+        validate_room_id(room_id)?;
+        let path = self.root.join(format!("room-{room_id}.json"));
+        if !path.is_file() {
+            return Err("ROOM_NOT_FOUND".to_owned());
+        }
+        let bytes = jcs(record)?;
+        let mut suffix = [0_u8; 8];
+        OsRng.fill_bytes(&mut suffix);
+        let temporary = self.root.join(format!(
+            ".room-{}-{}.tmp",
+            room_id,
+            Base64UrlUnpadded::encode_string(&suffix)
+        ));
+        self.write_local_secret(&temporary, &format!("room:{room_id}"), &bytes)?;
+        if fs::rename(&temporary, &path).is_err() {
+            let _ = fs::remove_file(&temporary);
+            return Err("ROOM_RECORD_REPLACE_FAILED".to_owned());
+        }
+        fs::File::open(&self.root)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| "ROOM_RECORD_SYNC_FAILED".to_owned())
+    }
+
     fn write_local_secret(
         &self,
         path: &Path,
@@ -669,6 +697,10 @@ mod tests {
             ctx.load_room_record("../outside").unwrap_err(),
             "ROOM_ID_INVALID"
         );
+        let updated = serde_json::json!({"roomKey": token, "status": "CONFIRMED"});
+        ctx.replace_room_record(&first, &updated)
+            .expect("replace room");
+        assert_eq!(ctx.load_room_record(&first).expect("updated room"), updated);
         fs::remove_dir_all(root).expect("cleanup");
     }
 

@@ -9,8 +9,8 @@ use app::{new_app, pack, validate_path};
 use clap::{Parser, Subcommand};
 use identity::{IdentityContext, read_passphrase};
 use publish::{
-    enroll_publisher, publish_package, room_request_repair, room_revoke, room_rotate_links,
-    room_status,
+    enroll_publisher, publish_package, resume_room_operation, room_operation_status,
+    room_request_repair, room_revoke, room_rotate_links, room_status,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -135,9 +135,17 @@ enum RoomCommand {
 
 #[derive(Debug, Subcommand)]
 enum OperationsCommand {
-    Status { operation_ref: String },
-    Resume { operation_ref: String },
-    Abandon { operation_ref: String },
+    Status {
+        operation_ref: String,
+    },
+    Resume {
+        operation_ref: String,
+        #[arg(long)]
+        show_secrets: bool,
+    },
+    Abandon {
+        operation_ref: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -154,6 +162,7 @@ struct CliError {
     code: String,
     detail: String,
     exit: u8,
+    operation_ref: Option<String>,
 }
 
 impl CliError {
@@ -175,6 +184,15 @@ impl CliError {
         };
         Self {
             code,
+            operation_ref: message
+                .strip_prefix("ROOM_CREATION_PENDING:")
+                .filter(|value| {
+                    value.len() == 22
+                        && value.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'
+                        })
+                })
+                .map(str::to_owned),
             detail: message,
             exit,
         }
@@ -366,29 +384,31 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                 }
             }
         }
-        Command::Operations { command } => match command {
-            OperationsCommand::Status { operation_ref } => emit(
-                &json!({"status": "CONFIRMED", "operationId": operation_ref}),
-                cli.json,
-            ),
-            OperationsCommand::Resume { operation_ref } => emit(
-                &json!({"resumed": true, "operationId": operation_ref}),
-                cli.json,
-            ),
-            OperationsCommand::Abandon { operation_ref } => emit(
-                &json!({"abandoned": true, "operationId": operation_ref}),
-                cli.json,
-            ),
-        },
-        Command::Export { command } => match command {
-            ExportCommand::Package {
-                package_or_room_ref,
-                output,
-            } => emit(
-                &json!({"ok": true, "ref": package_or_room_ref, "output": output}),
-                cli.json,
-            ),
-        },
+        Command::Operations { command } => {
+            let context = IdentityContext::discover(cli.test_store.as_deref())
+                .map_err(CliError::from_message)?;
+            match command {
+                OperationsCommand::Status { operation_ref } => emit(
+                    &room_operation_status(&context, operation_ref)
+                        .map_err(CliError::from_message)?,
+                    cli.json,
+                ),
+                OperationsCommand::Resume {
+                    operation_ref,
+                    show_secrets,
+                } => emit(
+                    &resume_room_operation(&context, operation_ref, *show_secrets)
+                        .map_err(CliError::from_message)?,
+                    cli.json,
+                ),
+                OperationsCommand::Abandon { .. } => Err(CliError::from_message(
+                    "OPERATION_ABANDON_REQUIRES_SERVER_RECONCILIATION".to_owned(),
+                )),
+            }
+        }
+        Command::Export { .. } => Err(CliError::from_message(
+            "PACKAGE_EXPORT_NOT_IMPLEMENTED".to_owned(),
+        )),
         Command::Dev { path } => run_dev(cli, path.as_ref()),
     }
 }
@@ -397,7 +417,11 @@ fn main() {
     let cli = Cli::parse();
     if let Err(error) = run(&cli) {
         if cli.json {
-            eprintln!("{}", json!({"ok":false,"error":{"code":error.code}}));
+            eprintln!(
+                "{}",
+                json!({"ok":false,"error":{"code":error.code},
+                "operationRef":error.operation_ref})
+            );
         } else {
             eprintln!("{}", error.detail);
         }

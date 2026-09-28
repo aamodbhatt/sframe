@@ -33,7 +33,16 @@ fn http_post_json(
     auth_header: Option<&str>,
     if_match: Option<&str>,
 ) -> Result<serde_json::Value, String> {
-    let body_str = serde_json::to_string(body).map_err(|e| format!("SERIALIZE_FAILED: {e}"))?;
+    let body_bytes = serde_json::to_vec(body).map_err(|_| "SERIALIZE_FAILED".to_owned())?;
+    http_post_json_bytes(url, &body_bytes, auth_header, if_match)
+}
+
+fn http_post_json_bytes(
+    url: &str,
+    body_bytes: &[u8],
+    auth_header: Option<&str>,
+    if_match: Option<&str>,
+) -> Result<serde_json::Value, String> {
     let mut cmd = ProcessCommand::new("curl");
     cmd.args([
         "-s",
@@ -62,7 +71,7 @@ fn http_post_json(
         .stdin
         .take()
         .ok_or("HTTP_REQUEST_FAILED")?
-        .write_all(body_str.as_bytes())
+        .write_all(body_bytes)
         .map_err(|_| "HTTP_REQUEST_FAILED".to_owned())?;
     let output = child
         .wait_with_output()
@@ -395,6 +404,8 @@ pub fn publish_package(
         "editorDescriptorSignature": Base64UrlUnpadded::encode_string(&editor_sig.to_bytes()),
         "envelope": envelope
     });
+    let request_bytes = serde_json::to_vec(&room_creation_body)
+        .map_err(|_| "ROOM_CREATION_SERIALIZE_FAILED".to_owned())?;
 
     // Keep the exact encrypted request and room secrets before the first room
     // send. An ambiguous response leaves this pending record available.
@@ -407,30 +418,29 @@ pub fn publish_package(
         "writerPrivateKey": writer_priv_str,
         "writerPublicKey": writer_pub_str,
         "expiresAt": expires_at,
-        "creationRequest": room_creation_body
+        "publisherKeyId": publisher_key_id,
+        "apiUrl": api_url.trim_end_matches('/'),
+        "controllerUrl": controller_url.trim_end_matches('/'),
+        "status": "PENDING",
+        "creationRequestBytes": Base64UrlUnpadded::encode_string(&request_bytes),
+        "creationRequestSha256": Base64UrlUnpadded::encode_string(&Sha256::digest(&request_bytes))
     });
     ctx.save_room_record(&room_id, &room_record)?;
 
     let rooms_url = format!("{}/v1/rooms", api_url.trim_end_matches('/'));
-    let room_res = http_post_json(
+    let room_res = http_post_json_bytes(
         &rooms_url,
-        &room_creation_body,
+        &request_bytes,
         Some(&format!("Bearer {token}")),
         None,
-    )?;
-    if room_res.get("ok").and_then(serde_json::Value::as_bool) != Some(true)
-        || room_res.get("roomId").and_then(serde_json::Value::as_str) != Some(&room_id)
-        || room_res
-            .get("packageDigest")
-            .and_then(serde_json::Value::as_str)
-            != Some(&pkg_digest)
-        || room_res
-            .get("publisherKeyId")
-            .and_then(serde_json::Value::as_str)
-            != Some(&publisher_key_id)
-    {
-        return Err("ROOM_CREATION_RESPONSE_MISMATCH".to_owned());
-    }
+    )
+    .map_err(|_| format!("ROOM_CREATION_PENDING:{room_id}"))?;
+    verify_room_creation_response(&room_res, &room_id, &pkg_digest, &publisher_key_id)
+        .map_err(|_| format!("ROOM_CREATION_PENDING:{room_id}"))?;
+    let mut confirmed_record = room_record;
+    confirmed_record["status"] = json!("CONFIRMED");
+    ctx.replace_room_record(&room_id, &confirmed_record)
+        .map_err(|_| format!("ROOM_CREATION_PENDING:{room_id}"))?;
 
     // 7. Construct invite URLs
     let viewer_d = Base64UrlUnpadded::encode_string(&viewer_jcs);
@@ -470,6 +480,7 @@ pub fn publish_package(
             "packageDigest": pkg_digest,
             "publisherKeyId": publisher_key_id,
             "expiresAt": expires_at,
+            "operationRef": room_id,
             "viewerInviteUrl": viewer_invite,
             "editorInviteUrl": editor_invite
         })
@@ -479,10 +490,178 @@ pub fn publish_package(
             "roomId": room_id,
             "packageDigest": pkg_digest,
             "publisherKeyId": publisher_key_id,
-            "expiresAt": expires_at
+            "expiresAt": expires_at,
+            "operationRef": room_id
         })
     };
 
+    Ok(result)
+}
+
+fn verify_room_creation_response(
+    response: &serde_json::Value,
+    room_id: &str,
+    package_digest: &str,
+    publisher_key_id: &str,
+) -> Result<(), String> {
+    if response.get("ok").and_then(serde_json::Value::as_bool) != Some(true)
+        || response.get("roomId").and_then(serde_json::Value::as_str) != Some(room_id)
+        || response
+            .get("packageDigest")
+            .and_then(serde_json::Value::as_str)
+            != Some(package_digest)
+        || response
+            .get("publisherKeyId")
+            .and_then(serde_json::Value::as_str)
+            != Some(publisher_key_id)
+    {
+        return Err("ROOM_CREATION_RESPONSE_MISMATCH".to_owned());
+    }
+    Ok(())
+}
+
+fn room_operation_record(
+    ctx: &IdentityContext,
+    room_id: &str,
+) -> Result<(serde_json::Value, Vec<u8>, serde_json::Value), String> {
+    let record = ctx.load_room_record(room_id)?;
+    if record.get("roomId").and_then(serde_json::Value::as_str) != Some(room_id)
+        || !matches!(
+            record.get("status").and_then(serde_json::Value::as_str),
+            Some("PENDING" | "CONFIRMED")
+        )
+    {
+        return Err("OPERATION_RECORD_INVALID".to_owned());
+    }
+    let encoded = record
+        .get("creationRequestBytes")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("OPERATION_RECORD_INVALID")?;
+    if encoded.len() > 966_656 {
+        return Err("OPERATION_RECORD_INVALID".to_owned());
+    }
+    let bytes = Base64UrlUnpadded::decode_vec(encoded)
+        .map_err(|_| "OPERATION_RECORD_INVALID".to_owned())?;
+    if bytes.len() > 724_992
+        || Base64UrlUnpadded::encode_string(&bytes) != encoded
+        || record
+            .get("creationRequestSha256")
+            .and_then(serde_json::Value::as_str)
+            != Some(Base64UrlUnpadded::encode_string(&Sha256::digest(&bytes)).as_str())
+    {
+        return Err("OPERATION_RECORD_INVALID".to_owned());
+    }
+    let request = parse_strict_json(&bytes).map_err(|_| "OPERATION_RECORD_INVALID".to_owned())?;
+    if request.get("roomId").and_then(serde_json::Value::as_str) != Some(room_id)
+        || request
+            .get("packageDigest")
+            .and_then(serde_json::Value::as_str)
+            != record
+                .get("packageDigest")
+                .and_then(serde_json::Value::as_str)
+    {
+        return Err("OPERATION_RECORD_INVALID".to_owned());
+    }
+    Ok((record, bytes, request))
+}
+
+pub fn room_operation_status(
+    ctx: &IdentityContext,
+    room_id: &str,
+) -> Result<serde_json::Value, String> {
+    let (record, _, request) = room_operation_record(ctx, room_id)?;
+    Ok(
+        json!({"operationRef":room_id,"operationId":request["operationId"],
+        "localStatus":record["status"],"serverStatus":"UNKNOWN"}),
+    )
+}
+
+pub fn resume_room_operation(
+    ctx: &IdentityContext,
+    room_id: &str,
+    show_secrets: bool,
+) -> Result<serde_json::Value, String> {
+    let (mut record, bytes, request) = room_operation_record(ctx, room_id)?;
+    let package_digest = record
+        .get("packageDigest")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("OPERATION_RECORD_INVALID")?
+        .to_owned();
+    let publisher_key_id = record
+        .get("publisherKeyId")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("OPERATION_RECORD_INVALID")?
+        .to_owned();
+    if record["status"] == "PENDING" {
+        let api_url = record
+            .get("apiUrl")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("OPERATION_RECORD_INVALID")?;
+        if !api_url.starts_with("http://") || api_url.contains(['#', '?', '@']) {
+            return Err("OPERATION_TARGET_INVALID".to_owned());
+        }
+        let token = ctx.load_api_token()?;
+        let response = http_post_json_bytes(
+            &format!("{api_url}/v1/rooms"),
+            &bytes,
+            Some(&format!("Bearer {token}")),
+            None,
+        )
+        .map_err(|_| "OPERATION_STILL_PENDING".to_owned())?;
+        verify_room_creation_response(&response, room_id, &package_digest, &publisher_key_id)?;
+        record["status"] = json!("CONFIRMED");
+        ctx.replace_room_record(room_id, &record)?;
+    }
+    let expiry = record
+        .get("expiresAt")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or("OPERATION_RECORD_INVALID")?;
+    let mut result = json!({"ok":true,"roomId":room_id,"packageDigest":package_digest,
+        "publisherKeyId":publisher_key_id,"expiresAt":expiry,"operationRef":room_id});
+    if show_secrets {
+        let controller = record
+            .get("controllerUrl")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("OPERATION_RECORD_INVALID")?;
+        let viewer_d = request
+            .get("viewerDescriptorJcs")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("OPERATION_RECORD_INVALID")?;
+        let viewer_s = request
+            .get("viewerDescriptorSignature")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("OPERATION_RECORD_INVALID")?;
+        let editor_d = request
+            .get("editorDescriptorJcs")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("OPERATION_RECORD_INVALID")?;
+        let editor_s = request
+            .get("editorDescriptorSignature")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("OPERATION_RECORD_INVALID")?;
+        let key = record
+            .get("roomKey")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("OPERATION_RECORD_INVALID")?;
+        let viewer_cap = record
+            .get("viewerCapability")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("OPERATION_RECORD_INVALID")?;
+        let editor_cap = record
+            .get("editorCapability")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("OPERATION_RECORD_INVALID")?;
+        let writer = record
+            .get("writerPrivateKey")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("OPERATION_RECORD_INVALID")?;
+        result["viewerInviteUrl"] = json!(format!(
+            "{controller}/r/{room_id}#v=1&d={viewer_d}&s={viewer_s}&k={key}&c={viewer_cap}"
+        ));
+        result["editorInviteUrl"] = json!(format!(
+            "{controller}/r/{room_id}#v=1&d={editor_d}&s={editor_s}&w={writer}&k={key}&c={editor_cap}"
+        ));
+    }
     Ok(result)
 }
 
