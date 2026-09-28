@@ -1,6 +1,9 @@
 import {createHash, randomBytes} from 'node:crypto';
-import {mkdir, mkdtemp, rm} from 'node:fs/promises';
+import {execFile, spawnSync} from 'node:child_process';
+import {promisify} from 'node:util';
+import {mkdir, mkdtemp, readFile, rm} from 'node:fs/promises';
 import {join, resolve} from 'node:path';
+import {pathToFileURL} from 'node:url';
 import {describe, expect, it, beforeAll, afterAll} from 'vitest';
 import {Miniflare} from 'miniflare';
 import {build} from 'vite';
@@ -11,6 +14,8 @@ import {
   encodeBase64Url,
   decodeBase64Url,
   encryptSnapshot,
+  decryptSnapshot,
+  parseInviteFragment,
 } from '../packages/protocol/src/index.js';
 
 const ROOT = resolve(import.meta.dirname, '..');
@@ -22,7 +27,7 @@ let temporaryDirectory = '';
 let miniflare: Miniflare;
 let apiOrigin = '';
 
-describe('Phase 4 signed publish API integration', () => {
+describe('local publishing prototype and capability-scoped package retrieval', () => {
   beforeAll(async () => {
     const testRoot = join(ROOT, '.wrangler');
     await mkdir(testRoot, {recursive: true});
@@ -76,7 +81,57 @@ describe('Phase 4 signed publish API integration', () => {
     if (temporaryDirectory) await rm(temporaryDirectory, {recursive: true, force: true});
   });
 
-  it('admin invite, publisher enrollment, package upload, and room creation saga', async () => {
+  it('publishes a real signed package and encrypted Automerge genesis with the native CLI', async () => {
+    const built = spawnSync('cargo', ['build', '--locked', '-q', '-p', 'smallframe-cli'], {cwd: ROOT, encoding: 'utf8'});
+    if (built.status !== 0) throw new Error('CLI_BUILD_FAILED');
+    const binary = join(ROOT, 'target', 'debug', 'smallframe-cli');
+    const store = await mkdtemp(join(temporaryDirectory, 'publisher-'));
+    const run = async (...args: string[]): Promise<Record<string, any>> => {
+      try {
+        const result = await promisify(execFile)(binary, ['--json', '--test-store', store, ...args],
+          {cwd: ROOT, encoding: 'utf8', maxBuffer: 32_768});
+        return JSON.parse(result.stdout) as Record<string, any>;
+      } catch {
+        throw new Error('CLI_COMMAND_FAILED');
+      }
+    };
+    await run('identity', 'init');
+    const invite = await fetch(`${apiOrigin}/v1/admin/invite`, {method: 'POST', headers: {Origin: CONTROLLER_ORIGIN,
+      'Content-Type': 'application/json'}, body: JSON.stringify({code: 'BETA_INVITE_TEST_123'})});
+    expect(invite.status).toBe(201);
+    await run('enroll', '--api-url', apiOrigin);
+    const published = await run('publish', join(ROOT, 'examples', 'decision-board', 'package'),
+      '--api-url', apiOrigin, '--show-secrets');
+    expect(published.ok).toBe(true);
+    const viewer = await parseInviteFragment(new URL(published.viewerInviteUrl).hash);
+    const editor = await parseInviteFragment(new URL(published.editorInviteUrl).hash);
+    expect(viewer.descriptor.packageDigest).toBe(published.packageDigest);
+    expect(editor.descriptor.packageDigest).toBe(published.packageDigest);
+    const headers = {Origin: CONTROLLER_ORIGIN, Authorization: `SF-Cap ${encodeBase64Url(viewer.capability)}`};
+    const packageResponse = await fetch(`${apiOrigin}/v1/rooms/${viewer.descriptor.roomId}/packages/${published.packageDigest}`, {headers});
+    expect(packageResponse.status).toBe(200);
+    expect(packageResponse.headers.get('X-Smallframe-Package-Digest')).toBe(published.packageDigest);
+    expect(packageResponse.headers.get('X-Smallframe-Artifact-Digest')).not.toBe(published.packageDigest);
+    const packageBytes = new Uint8Array(await packageResponse.arrayBuffer());
+    const gluePath = join(ROOT, 'target', 'phase1-wasm', 'smallframe_verifier.js');
+    const verifier = await import(pathToFileURL(gluePath).href);
+    verifier.initSync({module: await readFile(join(ROOT, 'target', 'phase1-wasm', 'smallframe_verifier_bg.wasm'))});
+    const verified = JSON.parse(verifier.wasm_verify_package(packageBytes, published.packageDigest,
+      published.publisherKeyId)) as {ok: boolean};
+    expect(verified.ok).toBe(true);
+    const stateResponse = await fetch(`${apiOrigin}/v1/rooms/${viewer.descriptor.roomId}/state`, {headers});
+    expect(stateResponse.status).toBe(200);
+    const restored = await decryptSnapshot({roomKey: viewer.roomKey, expectedAppId: 'dev.example.decision-board',
+      expectedWriterPublicKey: decodeBase64Url(viewer.descriptor.writerPublicKey),
+      roomId: viewer.descriptor.roomId, packageDigest: published.packageDigest, envelope: await stateResponse.json()});
+    expect(restored.automergeBytes.byteLength).toBeGreaterThan(0);
+    expect(editor.descriptor.writerPublicKey).toBe(viewer.descriptor.writerPublicKey);
+    const stored = await readFile(join(store, `room-${published.roomId}.json`), 'utf8');
+    expect(stored.includes('roomKey')).toBe(false);
+    expect(stored.includes('creationRequest')).toBe(false);
+  }, 180_000);
+
+  it('creates an encrypted local room from authenticated descriptors and pins its package for members', async () => {
     // 1. Admin creates an invite code
     const adminRes = await fetch(`${apiOrigin}/v1/admin/invite`, {
       method: 'POST',
@@ -165,6 +220,7 @@ describe('Phase 4 signed publish API integration', () => {
     const writerPub = await getPublicKeyAsync(writerPriv);
     const viewerCap = randomBytes(32);
     const editorCap = randomBytes(32);
+    const roomExpiry = Date.now() + 86_400_000;
 
     const viewerDesc = await createSignedRoomDescriptor({
       publisherPrivateKey: publisherPriv,
@@ -174,7 +230,7 @@ describe('Phase 4 signed publish API integration', () => {
       writerPublicKey: writerPub,
       capability: new Uint8Array(viewerCap),
       role: 'viewer',
-      expiresAt: Date.now() + 86_400_000
+      expiresAt: roomExpiry
     });
 
     const editorDesc = await createSignedRoomDescriptor({
@@ -185,34 +241,47 @@ describe('Phase 4 signed publish API integration', () => {
       writerPublicKey: writerPub,
       capability: new Uint8Array(editorCap),
       role: 'editor',
-      expiresAt: Date.now() + 86_400_000
+      expiresAt: roomExpiry
     });
 
     const roomOpId = encodeBase64Url(randomBytes(16));
-    const genesisBytes = encodeBase64Url(new Uint8Array(100).fill(0x01));
+    const roomKey = new Uint8Array(randomBytes(32));
+    const genesis = await encryptSnapshot({roomKey, writerPrivateKey: writerPriv, roomId,
+      appId: 'test.package', packageDigest: expectedPkgDigest, stateEpoch: 0, proposedRevision: 1,
+      previousEnvelopeDigest: encodeBase64Url(new Uint8Array(32)), automergeBytes: Uint8Array.of(1, 2, 3)});
 
-    const roomRes = await fetch(`${apiOrigin}/v1/rooms`, {
+    const roomBody = {
+      operationId: roomOpId,
+      roomId,
+      packageDigest: expectedPkgDigest,
+      viewerDescriptorJcs: encodeBase64Url(viewerDesc.jcsBytes),
+      viewerDescriptorSignature: encodeBase64Url(viewerDesc.signature),
+      editorDescriptorJcs: encodeBase64Url(editorDesc.jcsBytes),
+      editorDescriptorSignature: encodeBase64Url(editorDesc.signature),
+      envelope: genesis.envelope
+    };
+    const createRoom = (body: unknown) => fetch(`${apiOrigin}/v1/rooms`, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${apiTokenBase64Url}`,
         'Content-Type': 'application/json',
         Origin: CONTROLLER_ORIGIN
       },
-      body: JSON.stringify({
-        operationId: roomOpId,
-        roomId,
-        packageDigest: expectedPkgDigest,
-        viewerDescriptorJcs: encodeBase64Url(viewerDesc.jcsBytes),
-        viewerDescriptorSignature: encodeBase64Url(viewerDesc.signature),
-        editorDescriptorJcs: encodeBase64Url(editorDesc.jcsBytes),
-        editorDescriptorSignature: encodeBase64Url(editorDesc.signature),
-        genesisStateBytes: genesisBytes
-      })
+      body: JSON.stringify(body)
     });
+    expect((await createRoom({...roomBody, packageDigest: encodeBase64Url(randomBytes(32))})).status).toBe(404);
+    expect((await createRoom({...roomBody, envelope: {...genesis.envelope,
+      writerPublicKey: encodeBase64Url(randomBytes(32))}})).status).toBe(400);
+    expect((await createRoom({...roomBody, envelope: {...genesis.envelope,
+      writerSignature: encodeBase64Url(randomBytes(64))}})).status).toBe(400);
+    const roomRes = await createRoom(roomBody);
     expect(roomRes.status).toBe(201);
     const roomData = (await roomRes.json()) as {ok: boolean; roomId: string};
     expect(roomData.ok).toBe(true);
     expect(roomData.roomId).toBe(roomId);
+    expect((await createRoom(roomBody)).status).toBe(200);
+    expect((await createRoom({...roomBody, envelope: {...genesis.envelope,
+      writerSignature: encodeBase64Url(randomBytes(64))}})).status).toBe(409);
 
     // The old unauthenticated alias is no longer routable.
     const roomPkgRes = await fetch(`${apiOrigin}/v1/rooms/${roomId}/package`, {
@@ -220,17 +289,23 @@ describe('Phase 4 signed publish API integration', () => {
     });
     expect(roomPkgRes.status).toBe(404);
     const roomHeaders = {Origin: CONTROLLER_ORIGIN, Authorization: `SF-Cap ${encodeBase64Url(viewerCap)}`};
-    // The unfinished raw publisher saga has no DO-pinned package context.
-    expect((await fetch(`${apiOrigin}/v1/rooms/${roomId}/packages/${expectedPkgDigest}`, {headers: roomHeaders})).status).toBe(409);
+    const memberPackage = await fetch(`${apiOrigin}/v1/rooms/${roomId}/packages/${expectedPkgDigest}`, {headers: roomHeaders});
+    expect(memberPackage.status).toBe(200);
+    expect(new Uint8Array(await memberPackage.arrayBuffer())).toEqual(packageBytes);
+    const encryptedState = await fetch(`${apiOrigin}/v1/rooms/${roomId}/state`, {headers: roomHeaders});
+    expect(encryptedState.status).toBe(200);
+    const restored = await decryptSnapshot({roomKey, expectedWriterPublicKey: writerPub, expectedAppId: 'test.package',
+      roomId, packageDigest: expectedPkgDigest, envelope: await encryptedState.json()});
+    expect(restored.automergeBytes).toEqual(Uint8Array.of(1, 2, 3));
 
     // Test-only encrypted genesis pins the package in authoritative DO state.
     const encryptedRoomId = encodeBase64Url(randomBytes(16));
-    const genesis = await encryptSnapshot({roomKey: new Uint8Array(randomBytes(32)), writerPrivateKey: writerPriv,
+    const fixtureGenesis = await encryptSnapshot({roomKey: new Uint8Array(randomBytes(32)), writerPrivateKey: writerPriv,
       roomId: encryptedRoomId, appId: 'test.package', packageDigest: expectedPkgDigest, stateEpoch: 0,
       proposedRevision: 1, previousEnvelopeDigest: encodeBase64Url(new Uint8Array(32)), automergeBytes: Uint8Array.of(1)});
     const init = await fetch(`${apiOrigin}/__phase0/rooms/${encryptedRoomId}/init-envelope`, {method: 'POST', body: JSON.stringify({
       viewerCapHash: viewerDesc.descriptor.capabilityHash, editorCapHash: editorDesc.descriptor.capabilityHash,
-      expiresAtMs: Date.now() + 60_000, envelope: genesis.envelope
+      expiresAtMs: Date.now() + 60_000, envelope: fixtureGenesis.envelope
     })});
     expect(init.status).toBe(201);
     const packageUrl = `${apiOrigin}/v1/rooms/${encryptedRoomId}/packages/${expectedPkgDigest}`;

@@ -2,14 +2,8 @@ import type {DurableObjectNamespace} from 'cloudflare:workers';
 import {ROOM_ID_RE, decodeBase64Url, decodeFixed32} from './do-crypto.js';
 import {RoomDurableObject, type RoomEnvironment} from './do-room.js';
 import {readApiRuntimeConfig, secureApiResponse} from './runtime-config.js';
-import {
-  handleAdminCreateInvite,
-  handleEnrollment,
-  handleGetPackage,
-  handlePublisherGetPackage,
-  handlePackageUpload,
-  handleRoomCreationSaga,
-} from './publish-api.js';
+import {handleGetPackage} from './publish-api.js';
+import {handlePublishRoute} from './publish-router.js';
 
 type WorkerEnvironment = RoomEnvironment & {
   ROOMS: DurableObjectNamespace;
@@ -56,26 +50,6 @@ const handleCorsPreflight = (request: Request, config: {cors: {allowOrigin: stri
     'Cache-Control': 'no-store',
     Vary: 'Origin, Access-Control-Request-Method, Access-Control-Request-Headers',
   }});
-};
-
-const handlePublishRoute = async (pathname: string, request: Request, env: WorkerEnvironment): Promise<Response | null> => {
-  if (pathname === '/v1/enroll' && request.method === 'POST') {
-    return handleEnrollment(request);
-  }
-  if (pathname === '/v1/admin/invite' && request.method === 'POST') {
-    return handleAdminCreateInvite(request);
-  }
-  if (pathname === '/v1/packages' && request.method === 'POST') {
-    return handlePackageUpload(request);
-  }
-  if (pathname.startsWith('/v1/packages/') && request.method === 'GET') {
-    const pkgDigest = pathname.slice('/v1/packages/'.length);
-    return handlePublisherGetPackage(request, pkgDigest);
-  }
-  if (pathname === '/v1/rooms' && request.method === 'POST') {
-    return handleRoomCreationSaga(request, env);
-  }
-  return null;
 };
 
 const worker = {

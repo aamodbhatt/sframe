@@ -4,7 +4,7 @@ use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter, write::SimpleFileO
 
 const PACKAGE_PATHS: [&str; 3] = ["app.worker.js", "signature.dsse.json", "smallframe.json"];
 const MAX_PACKAGE_BYTES: u64 = 1024 * 1024;
-const MAX_ARCHIVE_BYTES: usize = 1_100_000;
+const MAX_ARCHIVE_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageFiles {
@@ -60,10 +60,17 @@ pub fn canonical_zip(files: &PackageFiles) -> Result<Vec<u8>> {
             )
             .map_err(|_| archive_error("failed to write deterministic ZIP entry"))?;
     }
-    archive
+    let bytes = archive
         .finish()
         .map(Cursor::into_inner)
-        .map_err(|_| archive_error("failed to finalize deterministic ZIP"))
+        .map_err(|_| archive_error("failed to finalize deterministic ZIP"))?;
+    if bytes.len() > MAX_ARCHIVE_BYTES {
+        return Err(CoreError::new(
+            ErrorCode::PackageSizeLimit,
+            "archive exceeds 1 MiB",
+        ));
+    }
+    Ok(bytes)
 }
 
 fn read_entry(archive: &mut ZipArchive<Cursor<&[u8]>>, index: usize) -> Result<(String, Vec<u8>)> {
@@ -175,4 +182,34 @@ pub fn read_canonical_zip(input: &[u8]) -> Result<PackageFiles> {
         ));
     }
     Ok(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn archive_limit_includes_store_headers_and_rejects_one_excess_byte() {
+        let mut files = PackageFiles {
+            manifest: vec![],
+            module: vec![],
+            signature: vec![],
+        };
+        let overhead = canonical_zip(&files).unwrap().len();
+        files.module = vec![0; MAX_ARCHIVE_BYTES - overhead];
+        let bytes = canonical_zip(&files).unwrap();
+        assert_eq!(bytes.len(), MAX_ARCHIVE_BYTES);
+        assert_eq!(read_canonical_zip(&bytes).unwrap(), files);
+        files.module.push(0);
+        assert_eq!(
+            canonical_zip(&files).unwrap_err().code(),
+            ErrorCode::PackageSizeLimit
+        );
+        let mut oversized = bytes;
+        oversized.push(0);
+        assert_eq!(
+            read_zip_bounded(&oversized).unwrap_err().code(),
+            ErrorCode::PackageSizeLimit
+        );
+    }
 }

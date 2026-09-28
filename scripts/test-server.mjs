@@ -34,9 +34,10 @@ const forwardRelay = async (request, response) => {
   }
   const chunks = [];
   let size = 0;
+  const bodyLimit = request.url === '/v1/packages' && request.method === 'POST' ? 1_048_576 : 724_992;
   for await (const chunk of request) {
     size += chunk.length;
-    if (size > 724992) { response.writeHead(413).end(); return; }
+    if (size > bodyLimit) { response.writeHead(413).end(); return; }
     chunks.push(chunk);
   }
   const headers = {...request.headers};

@@ -2,6 +2,8 @@ import canonicalize from 'canonicalize';
 import {getPublicKeyAsync, signAsync, verifyAsync} from '@noble/ed25519';
 import {encodeBase64Url, decodeBase64Url} from './crypto-envelope.js';
 import {dssePae} from './room-descriptor.js';
+import {parseUniqueJson} from './strict-json.js';
+import {strictEd25519Points} from './ed25519-points.js';
 
 export const ENROLLMENT_PAYLOAD_TYPE = 'application/vnd.smallframe.publisher-enrollment.v1+json';
 
@@ -54,32 +56,48 @@ export const createSignedEnrollment = async (options: {
   return {record, jcsBytes, signature};
 };
 
-export const verifyPublisherEnrollment = async (
-  jcsBytes: Uint8Array,
-  signature: Uint8Array,
-  options?: {now?: number; maxClockSkewMs?: number}
-): Promise<PublisherEnrollmentRecord> => {
+const fixedEnrollmentEncoding = (value: unknown, length: number): boolean => {
+  if (typeof value !== 'string' || !/^[A-Za-z0-9_-]+$/u.test(value)) return false;
+  try { const bytes = decodeBase64Url(value); return bytes.length === length && encodeBase64Url(bytes) === value; } catch { return false; }
+};
+
+const enrollmentFieldsValid = (rec: Record<string, unknown>): boolean =>
+  rec.protocolVersion === 1
+  && typeof rec.publisherPublicKey === 'string' && typeof rec.publisherKeyId === 'string'
+  && typeof rec.tokenHash === 'string' && typeof rec.operationId === 'string'
+  && typeof rec.inviteCodeHash === 'string' && typeof rec.createdAt === 'number'
+  && Number.isSafeInteger(rec.createdAt)
+  && fixedEnrollmentEncoding(rec.publisherPublicKey, 32) && fixedEnrollmentEncoding(rec.tokenHash, 32)
+  && fixedEnrollmentEncoding(rec.operationId, 16) && fixedEnrollmentEncoding(rec.inviteCodeHash, 32);
+
+const parseEnrollmentRecord = (jcsBytes: Uint8Array, signature: Uint8Array): PublisherEnrollmentRecord => {
+  if (jcsBytes.byteLength > 1_024 || signature.byteLength !== 64) throw new Error('ENROLLMENT_RECORD_INVALID');
   const jsonText = new TextDecoder('utf-8', {fatal: true}).decode(jcsBytes);
   let parsed: unknown;
   try {
-    parsed = JSON.parse(jsonText);
+    parsed = parseUniqueJson(jsonText);
   } catch {
     throw new Error('ENROLLMENT_JSON_INVALID');
   }
 
   if (typeof parsed !== 'object' || parsed === null) throw new Error('ENROLLMENT_RECORD_INVALID');
   const rec = parsed as Record<string, unknown>;
+  const fields = ['protocolVersion', 'publisherPublicKey', 'publisherKeyId', 'tokenHash', 'operationId', 'inviteCodeHash', 'createdAt'];
+  if (Object.keys(rec).length !== fields.length || !fields.every((field) => Object.hasOwn(rec, field))
+    || canonicalize(rec) !== jsonText) throw new Error('ENROLLMENT_RECORD_INVALID');
 
-  if (rec.protocolVersion !== 1) throw new Error('ENROLLMENT_VERSION_INVALID');
-  if (typeof rec.publisherPublicKey !== 'string') throw new Error('ENROLLMENT_PUBLIC_KEY_INVALID');
-  if (typeof rec.publisherKeyId !== 'string') throw new Error('ENROLLMENT_KEY_ID_INVALID');
-  if (typeof rec.tokenHash !== 'string') throw new Error('ENROLLMENT_TOKEN_HASH_INVALID');
-  if (typeof rec.operationId !== 'string') throw new Error('ENROLLMENT_OPERATION_ID_INVALID');
-  if (typeof rec.inviteCodeHash !== 'string') throw new Error('ENROLLMENT_INVITE_HASH_INVALID');
-  if (typeof rec.createdAt !== 'number' || !Number.isSafeInteger(rec.createdAt)) throw new Error('ENROLLMENT_CREATED_AT_INVALID');
+  if (!enrollmentFieldsValid(rec)) throw new Error('ENROLLMENT_RECORD_INVALID');
 
+  return rec as PublisherEnrollmentRecord;
+};
+
+export const verifyPublisherEnrollment = async (
+  jcsBytes: Uint8Array,
+  signature: Uint8Array,
+  options?: {now?: number; maxClockSkewMs?: number}
+): Promise<PublisherEnrollmentRecord> => {
+  const rec = parseEnrollmentRecord(jcsBytes, signature);
   const pubKeyBytes = decodeBase64Url(rec.publisherPublicKey);
-  if (pubKeyBytes.byteLength !== 32) throw new Error('ENROLLMENT_PUBLIC_KEY_BYTES_INVALID');
 
   const digest = await crypto.subtle.digest('SHA-256', pubKeyBytes);
   const expectedKeyId = `sha256:${encodeBase64Url(new Uint8Array(digest))}`;
@@ -87,7 +105,8 @@ export const verifyPublisherEnrollment = async (
 
   // Verify signature
   const pae = dssePae(ENROLLMENT_PAYLOAD_TYPE, jcsBytes);
-  const valid = await verifyAsync(signature, pae, pubKeyBytes);
+  const valid = strictEd25519Points(signature, pubKeyBytes)
+    && await verifyAsync(signature, pae, pubKeyBytes, {zip215: false});
   if (!valid) throw new Error('ENROLLMENT_SIGNATURE_INVALID');
 
   // Verify clock freshness
@@ -98,5 +117,5 @@ export const verifyPublisherEnrollment = async (
     }
   }
 
-  return rec as PublisherEnrollmentRecord;
+  return rec;
 };

@@ -1,5 +1,6 @@
 import {getPublicKeyAsync, signAsync, verifyAsync} from '@noble/ed25519';
 import canonicalize from 'canonicalize';
+import {strictEd25519Points} from './ed25519-points.js';
 import {
   decodeBase64Url,
   encodeBase64Url,
@@ -104,7 +105,8 @@ export const verifyRoomDescriptor = async (
   if (!canonical) return {valid: false, descriptorDigest: new Uint8Array(32)};
   const jcsBytes = new TextEncoder().encode(canonical);
   const pae = dssePae(DESCRIPTOR_PAYLOAD_TYPE, jcsBytes);
-  const valid = await verifyAsync(signature, pae, publisherPublicKey);
+  const valid = strictEd25519Points(signature, publisherPublicKey)
+    && await verifyAsync(signature, pae, publisherPublicKey, {zip215: false});
   const descriptorDigest = await computeDescriptorDigest(jcsBytes, signature);
   return {valid, descriptorDigest};
 };

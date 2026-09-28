@@ -5,16 +5,20 @@ use ed25519_dalek::{Signer, SigningKey};
 use rand_core::{OsRng, RngCore};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use smallframe_core::{dsse_pae, key_id};
+use smallframe_core::{
+    dsse_pae, key_id, parse_strict_json, validate_state_schema, verify_package_archive,
+};
 use std::{
     fs,
+    io::Write,
     path::Path,
-    process::Command as ProcessCommand,
+    process::{Command as ProcessCommand, Stdio},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use crate::app::{pack, validate_path};
 use crate::identity::IdentityContext;
+use crate::snapshot::encrypt_genesis;
 
 const ENROLLMENT_PAYLOAD_TYPE: &str = "application/vnd.smallframe.publisher-enrollment.v1+json";
 const DESCRIPTOR_PAYLOAD_TYPE: &str = "application/vnd.smallframe.room-descriptor.v1+json";
@@ -49,11 +53,20 @@ fn http_post_json(
     if let Some(etag) = if_match {
         cmd.args(["-H", &format!("If-Match: {etag}")]);
     }
-    cmd.args(["--data-raw", &body_str]);
-
-    let output = cmd
-        .output()
-        .map_err(|e| format!("HTTP_REQUEST_FAILED: {e}"))?;
+    cmd.args(["--data-binary", "@-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|_| "HTTP_REQUEST_FAILED".to_owned())?;
+    child
+        .stdin
+        .take()
+        .ok_or("HTTP_REQUEST_FAILED")?
+        .write_all(body_str.as_bytes())
+        .map_err(|_| "HTTP_REQUEST_FAILED".to_owned())?;
+    let output = child
+        .wait_with_output()
+        .map_err(|_| "HTTP_REQUEST_FAILED".to_owned())?;
     let response_str = String::from_utf8_lossy(&output.stdout);
     if !output.status.success() {
         return Err(format!(
@@ -62,14 +75,14 @@ fn http_post_json(
         ));
     }
 
-    serde_json::from_str(&response_str)
-        .map_err(|_| format!("HTTP_RESPONSE_INVALID: {response_str}"))
+    serde_json::from_str(&response_str).map_err(|_| "HTTP_RESPONSE_INVALID".to_owned())
 }
 
 fn http_post_bytes(
     url: &str,
     bytes: &[u8],
     auth_header: Option<&str>,
+    package_digest: &str,
 ) -> Result<serde_json::Value, String> {
     let temp_file = std::env::temp_dir().join(format!("sf-upload-{}.bin", std::process::id()));
     fs::write(&temp_file, bytes).map_err(|e| format!("TEMP_FILE_WRITE_FAILED: {e}"))?;
@@ -78,6 +91,7 @@ fn http_post_bytes(
     cmd.args([
         "-s",
         "-S",
+        "-f",
         "-X",
         "POST",
         url,
@@ -85,6 +99,8 @@ fn http_post_bytes(
         "Content-Type: application/vnd.smallframe.package",
         "-H",
         "Origin: http://app.localhost:4173",
+        "-H",
+        &format!("X-Smallframe-Package-Digest: {package_digest}"),
     ]);
     if let Some(auth) = auth_header {
         cmd.args(["-H", &format!("Authorization: {auth}")]);
@@ -103,8 +119,7 @@ fn http_post_bytes(
         ));
     }
 
-    serde_json::from_str(&response_str)
-        .map_err(|_| format!("HTTP_RESPONSE_INVALID: {response_str}"))
+    serde_json::from_str(&response_str).map_err(|_| "HTTP_RESPONSE_INVALID".to_owned())
 }
 
 fn http_get_json(url: &str, auth_header: Option<&str>) -> Result<serde_json::Value, String> {
@@ -133,8 +148,7 @@ fn http_get_json(url: &str, auth_header: Option<&str>) -> Result<serde_json::Val
         ));
     }
 
-    serde_json::from_str(&response_str)
-        .map_err(|_| format!("HTTP_RESPONSE_INVALID: {response_str}"))
+    serde_json::from_str(&response_str).map_err(|_| "HTTP_RESPONSE_INVALID".to_owned())
 }
 
 pub fn enroll_publisher(
@@ -205,7 +219,7 @@ pub fn enroll_publisher(
 pub fn publish_package(
     ctx: &IdentityContext,
     path: &Path,
-    _initial_state: Option<&Path>,
+    initial_state: Option<&Path>,
     expires_in_hours: Option<u64>,
     show_secrets: bool,
     api_url: &str,
@@ -218,16 +232,77 @@ pub fn publish_package(
     // 1. Validate and pack
     validate_path(path)?;
     let temp_pkg_path = std::env::temp_dir().join(format!("sf-pack-{}.zip", std::process::id()));
-    let _summary = pack(path, &temp_pkg_path, &signing_key)?;
+    let summary = pack(path, &temp_pkg_path, &signing_key)?;
     let pkg_bytes = fs::read(&temp_pkg_path).map_err(|e| format!("READ_PACK_FAILED: {e}"))?;
     let _ = fs::remove_file(&temp_pkg_path);
 
-    let pkg_digest = Base64UrlUnpadded::encode_string(&Sha256::digest(&pkg_bytes));
+    let verified = verify_package_archive(&pkg_bytes, None, Some(&publisher_key_id))
+        .map_err(|_| "PACK_VERIFY_FAILED".to_owned())?;
+    let pkg_digest = summary.package_digest;
+    if Base64UrlUnpadded::encode_string(&verified.package_digest) != pkg_digest
+        || Base64UrlUnpadded::encode_string(&verified.artifact_digest) != summary.artifact_digest
+    {
+        return Err("PACK_DIGEST_MISMATCH".to_owned());
+    }
+    let manifest = parse_strict_json(&verified.canonical_files.manifest)
+        .map_err(|_| "MANIFEST_INVALID".to_owned())?;
+    let app_id = manifest
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("MANIFEST_ID_INVALID")?;
+    let state = manifest.get("state").ok_or("MANIFEST_STATE_INVALID")?;
+    if state.get("mode").and_then(serde_json::Value::as_str) != Some("shared") {
+        return Err("PUBLISH_REQUIRES_SHARED_PACKAGE".to_owned());
+    }
+    let initial = if let Some(file) = initial_state {
+        let metadata = fs::metadata(file).map_err(|_| "INITIAL_STATE_READ_FAILED".to_owned())?;
+        if !metadata.is_file() || metadata.len() > 393_216 {
+            return Err("INITIAL_STATE_SIZE_LIMIT".to_owned());
+        }
+        parse_strict_json(&fs::read(file).map_err(|_| "INITIAL_STATE_READ_FAILED".to_owned())?)
+            .map_err(|_| "INITIAL_STATE_INVALID".to_owned())?
+    } else {
+        state
+            .get("publicTemplate")
+            .cloned()
+            .unwrap_or_else(|| json!({}))
+    };
+    let schema = state.get("jsonSchema").ok_or("STATE_SCHEMA_MISSING")?;
+    if !initial.is_object() {
+        return Err("INITIAL_STATE_INVALID".to_owned());
+    }
+    validate_state_schema(schema, &initial)
+        .map_err(|_| "INITIAL_STATE_SCHEMA_INVALID".to_owned())?;
+    let initial_json = jcs_bytes(&initial)?;
+    if initial_json.len() > 393_216 {
+        return Err("INITIAL_STATE_SIZE_LIMIT".to_owned());
+    }
 
     // 2. Upload package
     let token = ctx.load_api_token()?;
     let pkg_url = format!("{}/v1/packages", api_url.trim_end_matches('/'));
-    let _pkg_res = http_post_bytes(&pkg_url, &pkg_bytes, Some(&format!("Bearer {token}")))?;
+    let pkg_res = http_post_bytes(
+        &pkg_url,
+        &pkg_bytes,
+        Some(&format!("Bearer {token}")),
+        &pkg_digest,
+    )?;
+    if pkg_res.get("ok").and_then(serde_json::Value::as_bool) != Some(true)
+        || pkg_res
+            .get("packageDigest")
+            .and_then(serde_json::Value::as_str)
+            != Some(&pkg_digest)
+        || pkg_res
+            .get("artifactDigest")
+            .and_then(serde_json::Value::as_str)
+            != Some(&summary.artifact_digest)
+        || pkg_res
+            .get("publisherKeyId")
+            .and_then(serde_json::Value::as_str)
+            != Some(&publisher_key_id)
+    {
+        return Err("PACKAGE_UPLOAD_RESPONSE_MISMATCH".to_owned());
+    }
 
     // 3. Generate room parameters
     let mut room_id_bytes = [0_u8; 16];
@@ -256,8 +331,14 @@ pub fn publish_package(
         .map_err(|_| "TIME_FAILED".to_owned())?
         .as_millis() as u64;
 
-    let duration_ms = expires_in_hours.unwrap_or(24) * 3600 * 1000;
-    let expires_at = now_ms + duration_ms;
+    let hours = expires_in_hours.unwrap_or(7 * 24);
+    if !(1..=30 * 24).contains(&hours) {
+        return Err("EXPIRY_OUT_OF_RANGE".to_owned());
+    }
+    let duration_ms = hours.checked_mul(3_600_000).ok_or("EXPIRY_OUT_OF_RANGE")?;
+    let expires_at = now_ms
+        .checked_add(duration_ms)
+        .ok_or("EXPIRY_OUT_OF_RANGE")?;
 
     // 4. Create and sign descriptors
     let viewer_desc = json!({
@@ -289,8 +370,20 @@ pub fn publish_package(
     let editor_sig = signing_key.sign(&dsse_pae(DESCRIPTOR_PAYLOAD_TYPE, &editor_jcs));
 
     // 5. Initial genesis state
-    let genesis_bytes = vec![0x01_u8; 100];
-    let genesis_b64 = Base64UrlUnpadded::encode_string(&genesis_bytes);
+    let mut actor = [0_u8; 16];
+    OsRng.fill_bytes(&mut actor);
+    let genesis_bytes = smallframe_core::crdt::create_genesis_document(
+        std::str::from_utf8(&initial_json).map_err(|_| "INITIAL_STATE_INVALID".to_owned())?,
+        &actor,
+    )?;
+    let envelope = encrypt_genesis(
+        &room_key_bytes,
+        &writer_signing_key,
+        &room_id,
+        app_id,
+        &pkg_digest,
+        &genesis_bytes,
+    )?;
 
     let room_creation_body = json!({
         "operationId": Base64UrlUnpadded::encode_string(&op_id_bytes),
@@ -300,18 +393,11 @@ pub fn publish_package(
         "viewerDescriptorSignature": Base64UrlUnpadded::encode_string(&viewer_sig.to_bytes()),
         "editorDescriptorJcs": Base64UrlUnpadded::encode_string(&editor_jcs),
         "editorDescriptorSignature": Base64UrlUnpadded::encode_string(&editor_sig.to_bytes()),
-        "genesisStateBytes": genesis_b64
+        "envelope": envelope
     });
 
-    let rooms_url = format!("{}/v1/rooms", api_url.trim_end_matches('/'));
-    let _room_res = http_post_json(
-        &rooms_url,
-        &room_creation_body,
-        Some(&format!("Bearer {token}")),
-        None,
-    )?;
-
-    // 6. Save room secrets in vault
+    // Keep the exact encrypted request and room secrets before the first room
+    // send. An ambiguous response leaves this pending record available.
     let room_record = json!({
         "roomId": room_id,
         "packageDigest": pkg_digest,
@@ -320,9 +406,31 @@ pub fn publish_package(
         "editorCapability": Base64UrlUnpadded::encode_string(&editor_cap_bytes),
         "writerPrivateKey": writer_priv_str,
         "writerPublicKey": writer_pub_str,
-        "expiresAt": expires_at
+        "expiresAt": expires_at,
+        "creationRequest": room_creation_body
     });
     ctx.save_room_record(&room_id, &room_record)?;
+
+    let rooms_url = format!("{}/v1/rooms", api_url.trim_end_matches('/'));
+    let room_res = http_post_json(
+        &rooms_url,
+        &room_creation_body,
+        Some(&format!("Bearer {token}")),
+        None,
+    )?;
+    if room_res.get("ok").and_then(serde_json::Value::as_bool) != Some(true)
+        || room_res.get("roomId").and_then(serde_json::Value::as_str) != Some(&room_id)
+        || room_res
+            .get("packageDigest")
+            .and_then(serde_json::Value::as_str)
+            != Some(&pkg_digest)
+        || room_res
+            .get("publisherKeyId")
+            .and_then(serde_json::Value::as_str)
+            != Some(&publisher_key_id)
+    {
+        return Err("ROOM_CREATION_RESPONSE_MISMATCH".to_owned());
+    }
 
     // 7. Construct invite URLs
     let viewer_d = Base64UrlUnpadded::encode_string(&viewer_jcs);

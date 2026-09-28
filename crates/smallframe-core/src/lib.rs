@@ -38,6 +38,7 @@ pub use recovery_chain::{
     SignedRecoveryTransitionBytes, VerifiedRecoveryChain, VerifiedRecoveryTransition,
     verify_recovery_transition_chain,
 };
+pub use state_schema::validate_state_schema;
 
 #[cfg(feature = "wasm")]
 mod wasm;

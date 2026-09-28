@@ -423,7 +423,7 @@ const phase2DefaultPackageMetadata = JSON.parse(readFileSync(join(root, 'package
 const phase2Package = configuredPackage
   ? readFileSync(configuredPackage)
   : Buffer.from(readFileSync(phase2DefaultPackagePath, 'utf8').trim(), 'base64');
-if (phase2Package.byteLength < 1 || phase2Package.byteLength > 1_310_720) throw new Error('PHASE2_PACKAGE_SIZE_INVALID');
+if (phase2Package.byteLength < 1 || phase2Package.byteLength > 1_048_576) throw new Error('PHASE2_PACKAGE_SIZE_INVALID');
 const phase2Default = process.env.SMALLFRAME_PHASE2_DEFAULT === '1';
 const phase2ExpectedDigest = configuredPackage ? (process.env.SMALLFRAME_DEV_PACKAGE_DIGEST ?? '') : phase2DefaultPackageMetadata.packageDigest;
 const phase2ExpectedKeyId = configuredPackage ? (process.env.SMALLFRAME_DEV_PUBLISHER_KEY_ID ?? '') : phase2DefaultPackageMetadata.publisherKeyId;

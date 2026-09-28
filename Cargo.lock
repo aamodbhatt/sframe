@@ -2293,6 +2293,7 @@ dependencies = [
  "base64ct",
  "clap",
  "ed25519-dalek",
+ "hkdf",
  "keyring",
  "rand_core 0.6.4",
  "rpassword",

@@ -1,9 +1,10 @@
-import {ExtendedPoint, getPublicKeyAsync, signAsync, verifyAsync} from '@noble/ed25519';
+import {getPublicKeyAsync, signAsync, verifyAsync} from '@noble/ed25519';
 import canonicalize from 'canonicalize';
 import {encodeBase64Url, decodeBase64Url, sha256} from './crypto-envelope.js';
 import {parseUniqueJson} from './strict-json.js';
 import {dssePae} from './room-descriptor.js';
 import {recoveryDataRecord} from './recovery-snapshot.js';
+import {strictEd25519Points} from './ed25519-points.js';
 
 export const POISONED_HEAD_PAYLOAD_TYPE = 'application/vnd.smallframe.poisoned-head-repair.v1+json';
 export const RECOVERY_TRANSITION_PAYLOAD_TYPE = 'application/vnd.smallframe.recovery-transition.v1+json';
@@ -92,18 +93,6 @@ export const parsePoisonedHeadRepairRecord = (bytes: Uint8Array): PoisonedHeadRe
   } catch { throw new Error('REPAIR_RECORD_INVALID'); }
 };
 
-// RFC-mode in the JS library still uses a cofactored equation. Require
-// canonical, non-small-order subgroup points so both runtimes verify the same
-// equation and malicious signer points cannot create a runtime disagreement.
-const strictRecoveryPoints = (signature: Uint8Array, publicKey: Uint8Array): boolean => {
-  try {
-    return [publicKey, signature.slice(0, 32)].every((bytes) => {
-      const point = ExtendedPoint.fromHex(bytes, false);
-      return !point.isSmallOrder() && point.isTorsionFree();
-    });
-  } catch { return false; }
-};
-
 const repairPublisherMatches = async (record: PoisonedHeadRepairRecord, publicKey: Uint8Array): Promise<boolean> =>
   publicKey.length === 32 && record.publisherKeyId === `sha256:${encodeBase64Url(await sha256(publicKey))}`;
 
@@ -133,7 +122,7 @@ export const verifyPoisonedHeadRepair = async (
     const canonical = repairRecordBytes(record);
     if (!fixedEncoding(signature, 64) || !await repairPublisherMatches(parsePoisonedHeadRepairRecord(canonical), publicKey)) return false;
     const sigBytes = decodeBase64Url(signature as string);
-    if (!strictRecoveryPoints(sigBytes, publicKey)) return false;
+    if (!strictEd25519Points(sigBytes, publicKey)) return false;
     const pae = dssePae(POISONED_HEAD_PAYLOAD_TYPE, canonical);
     return await verifyAsync(sigBytes, pae, publicKey, {zip215: false});
   } catch { return false; }
@@ -218,7 +207,7 @@ export const verifyRecoveryTransition = async (
     const canonical = transitionRecordBytes(record);
     if (!fixedEncoding(signature, 64) || parseRecoveryTransitionRecord(canonical).writerPublicKey !== encodeBase64Url(publicKey)) return false;
     const sigBytes = decodeBase64Url(signature);
-    if (!strictRecoveryPoints(sigBytes, publicKey)) return false;
+    if (!strictEd25519Points(sigBytes, publicKey)) return false;
     return await verifyAsync(sigBytes, dssePae(RECOVERY_TRANSITION_PAYLOAD_TYPE, canonical), publicKey, {zip215: false});
   } catch { return false; }
 };

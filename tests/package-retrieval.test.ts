@@ -50,4 +50,40 @@ describe('package retrieval authority and stored integrity', () => {
       publisherPublicKey: randomBytes(32).toString('base64url'), tokenHash: hash(otherToken), enrolledAt: Date.now()});
     expect((await get(`Bearer ${otherToken.toString('base64url')}`)).status).toBe(404);
   });
+
+  it('binds literal bytes to artifactDigest independently of logical package identity', async () => {
+    const {store, digest} = fixture();
+    const record = store.packages.get(digest)!;
+    store.packages.delete(digest);
+    const logicalDigest = hash(randomBytes(32));
+    record.packageDigest = logicalDigest;
+    store.packages.set(logicalDigest, record);
+    const response = await handleGetPackage(logicalDigest, store);
+    expect(response.status).toBe(200);
+    expect(response.headers.get('X-Smallframe-Package-Digest')).toBe(logicalDigest);
+    expect(response.headers.get('X-Smallframe-Artifact-Digest')).toBe(digest);
+    record.artifactDigest = logicalDigest;
+    expect((await handleGetPackage(logicalDigest, store)).status).toBe(409);
+    record.artifactDigest = digest + '=';
+    expect((await handleGetPackage(logicalDigest, store)).status).toBe(409);
+  });
+
+  it('hashes and serves the same copied bytes and metadata despite mutation during verification', async () => {
+    const {store, digest, bytes} = fixture();
+    const record = store.packages.get(digest)!;
+    const publisher = record.publisherKeyId;
+    const pending = handleGetPackage(digest, store);
+    bytes.fill(0);
+    record.bytes = new Uint8Array(100);
+    record.artifactDigest = hash(randomBytes(32));
+    record.publisherKeyId = `sha256:${hash(randomBytes(32))}`;
+    record.packageDigest = hash(randomBytes(32));
+    const response = await pending;
+    expect(response.status).toBe(200);
+    expect(hash(new Uint8Array(await response.arrayBuffer()))).toBe(digest);
+    expect(response.headers.get('X-Smallframe-Package-Digest')).toBe(digest);
+    expect(response.headers.get('X-Smallframe-Artifact-Digest')).toBe(digest);
+    expect(response.headers.get('X-Smallframe-Publisher-Key-Id')).toBe(publisher);
+    expect((await handleGetPackage(digest, store)).status).toBe(409);
+  });
 });

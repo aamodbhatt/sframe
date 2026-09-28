@@ -531,7 +531,7 @@ fn validate_instance(root: &Value, schema: &Value, instance: &Value, depth: usiz
     true
 }
 
-pub(crate) fn validate_state_schema(schema: &Value, template: &Value) -> Result<()> {
+pub fn validate_state_schema(schema: &Value, template: &Value) -> Result<()> {
     if !schema.is_object() {
         return Err(schema_error("state schema root must be an object"));
     }

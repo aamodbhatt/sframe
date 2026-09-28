@@ -3,6 +3,7 @@
 mod app;
 mod identity;
 mod publish;
+mod snapshot;
 
 use app::{new_app, pack, validate_path};
 use clap::{Parser, Subcommand};

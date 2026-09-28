@@ -44,6 +44,14 @@ struct VaultPlaintext {
     private_key_pkcs8: String,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LocalSecretFile {
+    schema_version: u8,
+    nonce: String,
+    ciphertext: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RecoveryHeader {
@@ -259,12 +267,14 @@ impl IdentityContext {
 
     pub fn save_api_token(&self, token: &str) -> Result<(), String> {
         let path = self.root.join("api-token.txt");
-        write_new_private(&path, token.as_bytes())
+        self.write_local_secret(&path, "api-token", token.as_bytes())
     }
 
     pub fn load_api_token(&self) -> Result<String, String> {
         let path = self.root.join("api-token.txt");
-        let bytes = fs::read(&path).map_err(|_| "API_TOKEN_NOT_FOUND".to_owned())?;
+        let bytes = self
+            .read_local_secret(&path, "api-token", 256)
+            .map_err(|_| "API_TOKEN_NOT_FOUND_OR_INVALID".to_owned())?;
         String::from_utf8(bytes).map_err(|_| "API_TOKEN_INVALID".to_owned())
     }
 
@@ -273,16 +283,90 @@ impl IdentityContext {
         room_id: &str,
         record: &serde_json::Value,
     ) -> Result<(), String> {
+        validate_room_id(room_id)?;
         let path = self.root.join(format!("room-{}.json", room_id));
         let jcs_bytes = jcs(record)?;
-        write_new_private(&path, &jcs_bytes)
+        self.write_local_secret(&path, &format!("room:{room_id}"), &jcs_bytes)
     }
 
     pub fn load_room_record(&self, room_id: &str) -> Result<serde_json::Value, String> {
+        validate_room_id(room_id)?;
         let path = self.root.join(format!("room-{}.json", room_id));
-        let bytes = fs::read(&path).map_err(|_| "ROOM_NOT_FOUND".to_owned())?;
+        let bytes = self
+            .read_local_secret(&path, &format!("room:{room_id}"), 1_048_576)
+            .map_err(|_| "ROOM_NOT_FOUND_OR_INVALID".to_owned())?;
         serde_json::from_slice(&bytes).map_err(|_| "ROOM_RECORD_INVALID".to_owned())
     }
+
+    fn write_local_secret(
+        &self,
+        path: &Path,
+        context: &str,
+        plaintext: &[u8],
+    ) -> Result<(), String> {
+        if plaintext.len() > 1_048_576 {
+            return Err("LOCAL_SECRET_SIZE_LIMIT".to_owned());
+        }
+        let key = Zeroizing::new(self.unlock.load()?);
+        if key.len() != 32 {
+            return Err("KEY_STORE_VALUE_INVALID".to_owned());
+        }
+        let mut nonce = [0_u8; 12];
+        OsRng.fill_bytes(&mut nonce);
+        let aad = format!("smallframe/local-secret/v1\0{context}");
+        let ciphertext = encrypt(&key, &nonce, aad.as_bytes(), plaintext)?;
+        let envelope = LocalSecretFile {
+            schema_version: 1,
+            nonce: Base64UrlUnpadded::encode_string(&nonce),
+            ciphertext: Base64UrlUnpadded::encode_string(&ciphertext),
+        };
+        write_new_private(path, &jcs(&envelope)?)
+    }
+
+    fn read_local_secret(
+        &self,
+        path: &Path,
+        context: &str,
+        maximum: usize,
+    ) -> Result<Vec<u8>, String> {
+        let metadata = fs::metadata(path).map_err(|_| "LOCAL_SECRET_NOT_FOUND".to_owned())?;
+        if metadata.len() > (maximum.saturating_mul(2) + 256) as u64 {
+            return Err("LOCAL_SECRET_SIZE_LIMIT".to_owned());
+        }
+        let bytes = fs::read(path).map_err(|_| "LOCAL_SECRET_NOT_FOUND".to_owned())?;
+        let envelope: LocalSecretFile = strict_json(&bytes)?;
+        if envelope.schema_version != 1 {
+            return Err("LOCAL_SECRET_FORMAT_INVALID".to_owned());
+        }
+        let nonce = decode_fixed::<12>(&envelope.nonce)?;
+        let ciphertext = Base64UrlUnpadded::decode_vec(&envelope.ciphertext)
+            .map_err(|_| "LOCAL_SECRET_FORMAT_INVALID".to_owned())?;
+        if ciphertext.len() < 16 || ciphertext.len() > maximum + 16 {
+            return Err("LOCAL_SECRET_SIZE_LIMIT".to_owned());
+        }
+        let key = Zeroizing::new(self.unlock.load()?);
+        if key.len() != 32 {
+            return Err("KEY_STORE_VALUE_INVALID".to_owned());
+        }
+        let aad = format!("smallframe/local-secret/v1\0{context}");
+        decrypt(&key, &nonce, aad.as_bytes(), &ciphertext)
+            .map_err(|_| "LOCAL_SECRET_AUTH_FAILED".to_owned())
+    }
+}
+
+fn validate_room_id(room_id: &str) -> Result<(), String> {
+    if room_id.len() != 22
+        || !room_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err("ROOM_ID_INVALID".to_owned());
+    }
+    let raw = decode_fixed::<16>(room_id)?;
+    if Base64UrlUnpadded::encode_string(&raw) != room_id {
+        return Err("ROOM_ID_INVALID".to_owned());
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -549,6 +633,43 @@ mod tests {
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    #[test]
+    fn local_publisher_secrets_are_encrypted_and_bound_to_their_record() {
+        let root = temporary_root("local-secret-test");
+        let ctx = IdentityContext::discover(Some(&root)).expect("context");
+        ctx.init().expect("identity init");
+        let token = Base64UrlUnpadded::encode_string(&[7_u8; 32]);
+        ctx.save_api_token(&token).expect("token saved");
+        assert_eq!(ctx.load_api_token().expect("token opened"), token);
+        assert!(
+            !fs::read(root.join("api-token.txt"))
+                .expect("token file")
+                .windows(token.len())
+                .any(|window| window == token.as_bytes())
+        );
+        let room = serde_json::json!({"roomKey": token});
+        let first = Base64UrlUnpadded::encode_string(&[1_u8; 16]);
+        let second = Base64UrlUnpadded::encode_string(&[2_u8; 16]);
+        ctx.save_room_record(&first, &room).expect("room saved");
+        assert_eq!(ctx.load_room_record(&first).expect("room opened"), room);
+        let ciphertext = fs::read(root.join(format!("room-{first}.json"))).expect("room file");
+        assert!(
+            !ciphertext
+                .windows(token.len())
+                .any(|window| window == token.as_bytes())
+        );
+        fs::write(root.join(format!("room-{second}.json")), ciphertext).expect("copy ciphertext");
+        assert_eq!(
+            ctx.load_room_record(&second).unwrap_err(),
+            "ROOM_NOT_FOUND_OR_INVALID"
+        );
+        assert_eq!(
+            ctx.load_room_record("../outside").unwrap_err(),
+            "ROOM_ID_INVALID"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
