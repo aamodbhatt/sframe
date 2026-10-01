@@ -10,7 +10,10 @@ export const observeShellNavigation = (page: Page, clock = Date.now) => {
     firstRequestMs: null as number | null, firstResponseMs: null as number | null,
     firstFinishedMs: null as number | null, firstCommitMs: null as number | null};
   const isShell = (url: string, navigation: boolean): boolean => {
-    try { return navigation && new URL(url).pathname === '/'; } catch { return false; }
+    try {
+      const path = new URL(url).pathname;
+      return navigation && (path === '/' || /^\/r\/[A-Za-z0-9_-]{22}$/u.test(path));
+    } catch { return false; }
   };
   page.on('request', (req) => { if (isShell(req.url(), req.isNavigationRequest())) {
     if (counters.requests === 0) counters.firstRequestMs = elapsed();

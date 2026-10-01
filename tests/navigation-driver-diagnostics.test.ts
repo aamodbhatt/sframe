@@ -10,7 +10,7 @@ it('adds only progress-log statements and preserves every original driver byte',
   const instrumented = navigationDiagnosticSource(original);
   const restored = instrumented.split('\n').filter((line) => !line.includes('SMALLFRAME_NAVIGATION_STAGE')).join('\n');
   expect(restored).toBe(original);
-  expect(createHash('sha256').update(restored).digest('hex')).toBe('9393fa79e1c67c74edc26b610d65a4f7ed73d345a762465cc88340a33a2454ac');
+  expect(createHash('sha256').update(restored).digest('hex')).toBe('549070af3acabb3efcc4f55bfe6210f9f7c2fcf633cf7eaa59bfe60719969171');
   const added = instrumented.split('\n').filter((line) => line.includes('SMALLFRAME_NAVIGATION_STAGE'));
   expect(added).toHaveLength(6);
   expect(added.every((line) => line.trim().startsWith('progress2.log('))).toBe(true);

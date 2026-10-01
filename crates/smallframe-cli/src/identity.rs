@@ -270,6 +270,51 @@ impl IdentityContext {
         self.write_local_secret(&path, "api-token", token.as_bytes())
     }
 
+    pub fn enrollment_files_present(&self) -> (bool, bool) {
+        (
+            self.root.join("enrollment-pending.json").exists(),
+            self.root.join("api-token.txt").exists(),
+        )
+    }
+
+    pub fn save_pending_enrollment(&self, record: &serde_json::Value) -> Result<(), String> {
+        self.write_local_secret(
+            &self.root.join("enrollment-pending.json"),
+            "enrollment-pending",
+            &jcs(record)?,
+        )
+    }
+
+    pub fn load_pending_enrollment(&self) -> Result<serde_json::Value, String> {
+        let bytes = self
+            .read_local_secret(
+                &self.root.join("enrollment-pending.json"),
+                "enrollment-pending",
+                4_096,
+            )
+            .map_err(|_| "ENROLLMENT_PENDING_NOT_FOUND_OR_INVALID".to_owned())?;
+        strict_json(&bytes).map_err(|_| "ENROLLMENT_PENDING_INVALID".to_owned())
+    }
+
+    pub fn confirm_pending_enrollment(&self, token: &str) -> Result<(), String> {
+        let pending = self.root.join("enrollment-pending.json");
+        if !pending.is_file() {
+            return Err("ENROLLMENT_PENDING_NOT_FOUND_OR_INVALID".to_owned());
+        }
+        let active = self.root.join("api-token.txt");
+        if active.exists() {
+            if self.load_api_token()? != token {
+                return Err("ENROLLMENT_TOKEN_CONFLICT".to_owned());
+            }
+        } else {
+            self.save_api_token(token)?;
+        }
+        fs::remove_file(&pending).map_err(|_| "ENROLLMENT_PENDING_REMOVE_FAILED".to_owned())?;
+        fs::File::open(&self.root)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| "ENROLLMENT_PENDING_SYNC_FAILED".to_owned())
+    }
+
     pub fn load_api_token(&self) -> Result<String, String> {
         let path = self.root.join("api-token.txt");
         let bytes = self
@@ -326,13 +371,82 @@ impl IdentityContext {
             .map_err(|_| "ROOM_RECORD_SYNC_FAILED".to_owned())
     }
 
+    fn upload_path(&self, digest: &str) -> Result<PathBuf, String> {
+        let raw = decode_fixed::<32>(digest)?;
+        if Base64UrlUnpadded::encode_string(&raw) != digest {
+            return Err("PACKAGE_UPLOAD_REFERENCE_INVALID".to_owned());
+        }
+        Ok(self.root.join(format!("upload-{digest}.json")))
+    }
+
+    pub fn upload_record_present(&self, digest: &str) -> Result<bool, String> {
+        Ok(self.upload_path(digest)?.exists())
+    }
+
+    pub fn load_upload_record(&self, digest: &str) -> Result<serde_json::Value, String> {
+        let bytes = self.read_local_secret(
+            &self.upload_path(digest)?,
+            &format!("package-upload:{digest}"),
+            2_097_152,
+        )?;
+        smallframe_core::parse_strict_json(&bytes)
+            .map_err(|_| "PACKAGE_UPLOAD_PENDING_INVALID".to_owned())
+    }
+
+    pub fn save_upload_record(
+        &self,
+        digest: &str,
+        record: &serde_json::Value,
+    ) -> Result<(), String> {
+        self.write_local_secret(
+            &self.upload_path(digest)?,
+            &format!("package-upload:{digest}"),
+            &jcs(record)?,
+        )
+    }
+
+    pub fn replace_upload_record(
+        &self,
+        digest: &str,
+        record: &serde_json::Value,
+    ) -> Result<(), String> {
+        let path = self.upload_path(digest)?;
+        if !path.is_file() {
+            return Err("PACKAGE_UPLOAD_NOT_FOUND".to_owned());
+        }
+        let mut suffix = [0_u8; 8];
+        OsRng.fill_bytes(&mut suffix);
+        let temporary = self.root.join(format!(
+            ".upload-{}-{}.tmp",
+            digest,
+            Base64UrlUnpadded::encode_string(&suffix)
+        ));
+        self.write_local_secret(
+            &temporary,
+            &format!("package-upload:{digest}"),
+            &jcs(record)?,
+        )?;
+        if fs::rename(&temporary, path).is_err() {
+            let _ = fs::remove_file(&temporary);
+            return Err("PACKAGE_UPLOAD_REPLACE_FAILED".to_owned());
+        }
+        fs::File::open(&self.root)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| "PACKAGE_UPLOAD_SYNC_FAILED".to_owned())
+    }
+
     fn write_local_secret(
         &self,
         path: &Path,
         context: &str,
         plaintext: &[u8],
     ) -> Result<(), String> {
-        if plaintext.len() > 1_048_576 {
+        let maximum = if context.starts_with("package-upload:") {
+            2_097_152
+        } else {
+            1_048_576
+        };
+        if plaintext.len() > maximum {
             return Err("LOCAL_SECRET_SIZE_LIMIT".to_owned());
         }
         let key = Zeroizing::new(self.unlock.load()?);
@@ -580,7 +694,11 @@ fn write_new_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .map_err(|_| "OUTPUT_EXISTS_OR_UNWRITABLE".to_owned())?;
     file.write_all(bytes)
         .map_err(|_| "OUTPUT_WRITE_FAILED".to_owned())?;
-    file.sync_all().map_err(|_| "OUTPUT_SYNC_FAILED".to_owned())
+    file.sync_all()
+        .map_err(|_| "OUTPUT_SYNC_FAILED".to_owned())?;
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| "OUTPUT_DIRECTORY_SYNC_FAILED".to_owned())
 }
 
 fn grouped_base32(bytes: &[u8]) -> String {

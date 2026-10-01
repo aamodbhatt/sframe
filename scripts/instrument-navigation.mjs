@@ -4,7 +4,7 @@ import {resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 
 const marker = 'SMALLFRAME_NAVIGATION_STAGE';
-const sourceHash = '9393fa79e1c67c74edc26b610d65a4f7ed73d345a762465cc88340a33a2454ac';
+const sourceHash = '549070af3acabb3efcc4f55bfe6210f9f7c2fcf633cf7eaa59bfe60719969171';
 const hash = (source) => createHash('sha256').update(source).digest('hex');
 const replaceOnce = (source, needle, replacement) => {
   if (source.split(needle).length !== 2) throw new Error('NAVIGATION_DIAGNOSTIC_DRIVER_UNEXPECTED');
@@ -41,7 +41,7 @@ export const navigationDiagnosticSource = (input) => {
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const metadata = JSON.parse(readFileSync('node_modules/playwright-core/package.json', 'utf8'));
-  if (metadata.version !== '1.62.1') throw new Error('NAVIGATION_DIAGNOSTIC_DRIVER_VERSION');
+  if (metadata.version !== '1.63.0') throw new Error('NAVIGATION_DIAGNOSTIC_DRIVER_VERSION');
   const path = 'node_modules/playwright-core/lib/coreBundle.js';
   writeFileSync(path, navigationDiagnosticSource(readFileSync(path, 'utf8')));
   console.log('Pinned Playwright navigation stage logging enabled; behavior unchanged.');

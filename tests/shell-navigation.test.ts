@@ -43,6 +43,16 @@ it('ignores subresources, other routes and malformed diagnostic inputs, and mark
   expect(counters.fromServiceWorker).toBe(true);
 });
 
+it('counts shared entry navigations without retaining room paths or bearer fragments', () => {
+  const {page, counters, request} = fixture();
+  const req = request('http://app.localhost:4173/r/AAAAAAAAAAAAAAAAAAAAAA#FRAGMENT_SENTINEL');
+  page.emit('request', req);
+  page.emit('response', {url: req.url, request: () => req, status: () => 200, fromServiceWorker: () => false});
+  page.emit('requestfinished', req);
+  expect([counters.requests, counters.responses, counters.finished]).toEqual([1, 1, 1]);
+  expect(JSON.stringify(counters)).not.toMatch(/SENTINEL|AAAA|http|fragment/iu);
+});
+
 it('server diagnostic output drops unrecognized text and rejects malformed counters', () => {
   const counters = {received: 1, finished: 1, closedEarly: 0, aborted: 0, lastDurationMs: 1, lastStatus: 200, controllerListening: true};
   expect(safeNavigationServerCounters({...counters, privateText: 'OMIT_SENTINEL', url: 'OMIT_SENTINEL'})).toEqual(counters);

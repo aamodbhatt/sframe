@@ -1,7 +1,8 @@
 import {createCipheriv, createDecipheriv, createHash, randomBytes} from 'node:crypto';
 import {execFile, spawnSync} from 'node:child_process';
+import {createServer} from 'node:http';
 import {promisify} from 'node:util';
-import {cp, mkdir, mkdtemp, readFile, rm, writeFile} from 'node:fs/promises';
+import {cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile} from 'node:fs/promises';
 import {join, resolve} from 'node:path';
 import {pathToFileURL} from 'node:url';
 import {describe, expect, it, beforeAll, afterAll} from 'vitest';
@@ -113,10 +114,148 @@ describe('local publishing prototype and capability-scoped package retrieval', (
     const invite = await fetch(`${apiOrigin}/v1/admin/invite`, {method: 'POST', headers: {Origin: CONTROLLER_ORIGIN,
       'Content-Type': 'application/json'}, body: JSON.stringify({code: inviteCode})});
     expect(invite.status).toBe(201);
-    await run('enroll', '--invite-file', inviteFile, '--api-url', apiOrigin);
-    await rm(inviteFile);
+    const requestDigests: string[] = [];
+    let loseConfirmation = true;
+    let extraConfirmationField = true;
+    const proxy = createServer(async (request, response) => {
+      const chunks: Uint8Array[] = [];
+      for await (const chunk of request) chunks.push(chunk as Uint8Array);
+      const bytes = Buffer.concat(chunks);
+      requestDigests.push(createHash('sha256').update(bytes).digest('hex'));
+      try {
+        const upstream = await fetch(`${apiOrigin}/v1/enroll`, {method: 'POST',
+          headers: {Origin: CONTROLLER_ORIGIN, 'Content-Type': 'application/json'}, body: bytes});
+        response.writeHead(loseConfirmation ? 503 : upstream.status, {'Content-Type': 'application/json'});
+        const confirmation = await upstream.json() as Record<string, unknown>;
+        if (!loseConfirmation && extraConfirmationField) {
+          confirmation.unexpected = true;
+          extraConfirmationField = false;
+        }
+        response.end(loseConfirmation ? '{"error":"confirmation_lost"}' : JSON.stringify(confirmation));
+        loseConfirmation = false;
+      } catch {
+        response.writeHead(502).end();
+      }
+    });
+    await new Promise<void>((resolve) => proxy.listen(0, '127.0.0.1', resolve));
+    const address = proxy.address();
+    if (!address || typeof address === 'string') throw new Error('TEST_PROXY_ADDRESS_INVALID');
+    const enrollmentApiUrl = `http://127.0.0.1:${address.port}`;
+    try {
+      await expect(run('enroll', '--invite-file', inviteFile, '--api-url', enrollmentApiUrl))
+        .rejects.toThrow('ENROLLMENT_PENDING_USE_OPERATIONS_RESUME');
+      await rm(inviteFile);
+      const pendingEnrollment = await readFile(join(store, 'enrollment-pending.json'), 'utf8');
+      expect(pendingEnrollment).not.toContain('apiToken');
+      expect(pendingEnrollment).not.toContain('requestBytes');
+      expect((await run('operations', 'status', 'enrollment')).localStatus).toBe('PENDING');
+      await expect(run('enroll', '--api-url', enrollmentApiUrl))
+        .rejects.toThrow('ENROLLMENT_PENDING_USE_OPERATIONS_RESUME');
+      expect(requestDigests).toHaveLength(1);
+      const pendingFile = join(store, 'enrollment-pending.json');
+      const sealedPending = JSON.parse(pendingEnrollment) as {nonce: string; ciphertext: string};
+      const unlockKey = await readFile(join(store, 'unlock.key'));
+      const pendingAad = Buffer.from('smallframe/local-secret/v1\0enrollment-pending');
+      const pendingCiphertext = Buffer.from(sealedPending.ciphertext, 'base64url');
+      const pendingDecipher = createDecipheriv('aes-256-gcm', unlockKey, Buffer.from(sealedPending.nonce, 'base64url'));
+      pendingDecipher.setAAD(pendingAad);
+      pendingDecipher.setAuthTag(pendingCiphertext.subarray(-16));
+      const pendingRecord = JSON.parse(Buffer.concat([
+        pendingDecipher.update(pendingCiphertext.subarray(0, -16)), pendingDecipher.final(),
+      ]).toString()) as Record<string, unknown>;
+      pendingRecord.requestSha256 = randomBytes(32).toString('base64url');
+      const nonce = randomBytes(12);
+      const cipher = createCipheriv('aes-256-gcm', unlockKey, nonce);
+      cipher.setAAD(pendingAad);
+      const corrupted = Buffer.concat([cipher.update(JSON.stringify(pendingRecord)), cipher.final(), cipher.getAuthTag()]);
+      await writeFile(pendingFile, JSON.stringify({schemaVersion: 1, nonce: nonce.toString('base64url'),
+        ciphertext: corrupted.toString('base64url')}));
+      await expect(run('operations', 'resume', 'enrollment')).rejects.toThrow('ENROLLMENT_PENDING_INVALID');
+      expect(requestDigests).toHaveLength(1);
+      await writeFile(pendingFile, pendingEnrollment);
+      const alteredRequest = JSON.parse(Buffer.from(String(pendingRecord.requestBytes), 'base64url').toString()) as Record<string, unknown>;
+      alteredRequest.signature = randomBytes(64).toString('base64url');
+      const alteredBytes = Buffer.from(JSON.stringify(alteredRequest));
+      pendingRecord.requestBytes = alteredBytes.toString('base64url');
+      pendingRecord.requestSha256 = createHash('sha256').update(alteredBytes).digest('base64url');
+      const signatureNonce = randomBytes(12);
+      const signatureCipher = createCipheriv('aes-256-gcm', unlockKey, signatureNonce);
+      signatureCipher.setAAD(pendingAad);
+      const altered = Buffer.concat([signatureCipher.update(JSON.stringify(pendingRecord)), signatureCipher.final(), signatureCipher.getAuthTag()]);
+      await writeFile(pendingFile, JSON.stringify({schemaVersion: 1, nonce: signatureNonce.toString('base64url'),
+        ciphertext: altered.toString('base64url')}));
+      await expect(run('operations', 'resume', 'enrollment')).rejects.toThrow('ENROLLMENT_PENDING_INVALID');
+      expect(requestDigests).toHaveLength(1);
+      await writeFile(pendingFile, pendingEnrollment);
+      await expect(run('operations', 'resume', 'enrollment')).rejects.toThrow('ENROLLMENT_RESPONSE_MISMATCH');
+      expect((await run('operations', 'status', 'enrollment')).localStatus).toBe('PENDING');
+      await run('operations', 'resume', 'enrollment');
+      expect((await run('operations', 'status', 'enrollment')).localStatus).toBe('CONFIRMED');
+      await expect(run('enroll', '--api-url', enrollmentApiUrl)).rejects.toThrow('PUBLISHER_ALREADY_ENROLLED');
+      expect(requestDigests).toHaveLength(3);
+      expect(requestDigests[1]).toBe(requestDigests[0]);
+      expect(requestDigests[2]).toBe(requestDigests[0]);
+    } finally {
+      await new Promise<void>((resolve) => proxy.close(() => resolve()));
+    }
     const source = join(temporaryDirectory, 'publish-source');
     await cp(join(ROOT, 'examples', 'decision-board', 'package'), source, {recursive: true});
+    const uploadDigests: string[] = [];
+    const uploadOperations: string[] = [];
+    let dropUpload = true;
+    let unexpectedUploadField = true;
+    const uploadProxy = createServer(async (request, response) => {
+      try {
+        const chunks: Uint8Array[] = [];
+        for await (const chunk of request) chunks.push(chunk as Uint8Array);
+        const bytes = Buffer.concat(chunks);
+        uploadDigests.push(createHash('sha256').update(bytes).digest('hex'));
+        uploadOperations.push(String(request.headers['idempotency-key']));
+        const upstream = await fetch(`${apiOrigin}/v1/packages`, {method: 'POST', body: bytes,
+          headers: {Origin: CONTROLLER_ORIGIN, 'Content-Type': 'application/vnd.smallframe.package',
+            Authorization: String(request.headers.authorization),
+            'X-Smallframe-Package-Digest': String(request.headers['x-smallframe-package-digest'])}});
+        const confirmation = await upstream.json() as Record<string, unknown>;
+        if (!dropUpload && unexpectedUploadField) { confirmation.unexpected = true; unexpectedUploadField = false; }
+        response.writeHead(dropUpload ? 503 : upstream.status, {'Content-Type': 'application/json'});
+        response.end(dropUpload ? '{}' : JSON.stringify(confirmation));
+        dropUpload = false;
+      } catch { response.writeHead(502).end(); }
+    });
+    await new Promise<void>((resolve) => uploadProxy.listen(0, '127.0.0.1', resolve));
+    const uploadAddress = uploadProxy.address();
+    if (!uploadAddress || typeof uploadAddress === 'string') throw new Error('UPLOAD_PROXY_ADDRESS_INVALID');
+    try {
+      const uploadApiUrl = `http://127.0.0.1:${uploadAddress.port}`;
+      await expect(run('publish', source, '--api-url', uploadApiUrl)).rejects.toThrow('PACKAGE_UPLOAD_PENDING');
+      const journals = (await readdir(store)).filter((name) => /^upload-[A-Za-z0-9_-]{43}\.json$/u.test(name));
+      expect(journals).toHaveLength(1);
+      const digest = journals[0]!.slice(7, -5);
+      const reference = `upload:${digest}`;
+      const journalPath = join(store, journals[0]!);
+      const savedJournal = await readFile(journalPath, 'utf8');
+      expect(savedJournal.includes('apiToken')).toBe(false);
+      expect(savedJournal.includes('requestBytes')).toBe(false);
+      expect((await run('operations', 'status', reference)).localStatus).toBe('PENDING');
+      await expect(run('publish', source, '--api-url', apiOrigin)).rejects.toThrow('PACKAGE_UPLOAD_REQUEST_CONFLICT');
+      await writeFile(journalPath, '{}');
+      await expect(run('operations', 'resume', reference)).rejects.toThrow();
+      expect(uploadDigests).toHaveLength(1);
+      await writeFile(journalPath, savedJournal);
+      const savedWorker = await readFile(join(source, 'app.worker.js'));
+      await rm(join(source, 'app.worker.js'));
+      await expect(run('operations', 'resume', reference)).rejects.toThrow('PACKAGE_UPLOAD_PENDING');
+      expect((await run('operations', 'status', reference)).localStatus).toBe('PENDING');
+      await run('operations', 'resume', reference);
+      expect((await run('operations', 'status', reference)).localStatus).toBe('CONFIRMED');
+      expect(uploadDigests).toHaveLength(3);
+      expect(new Set(uploadDigests).size).toBe(1);
+      expect(new Set(uploadOperations).size).toBe(1);
+      await writeFile(join(source, 'app.worker.js'), savedWorker);
+      // Test-only removal lets the independent existing publication path below
+      // exercise its original API target; production offers no local abandon shortcut.
+      await rm(journalPath);
+    } finally { await new Promise<void>((resolve) => uploadProxy.close(() => resolve())); }
     const published = await run('publish', source,
       '--api-url', apiOrigin, '--show-secrets');
     expect(published.ok).toBe(true);

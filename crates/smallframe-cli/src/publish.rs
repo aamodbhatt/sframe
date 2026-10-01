@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use base64ct::{Base64UrlUnpadded, Encoding};
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::{Signature, Signer, SigningKey};
 use rand_core::{OsRng, RngCore};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -87,50 +87,6 @@ fn http_post_json_bytes(
     serde_json::from_str(&response_str).map_err(|_| "HTTP_RESPONSE_INVALID".to_owned())
 }
 
-fn http_post_bytes(
-    url: &str,
-    bytes: &[u8],
-    auth_header: Option<&str>,
-    package_digest: &str,
-) -> Result<serde_json::Value, String> {
-    let temp_file = std::env::temp_dir().join(format!("sf-upload-{}.bin", std::process::id()));
-    fs::write(&temp_file, bytes).map_err(|e| format!("TEMP_FILE_WRITE_FAILED: {e}"))?;
-
-    let mut cmd = ProcessCommand::new("curl");
-    cmd.args([
-        "-s",
-        "-S",
-        "-f",
-        "-X",
-        "POST",
-        url,
-        "-H",
-        "Content-Type: application/vnd.smallframe.package",
-        "-H",
-        "Origin: http://app.localhost:4173",
-        "-H",
-        &format!("X-Smallframe-Package-Digest: {package_digest}"),
-    ]);
-    if let Some(auth) = auth_header {
-        cmd.args(["-H", &format!("Authorization: {auth}")]);
-    }
-    cmd.args(["--data-binary", &format!("@{}", temp_file.display())]);
-
-    let output = cmd.output();
-    let _ = fs::remove_file(&temp_file);
-
-    let output = output.map_err(|e| format!("HTTP_REQUEST_FAILED: {e}"))?;
-    let response_str = String::from_utf8_lossy(&output.stdout);
-    if !output.status.success() {
-        return Err(format!(
-            "HTTP_ERROR: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-
-    serde_json::from_str(&response_str).map_err(|_| "HTTP_RESPONSE_INVALID".to_owned())
-}
-
 fn http_get_json(url: &str, auth_header: Option<&str>) -> Result<serde_json::Value, String> {
     let mut cmd = ProcessCommand::new("curl");
     cmd.args([
@@ -165,14 +121,34 @@ pub fn enroll_publisher(
     invite_file: Option<&Path>,
     api_url: &str,
 ) -> Result<serde_json::Value, String> {
+    let (pending, active) = ctx.enrollment_files_present();
+    if pending {
+        return Err("ENROLLMENT_PENDING_USE_OPERATIONS_RESUME".to_owned());
+    }
+    if active {
+        return Err("PUBLISHER_ALREADY_ENROLLED".to_owned());
+    }
     let invite_code = if let Some(path) = invite_file {
-        fs::read_to_string(path)
-            .map_err(|_| "INVITE_FILE_READ_FAILED".to_owned())?
-            .trim()
-            .to_owned()
+        let metadata = fs::metadata(path).map_err(|_| "INVITE_FILE_READ_FAILED".to_owned())?;
+        if !metadata.is_file() || metadata.len() > 256 {
+            return Err("INVITE_FILE_INVALID".to_owned());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o077 != 0 {
+                return Err("INVITE_FILE_PERMISSIONS_INVALID".to_owned());
+            }
+        }
+        fs::read_to_string(path).map_err(|_| "INVITE_FILE_READ_FAILED".to_owned())?
     } else {
-        "BETA_INVITE_TEST_123".to_owned()
+        rpassword::prompt_password("Publisher invite code: ")
+            .map_err(|_| "INVITE_PROMPT_FAILED".to_owned())?
     };
+    let invite_code = invite_code.trim();
+    if invite_code.len() < 16 || invite_code.len() > 256 {
+        return Err("INVITE_CODE_INVALID".to_owned());
+    }
 
     let signing_key = ctx.signing_key()?;
     let pub_key = signing_key.verifying_key().to_bytes();
@@ -211,18 +187,207 @@ pub fn enroll_publisher(
         "signature": Base64UrlUnpadded::encode_string(&signature.to_bytes())
     });
 
-    let enroll_url = format!("{}/v1/enroll", api_url.trim_end_matches('/'));
-    let response = http_post_json(&enroll_url, &request_body, None, None)?;
-
     let token_str = Base64UrlUnpadded::encode_string(&raw_token);
-    ctx.save_api_token(&token_str)?;
+    let request_bytes = serde_json::to_vec(&request_body).map_err(|_| "SERIALIZE_FAILED")?;
+    let enroll_url = format!("{}/v1/enroll", api_url.trim_end_matches('/'));
+    if !valid_enrollment_target(&enroll_url) {
+        return Err("ENROLLMENT_TARGET_INVALID".to_owned());
+    }
+    let pending_record = json!({
+        "status":"PENDING", "targetUrl":enroll_url,
+        "publisherKeyId":pub_key_id, "operationId":Base64UrlUnpadded::encode_string(&operation_id),
+        "apiToken":token_str,
+        "requestBytes":Base64UrlUnpadded::encode_string(&request_bytes),
+        "requestSha256":Base64UrlUnpadded::encode_string(&Sha256::digest(&request_bytes)),
+    });
+    ctx.save_pending_enrollment(&pending_record)?;
+    let response = http_post_json_bytes(&enroll_url, &request_bytes, None, None)
+        .map_err(|_| "ENROLLMENT_PENDING_USE_OPERATIONS_RESUME".to_owned())?;
+    verify_enrollment_response(&response, &pub_key_id)?;
+    ctx.confirm_pending_enrollment(&token_str)?;
 
     Ok(json!({
         "ok": true,
         "publisherKeyId": pub_key_id,
         "enrolled": true,
+        "operationRef":"enrollment",
         "response": response
     }))
+}
+
+fn valid_enrollment_target(target: &str) -> bool {
+    target.len() <= 2_048
+        && (target.starts_with("http://") || target.starts_with("https://"))
+        && target.ends_with("/v1/enroll")
+        && !target.contains(['#', '?', '@', ' ', '\n', '\r'])
+}
+
+fn verify_enrollment_response(
+    response: &serde_json::Value,
+    publisher_key_id: &str,
+) -> Result<(), String> {
+    if response.as_object().map(|object| object.len()) != Some(3)
+        || response.get("ok").and_then(serde_json::Value::as_bool) != Some(true)
+        || response
+            .get("publisherKeyId")
+            .and_then(serde_json::Value::as_str)
+            != Some(publisher_key_id)
+        || response
+            .get("enrolledAt")
+            .and_then(serde_json::Value::as_u64)
+            .is_none()
+    {
+        return Err("ENROLLMENT_RESPONSE_MISMATCH".to_owned());
+    }
+    Ok(())
+}
+
+fn pending_enrollment_record(
+    ctx: &IdentityContext,
+) -> Result<(serde_json::Value, Vec<u8>, String), String> {
+    let record = ctx.load_pending_enrollment()?;
+    let invalid = || "ENROLLMENT_PENDING_INVALID".to_owned();
+    if record.get("status").and_then(serde_json::Value::as_str) != Some("PENDING") {
+        return Err(invalid());
+    }
+    let target = record
+        .get("targetUrl")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(invalid)?;
+    if !valid_enrollment_target(target) {
+        return Err(invalid());
+    }
+    let publisher_key_id = record
+        .get("publisherKeyId")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(invalid)?;
+    if key_id(&ctx.signing_key()?.verifying_key().to_bytes()) != publisher_key_id {
+        return Err(invalid());
+    }
+    let token = record
+        .get("apiToken")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(invalid)?
+        .to_owned();
+    let token_bytes = Base64UrlUnpadded::decode_vec(&token).map_err(|_| invalid())?;
+    if token_bytes.len() != 32 || Base64UrlUnpadded::encode_string(&token_bytes) != token {
+        return Err(invalid());
+    }
+    let encoded = record
+        .get("requestBytes")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(invalid)?;
+    if encoded.len() > 2_731 {
+        return Err(invalid());
+    }
+    let bytes = Base64UrlUnpadded::decode_vec(encoded).map_err(|_| invalid())?;
+    if bytes.len() > 2_048
+        || Base64UrlUnpadded::encode_string(&bytes) != encoded
+        || record
+            .get("requestSha256")
+            .and_then(serde_json::Value::as_str)
+            != Some(Base64UrlUnpadded::encode_string(&Sha256::digest(&bytes)).as_str())
+    {
+        return Err(invalid());
+    }
+    let request = parse_strict_json(&bytes).map_err(|_| invalid())?;
+    if request.as_object().map(|object| object.len()) != Some(2) {
+        return Err(invalid());
+    }
+    let jcs_encoded = request
+        .get("jcsBytes")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(invalid)?;
+    if jcs_encoded.len() > 1_366 {
+        return Err(invalid());
+    }
+    let jcs = Base64UrlUnpadded::decode_vec(jcs_encoded).map_err(|_| invalid())?;
+    if jcs.len() > 1_024 || Base64UrlUnpadded::encode_string(&jcs) != jcs_encoded {
+        return Err(invalid());
+    }
+    let signed = parse_strict_json(&jcs).map_err(|_| invalid())?;
+    verify_pending_enrollment_statement(ctx, &request, &signed, &jcs)?;
+    if signed
+        .get("publisherKeyId")
+        .and_then(serde_json::Value::as_str)
+        != Some(publisher_key_id)
+        || signed.get("operationId") != record.get("operationId")
+        || signed.get("tokenHash").and_then(serde_json::Value::as_str)
+            != Some(Base64UrlUnpadded::encode_string(&Sha256::digest(&token_bytes)).as_str())
+    {
+        return Err(invalid());
+    }
+    Ok((record, bytes, token))
+}
+
+fn verify_pending_enrollment_statement(
+    ctx: &IdentityContext,
+    request: &serde_json::Value,
+    signed: &serde_json::Value,
+    jcs: &[u8],
+) -> Result<(), String> {
+    let invalid = || "ENROLLMENT_PENDING_INVALID".to_owned();
+    let key = ctx.signing_key()?.verifying_key();
+    if signed.as_object().map(|object| object.len()) != Some(7)
+        || signed.get("protocolVersion") != Some(&json!(1))
+        || signed
+            .get("publisherPublicKey")
+            .and_then(serde_json::Value::as_str)
+            != Some(Base64UrlUnpadded::encode_string(key.as_bytes()).as_str())
+        || jcs_bytes(signed)? != jcs
+    {
+        return Err(invalid());
+    }
+    let encoded = request
+        .get("signature")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(invalid)?;
+    let bytes = Base64UrlUnpadded::decode_vec(encoded).map_err(|_| invalid())?;
+    if bytes.len() != 64 || Base64UrlUnpadded::encode_string(&bytes) != encoded {
+        return Err(invalid());
+    }
+    let signature = Signature::from_slice(&bytes).map_err(|_| invalid())?;
+    key.verify_strict(&dsse_pae(ENROLLMENT_PAYLOAD_TYPE, jcs), &signature)
+        .map_err(|_| invalid())
+}
+
+pub fn enrollment_operation_status(ctx: &IdentityContext) -> Result<serde_json::Value, String> {
+    let (pending, active) = ctx.enrollment_files_present();
+    if pending {
+        let (record, _, _) = pending_enrollment_record(ctx)?;
+        return Ok(
+            json!({"operationRef":"enrollment", "operationId":record["operationId"],
+            "localStatus":"PENDING", "serverStatus":"UNKNOWN"}),
+        );
+    }
+    if active {
+        ctx.load_api_token()?;
+        return Ok(
+            json!({"operationRef":"enrollment", "localStatus":"CONFIRMED",
+            "serverStatus":"UNKNOWN"}),
+        );
+    }
+    Err("ENROLLMENT_OPERATION_NOT_FOUND".to_owned())
+}
+
+pub fn resume_enrollment_operation(ctx: &IdentityContext) -> Result<serde_json::Value, String> {
+    let (record, bytes, token) = pending_enrollment_record(ctx)?;
+    let target = record
+        .get("targetUrl")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("ENROLLMENT_PENDING_INVALID")?;
+    let publisher_key_id = record
+        .get("publisherKeyId")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("ENROLLMENT_PENDING_INVALID")?;
+    let response = http_post_json_bytes(target, &bytes, None, None)
+        .map_err(|_| "ENROLLMENT_STILL_PENDING".to_owned())?;
+    verify_enrollment_response(&response, publisher_key_id)?;
+    ctx.confirm_pending_enrollment(&token)?;
+    Ok(
+        json!({"ok":true,"operationRef":"enrollment","publisherKeyId":publisher_key_id,
+        "enrolled":true,"response":response}),
+    )
 }
 
 pub fn publish_package(
@@ -289,29 +454,7 @@ pub fn publish_package(
 
     // 2. Upload package
     let token = ctx.load_api_token()?;
-    let pkg_url = format!("{}/v1/packages", api_url.trim_end_matches('/'));
-    let pkg_res = http_post_bytes(
-        &pkg_url,
-        &pkg_bytes,
-        Some(&format!("Bearer {token}")),
-        &pkg_digest,
-    )?;
-    if pkg_res.get("ok").and_then(serde_json::Value::as_bool) != Some(true)
-        || pkg_res
-            .get("packageDigest")
-            .and_then(serde_json::Value::as_str)
-            != Some(&pkg_digest)
-        || pkg_res
-            .get("artifactDigest")
-            .and_then(serde_json::Value::as_str)
-            != Some(&summary.artifact_digest)
-        || pkg_res
-            .get("publisherKeyId")
-            .and_then(serde_json::Value::as_str)
-            != Some(&publisher_key_id)
-    {
-        return Err("PACKAGE_UPLOAD_RESPONSE_MISMATCH".to_owned());
-    }
+    crate::upload::upload_package(ctx, api_url, &pkg_bytes, &pkg_digest)?;
 
     // 3. Generate room parameters
     let mut room_id_bytes = [0_u8; 16];

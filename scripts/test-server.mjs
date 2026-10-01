@@ -148,7 +148,7 @@ const staticHandler = (request, response) => {
     response.writeHead(200, {'Content-Type': 'application/json', 'Cache-Control': 'no-store'}).end(JSON.stringify(evidenceSnapshot()));
     return;
   }
-  if (url.pathname === '/' && request.method === 'GET') {
+  if ((url.pathname === '/' || /^\/r\/[A-Za-z0-9_-]{22}$/u.test(url.pathname)) && request.method === 'GET') {
     const started = Date.now();
     navigationDiagnostics.received += 1;
     request.once('aborted', () => { navigationDiagnostics.aborted += 1; });

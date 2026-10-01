@@ -4,13 +4,15 @@ mod app;
 mod identity;
 mod publish;
 mod snapshot;
+mod upload;
 
 use app::{new_app, pack, validate_path};
 use clap::{Parser, Subcommand};
 use identity::{IdentityContext, read_passphrase};
 use publish::{
-    enroll_publisher, publish_package, resume_room_operation, room_operation_status,
-    room_request_repair, room_revoke, room_rotate_links, room_status,
+    enroll_publisher, enrollment_operation_status, publish_package, resume_enrollment_operation,
+    resume_room_operation, room_operation_status, room_request_repair, room_revoke,
+    room_rotate_links, room_status,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -110,21 +112,25 @@ enum IdentityCommand {
 #[derive(Debug, Subcommand)]
 enum RoomCommand {
     Status {
+        #[arg(allow_hyphen_values = true)]
         room_ref: String,
         #[arg(long, default_value = "http://api.localhost:8787")]
         api_url: String,
     },
     RotateLinks {
+        #[arg(allow_hyphen_values = true)]
         room_ref: String,
         #[arg(long, default_value = "http://api.localhost:8787")]
         api_url: String,
     },
     Revoke {
+        #[arg(allow_hyphen_values = true)]
         room_ref: String,
         #[arg(long, default_value = "http://api.localhost:8787")]
         api_url: String,
     },
     RequestRepair {
+        #[arg(allow_hyphen_values = true)]
         room_ref: String,
         #[arg(long)]
         expected_etag: Option<String>,
@@ -136,14 +142,17 @@ enum RoomCommand {
 #[derive(Debug, Subcommand)]
 enum OperationsCommand {
     Status {
+        #[arg(allow_hyphen_values = true)]
         operation_ref: String,
     },
     Resume {
+        #[arg(allow_hyphen_values = true)]
         operation_ref: String,
         #[arg(long)]
         show_secrets: bool,
     },
     Abandon {
+        #[arg(allow_hyphen_values = true)]
         operation_ref: String,
     },
 }
@@ -151,10 +160,39 @@ enum OperationsCommand {
 #[derive(Debug, Subcommand)]
 enum ExportCommand {
     Package {
+        #[arg(allow_hyphen_values = true)]
         package_or_room_ref: String,
         #[arg(long)]
         output: PathBuf,
     },
+}
+
+#[cfg(test)]
+mod argument_tests {
+    use super::Cli;
+    use clap::Parser;
+
+    #[test]
+    fn base64url_references_can_start_with_a_hyphen() {
+        let reference = "-AAAAAAAAAAAAAAAAAAAAA";
+        for action in ["status", "rotate-links", "revoke", "request-repair"] {
+            assert!(Cli::try_parse_from(["smallframe", "room", action, reference]).is_ok());
+        }
+        for action in ["status", "resume", "abandon"] {
+            assert!(Cli::try_parse_from(["smallframe", "operations", action, reference]).is_ok());
+        }
+        assert!(
+            Cli::try_parse_from([
+                "smallframe",
+                "export",
+                "package",
+                reference,
+                "--output",
+                "unused-package",
+            ])
+            .is_ok()
+        );
+    }
 }
 
 #[derive(Debug)]
@@ -192,7 +230,18 @@ impl CliError {
                             byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'
                         })
                 })
-                .map(str::to_owned),
+                .map(str::to_owned)
+                .or_else(|| {
+                    message
+                        .strip_prefix("PACKAGE_UPLOAD_PENDING:")
+                        .filter(|value| {
+                            value.len() == 43
+                                && value
+                                    .bytes()
+                                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                        })
+                        .map(|digest| format!("upload:{digest}"))
+                }),
             detail: message,
             exit,
         }
@@ -388,19 +437,29 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             let context = IdentityContext::discover(cli.test_store.as_deref())
                 .map_err(CliError::from_message)?;
             match command {
-                OperationsCommand::Status { operation_ref } => emit(
-                    &room_operation_status(&context, operation_ref)
-                        .map_err(CliError::from_message)?,
-                    cli.json,
-                ),
+                OperationsCommand::Status { operation_ref } => {
+                    let result = if operation_ref == "enrollment" {
+                        enrollment_operation_status(&context)
+                    } else if let Some(digest) = operation_ref.strip_prefix("upload:") {
+                        upload::upload_status(&context, digest)
+                    } else {
+                        room_operation_status(&context, operation_ref)
+                    };
+                    emit(&result.map_err(CliError::from_message)?, cli.json)
+                }
                 OperationsCommand::Resume {
                     operation_ref,
                     show_secrets,
-                } => emit(
-                    &resume_room_operation(&context, operation_ref, *show_secrets)
-                        .map_err(CliError::from_message)?,
-                    cli.json,
-                ),
+                } => {
+                    let result = if operation_ref == "enrollment" {
+                        resume_enrollment_operation(&context)
+                    } else if let Some(digest) = operation_ref.strip_prefix("upload:") {
+                        upload::resume_upload(&context, digest)
+                    } else {
+                        resume_room_operation(&context, operation_ref, *show_secrets)
+                    };
+                    emit(&result.map_err(CliError::from_message)?, cli.json)
+                }
                 OperationsCommand::Abandon { .. } => Err(CliError::from_message(
                     "OPERATION_ABANDON_REQUIRES_SERVER_RECONCILIATION".to_owned(),
                 )),
