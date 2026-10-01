@@ -5,6 +5,7 @@ import {join, resolve} from 'node:path';
 import {Miniflare} from 'miniflare';
 import {afterAll, beforeAll, describe, expect, it} from 'vitest';
 import {build} from 'vite';
+import {compiledVerifierPlugin} from '../scripts/compiled-verifier-plugin.mjs';
 
 const ROOT = resolve(import.meta.dirname, '..');
 const CONTROLLER_ORIGIN = 'http://app.localhost:4173';
@@ -185,6 +186,7 @@ describe('SQLite Durable Object Phase 3 Protocol & Lifecycle', () => {
     temporaryDirectory = await mkdtemp(join(testRoot, 'phase3-do-'));
     const entry = join(temporaryDirectory, 'worker.mjs');
     await build({
+      plugins: [compiledVerifierPlugin({worker: true})],
       configFile: false,
       root: ROOT,
       build: {
@@ -201,6 +203,8 @@ describe('SQLite Durable Object Phase 3 Protocol & Lifecycle', () => {
 
     miniflare = new Miniflare({
       modules: true,
+      modulesRoot: temporaryDirectory,
+      modulesRules: [{type: 'CompiledWasm', include: ['**/*.wasm']}],
       scriptPath: entry,
       name: WORKER_NAME,
       compatibilityDate: '2026-07-30',

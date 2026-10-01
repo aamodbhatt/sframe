@@ -10,7 +10,7 @@ type PublishEnvironment = {
 export const handlePublishRoute = async (pathname: string, request: Request, env: PublishEnvironment): Promise<Response | null> => {
   const prototypePath = ['/v1/enroll', '/v1/admin/invite', '/v1/packages', '/v1/rooms'].includes(pathname)
     || pathname.startsWith('/v1/packages/');
-  // In-memory publisher storage, unvalidated uploads and the raw genesis saga
+  // In-memory publisher storage and the raw genesis saga
   // are local fixtures. Reject before credentials/body/DO access elsewhere.
   if (prototypePath && env.ENVIRONMENT !== 'local') {
     return new Response(JSON.stringify({type: 'urn:smallframe:error:publishing_not_implemented',

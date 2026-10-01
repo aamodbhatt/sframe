@@ -1,4 +1,4 @@
-import {createCipheriv, createDecipheriv, createHash, randomBytes} from 'node:crypto';
+import {createCipheriv, createDecipheriv, createHash, createPrivateKey, randomBytes} from 'node:crypto';
 import {execFile, spawnSync} from 'node:child_process';
 import {createServer} from 'node:http';
 import {promisify} from 'node:util';
@@ -8,6 +8,7 @@ import {pathToFileURL} from 'node:url';
 import {describe, expect, it, beforeAll, afterAll} from 'vitest';
 import {Miniflare} from 'miniflare';
 import {build} from 'vite';
+import {compiledVerifierPlugin} from '../scripts/compiled-verifier-plugin.mjs';
 import {getPublicKeyAsync, utils} from '@noble/ed25519';
 import {
   createSignedEnrollment,
@@ -35,6 +36,7 @@ describe('local publishing prototype and capability-scoped package retrieval', (
     temporaryDirectory = await mkdtemp(join(testRoot, 'phase4-publish-'));
     const entry = join(temporaryDirectory, 'worker.mjs');
     await build({
+      plugins: [compiledVerifierPlugin({worker: true})],
       configFile: false,
       root: ROOT,
       build: {
@@ -52,6 +54,8 @@ describe('local publishing prototype and capability-scoped package retrieval', (
     miniflare = new Miniflare({
       unsafeInspectDurableObjects: true,
       modules: true,
+      modulesRoot: temporaryDirectory,
+      modulesRules: [{type: 'CompiledWasm', include: ['**/*.wasm']}],
       scriptPath: entry,
       name: WORKER_NAME,
       compatibilityDate: '2026-07-30',
@@ -256,6 +260,18 @@ describe('local publishing prototype and capability-scoped package retrieval', (
       // exercise its original API target; production offers no local abandon shortcut.
       await rm(journalPath);
     } finally { await new Promise<void>((resolve) => uploadProxy.close(() => resolve())); }
+    const oversizedSource = join(temporaryDirectory, 'oversized-publish-source');
+    await cp(join(ROOT, 'examples/decision-board/package'), oversizedSource, {recursive: true});
+    const oversizedWorker = join(oversizedSource, 'app.worker.js');
+    await writeFile(oversizedWorker, `${await readFile(oversizedWorker, 'utf8')}\n/*${'x'.repeat(9_000)}*/`);
+    const oversizedManifestPath = join(oversizedSource, 'smallframe.json');
+    const oversizedManifest = JSON.parse(await readFile(oversizedManifestPath, 'utf8')) as Record<string, any>;
+    const oversizedModule = await readFile(oversizedWorker);
+    oversizedManifest.files['app.worker.js'] = {bytes: oversizedModule.byteLength,
+      sha256: createHash('sha256').update(oversizedModule).digest('base64url')};
+    await writeFile(oversizedManifestPath, JSON.stringify(oversizedManifest));
+    await expect(run('publish', oversizedSource, '--api-url', apiOrigin)).rejects.toThrow('PACKAGE_UPLOAD_LOCAL_BETA_SIZE_LIMIT');
+    expect((await readdir(store)).filter((name) => name.startsWith('upload-'))).toHaveLength(0);
     const published = await run('publish', source,
       '--api-url', apiOrigin, '--show-secrets');
     expect(published.ok).toBe(true);
@@ -342,7 +358,29 @@ describe('local publishing prototype and capability-scoped package retrieval', (
     expect(adminData.ok).toBe(true);
 
     // 2. Publisher generates keypair, API token, operation ID, and signs enrollment
-    const publisherPriv = utils.randomPrivateKey();
+    const packageStore = await mkdtemp(join(temporaryDirectory, 'package-author-'));
+    const binary = join(ROOT, 'target', 'debug', 'smallframe-cli');
+    const native = async (...args: string[]): Promise<Record<string, any>> => {
+      try {
+        const output = await promisify(execFile)(binary, ['--json', '--test-store', packageStore, ...args],
+          {cwd: ROOT, encoding: 'utf8', maxBuffer: 32_768});
+        return JSON.parse(output.stdout) as Record<string, any>;
+      } catch { throw new Error('NATIVE_PACKAGE_FIXTURE_FAILED'); }
+    };
+    await native('identity', 'init');
+    const identityVault = JSON.parse(await readFile(join(packageStore, 'identity-v1.json'), 'utf8')) as
+      {keyId: string; nonce: string; ciphertext: string};
+    const vaultBytes = Buffer.from(identityVault.ciphertext, 'base64url');
+    const vaultCipher = createDecipheriv('aes-256-gcm', await readFile(join(packageStore, 'unlock.key')),
+      Buffer.from(identityVault.nonce, 'base64url'));
+    vaultCipher.setAAD(Buffer.from(`smallframe-vault-v1\0${identityVault.keyId}`));
+    vaultCipher.setAuthTag(vaultBytes.subarray(-16));
+    const vaultPlain = JSON.parse(Buffer.concat([vaultCipher.update(vaultBytes.subarray(0, -16)), vaultCipher.final()]).toString()) as
+      {privateKeyPkcs8: string};
+    const privateJwk = createPrivateKey({key: Buffer.from(vaultPlain.privateKeyPkcs8, 'base64'), type: 'pkcs8', format: 'der'})
+      .export({format: 'jwk'});
+    if (typeof privateJwk.d !== 'string') throw new Error('NATIVE_PACKAGE_FIXTURE_FAILED');
+    const publisherPriv = decodeBase64Url(privateJwk.d);
     const publisherPub = await getPublicKeyAsync(publisherPriv);
     const publisherKeyDigest = await crypto.subtle.digest('SHA-256', publisherPub);
     const publisherKeyId = `sha256:${encodeBase64Url(new Uint8Array(publisherKeyDigest))}`;
@@ -385,8 +423,10 @@ describe('local publishing prototype and capability-scoped package retrieval', (
 
     // 4. Upload package with Bearer auth
     const apiTokenBase64Url = encodeBase64Url(new Uint8Array(rawToken));
-    const packageBytes = new Uint8Array(1024).fill(0x42);
-    const expectedPkgDigest = encodeBase64Url(new Uint8Array(await crypto.subtle.digest('SHA-256', packageBytes)));
+    const archivePath = join(packageStore, 'signed-package.zip');
+    const packed = await native('pack', join(ROOT, 'examples/decision-board/package'), '--output', archivePath);
+    const packageBytes = new Uint8Array(await readFile(archivePath));
+    const expectedPkgDigest = String(packed.packageDigest);
 
     const pkgUploadRes = await fetch(`${apiOrigin}/v1/packages`, {
       method: 'POST',
@@ -401,6 +441,22 @@ describe('local publishing prototype and capability-scoped package retrieval', (
     const pkgUploadData = (await pkgUploadRes.json()) as {ok: boolean; packageDigest: string};
     expect(pkgUploadData.packageDigest).toBe(expectedPkgDigest);
 
+    const limitSource = join(packageStore, 'limit-source');
+    await cp(join(ROOT, 'examples/decision-board/package'), limitSource, {recursive: true});
+    const limitWorker = join(limitSource, 'app.worker.js');
+    const originalWorker = await readFile(limitWorker, 'utf8');
+    await writeFile(limitWorker, `${originalWorker}\n/*${'x'.repeat(5_500 - Buffer.byteLength(originalWorker) - 5)}*/`);
+    const limitArchive = join(packageStore, 'limit-package.zip');
+    await native('pack', limitSource, '--output', limitArchive);
+    const limitBytes = await readFile(limitArchive);
+    expect(limitBytes.byteLength).toBe(8_192);
+    const sendLimit = (body: Uint8Array) => fetch(`${apiOrigin}/v1/packages`, {method: 'POST', body,
+      headers: {Origin: CONTROLLER_ORIGIN, Authorization: `Bearer ${apiTokenBase64Url}`,
+        'Content-Type': 'application/vnd.smallframe.package'}});
+    expect((await sendLimit(limitBytes)).status).toBe(201);
+    expect((await sendLimit(new Uint8Array([...limitBytes, 0]))).status).toBe(413);
+    expect((await sendLimit(limitBytes)).status).toBe(200);
+
     // 5. Publisher retrieval requires its authenticated token.
     expect((await fetch(`${apiOrigin}/v1/packages/${expectedPkgDigest}`)).status).toBe(401);
     expect((await fetch(`${apiOrigin}/v1/packages/${expectedPkgDigest}`, {headers: {Authorization: 'Bearer malformed'}})).status).toBe(401);
@@ -409,8 +465,8 @@ describe('local publishing prototype and capability-scoped package retrieval', (
     });
     expect(getPkgRes.status).toBe(200);
     const downloadedBytes = new Uint8Array(await getPkgRes.arrayBuffer());
-    expect(downloadedBytes.byteLength).toBe(1024);
-    expect(downloadedBytes[0]).toBe(0x42);
+    expect(downloadedBytes.byteLength).toBe(packageBytes.byteLength);
+    expect(createHash('sha256').update(downloadedBytes).digest('hex')).toBe(createHash('sha256').update(packageBytes).digest('hex'));
 
     // 6. Create room saga
     const roomBytes = randomBytes(16);
@@ -526,7 +582,7 @@ describe('local publishing prototype and capability-scoped package retrieval', (
       expect(memberPackage.status).toBe(200);
       expect(memberPackage.headers.get('Cache-Control')).toBe('private, no-store');
       expect(memberPackage.headers.get('X-Smallframe-Package-Digest')).toBe(expectedPkgDigest);
-      expect(new Uint8Array(await memberPackage.arrayBuffer()).byteLength).toBe(1024);
+      expect(new Uint8Array(await memberPackage.arrayBuffer()).byteLength).toBe(packageBytes.byteLength);
     }
     const storage = await miniflare.unsafeGetDurableObjectStorage(WORKER_NAME, DO_CLASS, {name: encryptedRoomId});
     await storage.exec("UPDATE room_state SET recovery_status = 'RECOVERY_REQUIRED'");

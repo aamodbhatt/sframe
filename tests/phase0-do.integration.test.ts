@@ -5,6 +5,7 @@ import {join, resolve} from 'node:path';
 import {Miniflare} from 'miniflare';
 import {afterAll, beforeAll, describe, expect, it} from 'vitest';
 import {build} from 'vite';
+import {compiledVerifierPlugin} from '../scripts/compiled-verifier-plugin.mjs';
 import WebSocket from 'ws';
 
 const ROOT = resolve(import.meta.dirname, '..');
@@ -132,6 +133,7 @@ beforeAll(async () => {
   await mkdir(testRoot, {recursive: true});
   temporaryDirectory = await mkdtemp(join(testRoot, 'phase0-do-'));
   await build({
+      plugins: [compiledVerifierPlugin({worker: true})],
     configFile: false,
     logLevel: 'silent',
     build: {
@@ -151,6 +153,8 @@ beforeAll(async () => {
   miniflare = new Miniflare({
     name: WORKER_NAME,
     modules: true,
+    modulesRoot: temporaryDirectory,
+    modulesRules: [{type: 'CompiledWasm', include: ['**/*.wasm']}],
     scriptPath: join(temporaryDirectory, 'worker.mjs'),
     compatibilityDate: '2026-07-30',
     host: '127.0.0.1',

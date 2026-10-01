@@ -12,6 +12,7 @@ use std::{
 
 const CONTENT_TYPE: &str = "application/vnd.smallframe.package";
 const MAX_ARTIFACT: usize = 1_048_576;
+const MAX_LOCAL_BETA_UPLOAD: usize = 8_192;
 
 // Never derive Debug: this record holds the exact authorization credential.
 #[derive(Serialize, Deserialize)]
@@ -108,6 +109,11 @@ pub fn upload_package(
     bytes: &[u8],
     digest: &str,
 ) -> Result<(), String> {
+    // Preserve validation/replay of existing journals, but reject oversized new
+    // local-beta uploads before saving credentials or contacting the server.
+    if bytes.len() > MAX_LOCAL_BETA_UPLOAD {
+        return Err("PACKAGE_UPLOAD_LOCAL_BETA_SIZE_LIMIT".to_owned());
+    }
     let target = format!("{}/v1/packages", api_url.trim_end_matches('/'));
     if !valid_target(&target) {
         return Err("PACKAGE_UPLOAD_TARGET_INVALID".to_owned());

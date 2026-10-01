@@ -5,17 +5,18 @@ import {extname, join, normalize, sep} from 'node:path';
 import {WebSocket, WebSocketServer} from 'ws';
 import {Miniflare} from 'miniflare';
 import {build} from 'vite';
+import {compiledVerifierPlugin} from './compiled-verifier-plugin.mjs';
 
 const root = process.cwd();
 const dist = join(root, 'dist', 'controller');
 mkdirSync(join(root, '.wrangler'), {recursive: true});
 const relayDir = mkdtempSync(join(root, '.wrangler', 'e2e-relay-'));
-await build({configFile: false, root, logLevel: 'silent', build: {
+await build({plugins: [compiledVerifierPlugin({worker: true})], configFile: false, root, logLevel: 'silent', build: {
   lib: {entry: join(root, 'apps/api/src/do-test-worker.ts'), formats: ['es'], fileName: () => 'worker.mjs'},
   outDir: relayDir, target: 'es2022', minify: false,
   rollupOptions: {external: ['cloudflare:workers']}
 }});
-const relay = new Miniflare({modules: true, scriptPath: join(relayDir, 'worker.mjs'),
+const relay = new Miniflare({modules: true, modulesRoot: relayDir, modulesRules: [{type: 'CompiledWasm', include: ['**/*.wasm']}], scriptPath: join(relayDir, 'worker.mjs'),
   compatibilityDate: '2026-07-30', host: '127.0.0.1', port: 0,
   bindings: {CONTROLLER_ORIGIN: 'http://app.localhost:4173', ENVIRONMENT: 'local', BUILD_VERSION: 'local',
     API_ORIGIN: 'http://api.localhost:8787', WEBSOCKET_ORIGIN: 'ws://api.localhost:8787'},

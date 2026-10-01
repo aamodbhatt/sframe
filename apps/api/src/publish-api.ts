@@ -9,9 +9,12 @@ import {
 import type {WireEnvelope} from '../../../packages/protocol/src/crypto-envelope.js';
 import {parseUniqueJson} from '../../../packages/protocol/src/strict-json.js';
 import canonicalize from 'canonicalize';
+import {verifyUploadedPackage} from './package-verifier.js';
 import {readBoundedBody} from './bounded-body.js';
 
-export const MAX_PACKAGE_UPLOAD_BYTES = 1_048_576;
+// Temporary local-beta admission cap: larger shared-core CPU probes exceed 10 ms.
+// The signed package format/native offline verifier retains its 1 MiB bound.
+export const MAX_PACKAGE_UPLOAD_BYTES = 8_192;
 const MAX_ENROLLMENT_BODY_BYTES = 2_048;
 const MAX_ADMIN_INVITE_BODY_BYTES = 1_024;
 
@@ -231,19 +234,16 @@ export const handlePackageUpload = async (request: Request, store = globalPublis
   if (!publisher) return problem(401, 'UNAUTHORIZED');
 
   try {
+    if (request.headers.get('Content-Type') !== 'application/vnd.smallframe.package') return problem(415, 'UNSUPPORTED_MEDIA_TYPE');
     const body = await readBoundedBody(request, MAX_PACKAGE_UPLOAD_BYTES);
     if (body.kind === 'too-large') return problem(413, 'PACKAGE_SIZE_LIMIT');
     if (body.kind !== 'ok') return problem(400, 'PACKAGE_UPLOAD_INVALID');
     const bytes = body.body;
     if (bytes.byteLength < 100) return problem(400, 'PACKAGE_SIZE_INVALID');
 
-    const digest = await crypto.subtle.digest('SHA-256', bytes);
-    const artifactDigest = encodeBase64Url(new Uint8Array(digest));
-    // Local prototype: a native packer supplies the logical manifest digest.
-    // The controller independently verifies the signed canonical ZIP on open.
     const declaredDigest = request.headers.get('X-Smallframe-Package-Digest');
     if (declaredDigest !== null && !canonicalDigest(declaredDigest)) return problem(400, 'PACKAGE_DIGEST_INVALID');
-    const packageDigest = declaredDigest ?? artifactDigest;
+    const {packageDigest, artifactDigest} = verifyUploadedPackage(bytes, declaredDigest ?? '', publisher.publisherKeyId);
 
     const existing = store.packages.get(packageDigest);
     if (existing) {
