@@ -218,6 +218,7 @@ describe('local publishing prototype and capability-scoped package retrieval', (
         const upstream = await fetch(`${apiOrigin}/v1/packages`, {method: 'POST', body: bytes,
           headers: {Origin: CONTROLLER_ORIGIN, 'Content-Type': 'application/vnd.smallframe.package',
             Authorization: String(request.headers.authorization),
+            'Idempotency-Key': String(request.headers['idempotency-key']),
             'X-Smallframe-Package-Digest': String(request.headers['x-smallframe-package-digest'])}});
         const confirmation = await upstream.json() as Record<string, unknown>;
         if (!dropUpload && unexpectedUploadField) { confirmation.unexpected = true; unexpectedUploadField = false; }
@@ -428,10 +429,12 @@ describe('local publishing prototype and capability-scoped package retrieval', (
     const packageBytes = new Uint8Array(await readFile(archivePath));
     const expectedPkgDigest = String(packed.packageDigest);
 
+    const packageOperation = randomBytes(16).toString('base64url');
     const pkgUploadRes = await fetch(`${apiOrigin}/v1/packages`, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${apiTokenBase64Url}`,
+        'Idempotency-Key': packageOperation,
         'Content-Type': 'application/vnd.smallframe.package',
         Origin: CONTROLLER_ORIGIN
       },
@@ -440,6 +443,20 @@ describe('local publishing prototype and capability-scoped package retrieval', (
     expect(pkgUploadRes.status).toBe(201);
     const pkgUploadData = (await pkgUploadRes.json()) as {ok: boolean; packageDigest: string};
     expect(pkgUploadData.packageDigest).toBe(expectedPkgDigest);
+    const uploadReplay = (operation: string | null, declared = false) => {
+      const headers = new Headers({Authorization: `Bearer ${apiTokenBase64Url}`,
+        'Content-Type': 'application/vnd.smallframe.package'});
+      if (operation !== null) headers.set('Idempotency-Key', operation);
+      if (declared) headers.set('X-Smallframe-Package-Digest', expectedPkgDigest);
+      return fetch(`${apiOrigin}/v1/packages`, {method: 'POST', headers, body: packageBytes});
+    };
+    expect((await uploadReplay(packageOperation)).status).toBe(200);
+    const changedHeader = await uploadReplay(packageOperation, true);
+    expect(changedHeader.status).toBe(409);
+    expect((await changedHeader.json() as {title: string}).title).toBe('IDEMPOTENCY_MISMATCH');
+    for (const invalid of [null, 'short', `${packageOperation}=`, randomBytes(32).toString('base64url')]) {
+      expect((await uploadReplay(invalid)).status).toBe(400);
+    }
 
     const limitSource = join(packageStore, 'limit-source');
     await cp(join(ROOT, 'examples/decision-board/package'), limitSource, {recursive: true});
@@ -450,8 +467,10 @@ describe('local publishing prototype and capability-scoped package retrieval', (
     await native('pack', limitSource, '--output', limitArchive);
     const limitBytes = await readFile(limitArchive);
     expect(limitBytes.byteLength).toBe(8_192);
+    const limitOperation = randomBytes(16).toString('base64url');
     const sendLimit = (body: Uint8Array) => fetch(`${apiOrigin}/v1/packages`, {method: 'POST', body,
       headers: {Origin: CONTROLLER_ORIGIN, Authorization: `Bearer ${apiTokenBase64Url}`,
+        'Idempotency-Key': limitOperation,
         'Content-Type': 'application/vnd.smallframe.package'}});
     expect((await sendLimit(limitBytes)).status).toBe(201);
     expect((await sendLimit(new Uint8Array([...limitBytes, 0]))).status).toBe(413);

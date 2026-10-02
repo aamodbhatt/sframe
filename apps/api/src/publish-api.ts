@@ -11,6 +11,7 @@ import {parseUniqueJson} from '../../../packages/protocol/src/strict-json.js';
 import canonicalize from 'canonicalize';
 import {verifyUploadedPackage} from './package-verifier.js';
 import {readBoundedBody} from './bounded-body.js';
+import {PublisherStorageError, type DurablePublisherStorage} from './durable-publisher-storage.js';
 
 // Temporary local-beta admission cap: larger shared-core CPU probes exceed 10 ms.
 // The signed package format/native offline verifier retains its 1 MiB bound.
@@ -53,6 +54,7 @@ export type StoredRoomRecord = {
 };
 
 export type PublishStore = {
+  durable?: DurablePublisherStorage;
   invites: Map<string, StoredInvite>;
   publishers: Map<string, StoredPublisher>; // key: tokenHash
   publishersByKeyId: Map<string, StoredPublisher>; // key: publisherKeyId
@@ -70,6 +72,12 @@ export const globalPublishStore: PublishStore = {
   rooms: new Map(),
   operations: new Map()
 };
+
+const storedPackage = (store: PublishStore, digest: string): Promise<StoredPackageRecord | null | undefined> =>
+  store.durable ? store.durable.package(digest) : Promise.resolve(store.packages.get(digest));
+
+const savedResponse = (body: string, status = 200): Response =>
+  new Response(body, {status, headers: {'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store'}});
 
 const jsonResponse = (data: unknown, status = 200): Response =>
   new Response(JSON.stringify(data), {
@@ -104,11 +112,10 @@ export const handleAdminCreateInvite = async (request: Request, store = globalPu
     const now = Date.now();
     const expiresAt = now + duration;
 
-    store.invites.set(codeHash, {
-      codeHash,
-      createdAt: now,
-      expiresAt
-    });
+    const record = {codeHash, createdAt: now, expiresAt};
+    if (store.durable) {
+      if (!await store.durable.createInvite(record)) return problem(409, 'INVITE_CODE_ALREADY_EXISTS');
+    } else store.invites.set(codeHash, record);
 
     return jsonResponse({ok: true, codeHash, expiresAt}, 201);
   } catch {
@@ -145,6 +152,13 @@ export const handleEnrollment = async (request: Request, store = globalPublishSt
 
     // Check existing operation for idempotency
     const requestDigest = encodeBase64Url(new Uint8Array(await crypto.subtle.digest('SHA-256', bounded.body)));
+    if (store.durable) {
+      const replay = await store.durable.replayEnrollment(record, requestDigest);
+      if (replay) return savedResponse(replay);
+      await verifyPublisherEnrollment(jcsBytes, signature, {now: Date.now()});
+      const result = await store.durable.enroll(record, requestDigest);
+      return savedResponse(result.body, result.created ? 201 : 200);
+    }
     const operationKey = `enroll:${record.publisherKeyId}:${record.operationId}`;
     const existingOp = store.operations.get(operationKey);
     if (existingOp) {
@@ -192,6 +206,8 @@ export const handleEnrollment = async (request: Request, store = globalPublishSt
 
     return jsonResponse(responseData, 201);
   } catch (err) {
+    if (err instanceof PublisherStorageError) return problem(err.status, err.code);
+    if (store.durable) return problem(400, 'ENROLLMENT_FAILED');
     const msg = err instanceof Error ? err.message : 'ENROLLMENT_FAILED';
     return problem(400, msg);
   }
@@ -226,7 +242,7 @@ export const authenticatePublisher = async (
   const hash = await crypto.subtle.digest('SHA-256', tokenBytes);
   const tokenHash = encodeBase64Url(new Uint8Array(hash));
 
-  return store.publishers.get(tokenHash) ?? null;
+  return store.durable ? store.durable.publisher(tokenHash) : store.publishers.get(tokenHash) ?? null;
 };
 
 export const handlePackageUpload = async (request: Request, store = globalPublishStore): Promise<Response> => {
@@ -245,6 +261,15 @@ export const handlePackageUpload = async (request: Request, store = globalPublis
     if (declaredDigest !== null && !canonicalDigest(declaredDigest)) return problem(400, 'PACKAGE_DIGEST_INVALID');
     const {packageDigest, artifactDigest} = verifyUploadedPackage(bytes, declaredDigest ?? '', publisher.publisherKeyId);
 
+    if (store.durable) {
+      const operationId = request.headers.get('Idempotency-Key');
+      if (!canonicalBytes(operationId, 16)) return problem(400, 'OPERATION_ID_INVALID');
+      const requestDigest = encodeBase64Url(new Uint8Array(await crypto.subtle.digest('SHA-256',
+        new TextEncoder().encode(JSON.stringify({contentType: 'application/vnd.smallframe.package', declaredDigest, artifactDigest})))));
+      const result = await store.durable.upload({packageDigest, artifactDigest, publisherKeyId: publisher.publisherKeyId,
+        byteLength: bytes.byteLength, bytes, createdAt: Date.now()}, operationId, requestDigest);
+      return savedResponse(result.body, result.created ? 201 : 200);
+    }
     const existing = store.packages.get(packageDigest);
     if (existing) {
       if (existing.publisherKeyId !== publisher.publisherKeyId || existing.artifactDigest !== artifactDigest) {
@@ -277,7 +302,8 @@ export const handlePackageUpload = async (request: Request, store = globalPublis
       publisherKeyId: publisher.publisherKeyId,
       byteLength: bytes.byteLength
     }, 201);
-  } catch {
+  } catch (error) {
+    if (error instanceof PublisherStorageError) return problem(error.status, error.code);
     return problem(400, 'PACKAGE_UPLOAD_INVALID');
   }
 };
@@ -288,8 +314,13 @@ const canonicalDigest = (value: unknown): value is string => {
 };
 
 export const handleGetPackage = async (packageDigest: string, store = globalPublishStore): Promise<Response> => {
-  const record = store.packages.get(packageDigest);
+  let record: StoredPackageRecord | null | undefined;
+  try { record = store.durable ? await store.durable.package(packageDigest) : store.packages.get(packageDigest); } catch { return problem(409, 'STORED_PACKAGE_INVALID'); }
   if (!record) return problem(404, 'PACKAGE_NOT_FOUND');
+  return servePackageSnapshot(record, packageDigest);
+};
+
+const servePackageSnapshot = async (record: StoredPackageRecord, packageDigest: string): Promise<Response> => {
   const {packageDigest: logicalDigest, artifactDigest, publisherKeyId, byteLength, bytes} = record;
   if (!canonicalDigest(logicalDigest) || !canonicalDigest(artifactDigest) || logicalDigest !== packageDigest
     || !(bytes instanceof Uint8Array) || !Number.isSafeInteger(byteLength) || bytes.byteLength !== byteLength
@@ -318,8 +349,11 @@ export const handleGetPackage = async (packageDigest: string, store = globalPubl
 export const handlePublisherGetPackage = async (request: Request, packageDigest: string, store = globalPublishStore): Promise<Response> => {
   const publisher = await authenticatePublisher(request, store);
   if (!publisher) return problem(401, 'UNAUTHORIZED');
-  if (store.packages.get(packageDigest)?.publisherKeyId !== publisher.publisherKeyId) return problem(404, 'PACKAGE_NOT_FOUND');
-  return handleGetPackage(packageDigest, store);
+  let record: StoredPackageRecord | null | undefined;
+  try { record = store.durable ? await store.durable.package(packageDigest) : store.packages.get(packageDigest); }
+  catch { return problem(409, 'STORED_PACKAGE_INVALID'); }
+  if (!record || record.publisherKeyId !== publisher.publisherKeyId) return problem(404, 'PACKAGE_NOT_FOUND');
+  return servePackageSnapshot(record, packageDigest);
 };
 
 type RoomCreationBody = {
@@ -401,8 +435,8 @@ export const handleRoomCreationSaga = async (
       });
     }
 
-    const storedPackage = store.packages.get(rawBody.packageDigest);
-    if (!storedPackage || storedPackage.publisherKeyId !== publisher.publisherKeyId) return problem(404, 'PACKAGE_NOT_FOUND');
+    const packageRecord = await storedPackage(store, rawBody.packageDigest);
+    if (!packageRecord || packageRecord.publisherKeyId !== publisher.publisherKeyId) return problem(404, 'PACKAGE_NOT_FOUND');
     if (!(await handleGetPackage(rawBody.packageDigest, store)).ok) return problem(409, 'STORED_PACKAGE_INVALID');
 
     const {viewer: viewerDesc, editor: editorDesc} = await verifyRoomCreationContext(rawBody, publisher);

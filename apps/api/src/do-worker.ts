@@ -3,7 +3,7 @@ import {ROOM_ID_RE, decodeBase64Url, decodeFixed32} from './do-crypto.js';
 import {RoomDurableObject, type RoomEnvironment} from './do-room.js';
 import {readApiRuntimeConfig, secureApiResponse} from './runtime-config.js';
 import {handleGetPackage} from './publish-api.js';
-import {handlePublishRoute} from './publish-router.js';
+import {handlePublishRoute, localPublishStore} from './publish-router.js';
 
 type WorkerEnvironment = RoomEnvironment & {
   ROOMS: DurableObjectNamespace;
@@ -78,7 +78,7 @@ const worker = {
       if (!metadataResponse.ok) return respond(metadataResponse);
       const metadata = await metadataResponse.json() as {packageDigest?: unknown};
       if (metadata.packageDigest !== digest) return respond(problem(409, 'ROOM_PACKAGE_CONTEXT_INVALID'));
-      return respond(await handleGetPackage(digest));
+      return respond(await handleGetPackage(digest, env.ENVIRONMENT === 'local' ? localPublishStore(env) : undefined));
     }
 
     const match = PUBLIC_ROOM_ROUTE.exec(url.pathname);
