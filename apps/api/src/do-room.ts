@@ -159,14 +159,21 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
       ) STRICT
     `).toArray();
     this.ctx.storage.sql.exec('CREATE INDEX IF NOT EXISTS event_tickets_expiry ON event_tickets(expires_at_ms)').toArray();
+    this.ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS room_tombstones (singleton INTEGER PRIMARY KEY CHECK(singleton=1), room_id TEXT NOT NULL UNIQUE, terminal_kind TEXT NOT NULL CHECK(terminal_kind IN ('EXPIRED','REVOKED')), terminal_at_ms INTEGER NOT NULL) STRICT`).toArray();
+    this.ctx.blockConcurrencyWhile(() => this.repairLifetimeAlarm());
   }
 
   override async fetch(request: Request): Promise<Response> {
+    await this.repairLifetimeAlarm();
     const response = await this.routeRequest(request);
     return this.withControllerCors(request, response);
   }
 
   private async dispatchPhase0(url: URL, request: Request): Promise<Response | null> {
+    const maintenance = /^\/__phase0\/rooms\/([A-Za-z0-9_-]{22})\/expiry-maintenance$/u.exec(url.pathname);
+    if (maintenance?.[1] && this.env.ENVIRONMENT === 'local' && request.method === 'POST') {
+      return new Response(JSON.stringify(await this.deliverExpiryAlarm()), {headers: jsonHeaders});
+    }
     const publisherMatch = /^\/__publisher\/rooms\/([A-Za-z0-9_-]{22})\/init-envelope$/u.exec(url.pathname);
     if (publisherMatch?.[1]) return this.initializeEncryptedForLocalTest(publisherMatch[1], request, true);
     const envelopeMatch = /^\/__phase0\/rooms\/([A-Za-z0-9_-]{22})\/init-envelope$/u.exec(url.pathname);
@@ -178,7 +185,7 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
     const statusRoomId = statusMatch?.[1];
     if (statusRoomId && ROOM_ID_RE.test(statusRoomId) && request.method === 'GET' && this.env.ENVIRONMENT === 'local') {
       const room = this.loadRoom(statusRoomId);
-      if (!room) return problem(404, 'NOT_FOUND');
+      if (!room && !this.hasTombstone(statusRoomId)) return problem(404, 'NOT_FOUND');
       return new Response(JSON.stringify({waiters: this.waiters.size, sockets: this.ctx.getWebSockets().length}), {headers: jsonHeaders});
     }
     return null;
@@ -217,25 +224,30 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
       const initial = {room_id: roomId, state_epoch: 0, revision: 0, envelope_digest: zero} as RoomRow;
       const verified = await this.verifyWireEnvelope(envelope, initial);
       if (!verified.ok) return problem(verified.status, verified.code);
-      const created = this.ctx.storage.transactionSync(() => {
-        const current = this.loadRoom(roomId);
-        const receipt = this.ctx.storage.sql.exec<{operation_id: string; request_digest: string; publisher_key_id: string; genesis_digest: string; configuration_digest: string}>('SELECT * FROM creation_receipts WHERE singleton=1').toArray()[0];
-        if (current || receipt) return current && binding && receipt
-          && receipt.operation_id === binding.operationId && receipt.request_digest === binding.requestDigest
-          && receipt.publisher_key_id === binding.publisherKeyId && receipt.genesis_digest === verified.envelopeDigest
-          && receipt.configuration_digest === configurationDigest ? 'existing' : 'conflict';
-        this.ctx.storage.sql.exec(`INSERT INTO room_state (
-          singleton, room_id, viewer_cap_hash, editor_cap_hash, expires_at_ms,
-          state_epoch, revision, envelope_digest, ciphertext, etag, recovery_status,
-          previous_envelope_digest, writer_public_key, writer_signature, envelope_salt, aad_json
-        ) VALUES (1, ?, ?, ?, ?, 0, 1, ?, ?, ?, 'ACTIVE', ?, ?, ?, ?, ?)`,
-        roomId, exactArrayBuffer(viewer), exactArrayBuffer(editor), body.expiresAtMs,
-        verified.envelopeDigest, exactArrayBuffer(verified.cipherBytes), verified.etag,
-        zero, exactArrayBuffer(verified.writerPubBytes), exactArrayBuffer(verified.writerSigBytes),
-        envelope.envelopeSalt, JSON.stringify(envelope.aad)).toArray();
-        if (binding) this.ctx.storage.sql.exec('INSERT INTO creation_receipts VALUES(1,?,?,?,?,?)',
-          binding.operationId, binding.requestDigest, binding.publisherKeyId, verified.envelopeDigest, configurationDigest).toArray();
-        return 'created';
+      const created = await this.ctx.storage.transaction(async () => {
+        const outcome = this.ctx.storage.transactionSync(() => {
+          this.assertNotTombstoned(roomId);
+          const current = this.loadRoom(roomId);
+          const receipt = this.ctx.storage.sql.exec<{operation_id: string; request_digest: string; publisher_key_id: string; genesis_digest: string; configuration_digest: string}>('SELECT * FROM creation_receipts WHERE singleton=1').toArray()[0];
+          if (current || receipt) return current && binding && receipt
+            && receipt.operation_id === binding.operationId && receipt.request_digest === binding.requestDigest
+            && receipt.publisher_key_id === binding.publisherKeyId && receipt.genesis_digest === verified.envelopeDigest
+            && receipt.configuration_digest === configurationDigest ? 'existing' : 'conflict';
+          this.ctx.storage.sql.exec(`INSERT INTO room_state (
+            singleton, room_id, viewer_cap_hash, editor_cap_hash, expires_at_ms,
+            state_epoch, revision, envelope_digest, ciphertext, etag, recovery_status,
+            previous_envelope_digest, writer_public_key, writer_signature, envelope_salt, aad_json
+          ) VALUES (1, ?, ?, ?, ?, 0, 1, ?, ?, ?, 'ACTIVE', ?, ?, ?, ?, ?)`,
+          roomId, exactArrayBuffer(viewer), exactArrayBuffer(editor), body.expiresAtMs,
+          verified.envelopeDigest, exactArrayBuffer(verified.cipherBytes), verified.etag,
+          zero, exactArrayBuffer(verified.writerPubBytes), exactArrayBuffer(verified.writerSigBytes),
+          envelope.envelopeSalt, JSON.stringify(envelope.aad)).toArray();
+          if (binding) this.ctx.storage.sql.exec('INSERT INTO creation_receipts VALUES(1,?,?,?,?,?)',
+            binding.operationId, binding.requestDigest, binding.publisherKeyId, verified.envelopeDigest, configurationDigest).toArray();
+          return 'created';
+        });
+        if (outcome !== 'conflict') await this.ctx.storage.setAlarm(body.expiresAtMs);
+        return outcome;
       });
       return created === 'conflict' ? problem(409, 'INITIALIZATION_CONFLICT') : new Response(null, {status: created === 'created' ? 201 : 200});
     } catch {
@@ -274,7 +286,7 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
     }
 
     const room = this.loadRoom(route.roomId);
-    if (!room) return problem(404, 'NOT_FOUND');
+    if (!room) return this.missingRoom(route.roomId);
 
     return this.dispatchAction(route.action, request, room);
   }
@@ -299,6 +311,7 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
 
   private async rotateLinks(request: Request, room: RoomRow): Promise<Response> {
     if (!await this.authorize(request, room, true)) return problem(403, 'ROOM_AUTH_INVALID');
+    if (room.aad_json || this.env.ENVIRONMENT !== 'local') return problem(503, 'PUBLISHER_LIFECYCLE_NOT_IMPLEMENTED');
     let body: any;
     try {
       body = await request.json();
@@ -324,12 +337,13 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
 
   private async revokeRoom(request: Request, room: RoomRow): Promise<Response> {
     if (!await this.authorize(request, room, true)) return problem(403, 'ROOM_AUTH_INVALID');
+    if (room.aad_json || this.env.ENVIRONMENT !== 'local') return problem(503, 'PUBLISHER_LIFECYCLE_NOT_IMPLEMENTED');
     const now = Date.now();
-    this.ctx.storage.sql.exec(
-      `UPDATE room_state SET revoked_at_ms = ? WHERE singleton = 1 AND room_id = ?`,
-      now,
-      room.room_id
-    ).toArray();
+    await this.ctx.storage.transaction(async () => {
+      this.ctx.storage.sql.exec(
+        `UPDATE room_state SET revoked_at_ms = ? WHERE singleton = 1 AND room_id = ?`, now, room.room_id).toArray();
+      await this.ctx.storage.setAlarm(now);
+    });
 
     for (const socket of this.ctx.getWebSockets()) {
       try { socket.close(1008, 'room revoked'); } catch {}
@@ -433,34 +447,39 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
     const etag = this.etag(0, 1, digest);
 
     try {
-      const result = this.ctx.storage.transactionSync(() => {
-        const current = this.loadRoom(roomId);
-        if (!current) {
-          this.ctx.storage.sql.exec(
-            `INSERT INTO room_state (
-              singleton, room_id, viewer_cap_hash, editor_cap_hash, expires_at_ms, revoked_at_ms,
-              state_epoch, revision, envelope_digest, ciphertext, etag
-            ) VALUES (1, ?, ?, ?, ?, NULL, 0, 1, ?, ?, ?)`,
-            roomId,
-            exactArrayBuffer(viewerHash),
-            exactArrayBuffer(editorHash),
-            expiresAtMs,
-            digest,
-            exactArrayBuffer(ciphertext),
-            etag,
-          ).toArray();
-          return 'created';
-        }
-        const identical = current.expires_at_ms === expiresAtMs
-          && current.state_epoch === 0
-          && current.revision === 1
-          && current.envelope_digest === digest
-          && current.etag === etag
-          && constantTimeEqual32(bytesFromSql(current.viewer_cap_hash), viewerHash)
-          && constantTimeEqual32(bytesFromSql(current.editor_cap_hash), editorHash)
-          && encodeBase64Url(bytesFromSql(current.ciphertext)) === record.ciphertext;
-        if (!identical) throw new Error('INITIALIZATION_CONFLICT');
-        return 'existing';
+      const result = await this.ctx.storage.transaction(async () => {
+        const outcome = this.ctx.storage.transactionSync(() => {
+          this.assertNotTombstoned(roomId);
+          const current = this.loadRoom(roomId);
+          if (!current) {
+            this.ctx.storage.sql.exec(
+              `INSERT INTO room_state (
+                singleton, room_id, viewer_cap_hash, editor_cap_hash, expires_at_ms, revoked_at_ms,
+                state_epoch, revision, envelope_digest, ciphertext, etag
+              ) VALUES (1, ?, ?, ?, ?, NULL, 0, 1, ?, ?, ?)`,
+              roomId,
+              exactArrayBuffer(viewerHash),
+              exactArrayBuffer(editorHash),
+              expiresAtMs,
+              digest,
+              exactArrayBuffer(ciphertext),
+              etag,
+            ).toArray();
+            return 'created';
+          }
+          const identical = current.expires_at_ms === expiresAtMs
+            && current.state_epoch === 0
+            && current.revision === 1
+            && current.envelope_digest === digest
+            && current.etag === etag
+            && constantTimeEqual32(bytesFromSql(current.viewer_cap_hash), viewerHash)
+            && constantTimeEqual32(bytesFromSql(current.editor_cap_hash), editorHash)
+            && encodeBase64Url(bytesFromSql(current.ciphertext)) === record.ciphertext;
+          if (!identical) throw new Error('INITIALIZATION_CONFLICT');
+          return 'existing';
+        });
+        await this.ctx.storage.setAlarm(expiresAtMs);
+        return outcome;
       });
       return new Response(JSON.stringify({status: result, etag}), {status: result === 'created' ? 201 : 200, headers: jsonHeaders});
     } catch (error) {
@@ -493,16 +512,20 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
   }
 
   override async alarm(): Promise<void> {
-    await this.deliverExpiryAlarm();
+    try { await this.deliverExpiryAlarm(); } catch (error) {
+      await this.ctx.storage.setAlarm(Date.now() + 60_000);
+      throw error;
+    }
   }
 
   private async deliverExpiryAlarm(): Promise<{closed: number; nextExpiry: number | null}> {
     const now = Date.now();
-    let nextExpiry: number | null = null;
+    const cleared = this.clearTerminalRoom(now);
+    let nextExpiry: number | null = this.lifetimeDeadline();
     let closed = 0;
     for (const socket of this.ctx.getWebSockets()) {
       const attachment = socket.deserializeAttachment() as SocketAttachment | null;
-      if (!attachment || attachment.version !== 1 || attachment.roomExpiresAt <= now) {
+      if (cleared || nextExpiry === null || !attachment || attachment.version !== 1 || attachment.roomExpiresAt <= now) {
         try {
           socket.close(1008, 'session ended');
           closed += 1;
@@ -515,6 +538,44 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
     }
     if (nextExpiry !== null) await this.ctx.storage.setAlarm(nextExpiry);
     return {closed, nextExpiry};
+  }
+
+  private hasTombstone(roomId: string): boolean {
+    return this.ctx.storage.sql.exec('SELECT 1 FROM room_tombstones WHERE singleton=1 AND room_id=?', roomId).toArray().length === 1;
+  }
+  private assertNotTombstoned(roomId: string): void {
+    if (this.hasTombstone(roomId)) throw new Error('INITIALIZATION_CONFLICT');
+  }
+  private missingRoom(roomId: string): Response {
+    return this.hasTombstone(roomId) ? problem(403, 'ROOM_AUTH_INVALID') : problem(404, 'NOT_FOUND');
+  }
+  private lifetimeDeadline(): number | null {
+    const row = this.ctx.storage.sql.exec<{expires_at_ms: number; revoked_at_ms: number | null}>(
+      'SELECT expires_at_ms,revoked_at_ms FROM room_state WHERE singleton=1').toArray()[0];
+    return row ? Math.min(row.expires_at_ms, row.revoked_at_ms ?? row.expires_at_ms) : null;
+  }
+  private async repairLifetimeAlarm(): Promise<void> {
+    const deadline = this.lifetimeDeadline();
+    if (deadline === null) return;
+    const current = await this.ctx.storage.getAlarm();
+    if (current === null || current > deadline) await this.ctx.storage.setAlarm(deadline);
+  }
+  private clearTerminalRoom(now: number): boolean {
+    const cleared = this.ctx.storage.transactionSync(() => {
+      const row = this.ctx.storage.sql.exec<{room_id: string; expires_at_ms: number; revoked_at_ms: number | null}>(
+        'SELECT room_id,expires_at_ms,revoked_at_ms FROM room_state WHERE singleton=1').toArray()[0];
+      if (!row || row.revoked_at_ms === null && row.expires_at_ms > now) return false;
+      this.ctx.storage.sql.exec(`INSERT INTO room_tombstones VALUES(1,?,?,?) ON CONFLICT DO NOTHING`,
+        row.room_id, row.revoked_at_ms === null ? 'EXPIRED' : 'REVOKED', Math.min(row.expires_at_ms, row.revoked_at_ms ?? row.expires_at_ms)).toArray();
+      this.ctx.storage.sql.exec('DELETE FROM event_tickets').toArray();
+      this.ctx.storage.sql.exec('DELETE FROM recovery_transition_log').toArray();
+      this.ctx.storage.sql.exec('DELETE FROM room_state WHERE singleton=1').toArray();
+      return true;
+    });
+    if (cleared) {
+      for (const waiter of this.waiters.values()) waiter.finish(problem(403, 'ROOM_AUTH_INVALID'));
+    }
+    return cleared;
   }
 
   private loadRoom(roomId: string): RoomRow | null {

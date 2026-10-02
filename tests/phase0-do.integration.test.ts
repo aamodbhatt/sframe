@@ -1,4 +1,4 @@
-import {createHash} from 'node:crypto';
+import {createHash, randomBytes} from 'node:crypto';
 import {once} from 'node:events';
 import {mkdir, mkdtemp, rm} from 'node:fs/promises';
 import {join, resolve} from 'node:path';
@@ -369,6 +369,61 @@ describe('SQLite Durable Object Phase 0 spike', () => {
     }
     expect(sockets).toBe(0);
     socket.terminate();
+  });
+
+  it('expires an unopened room, clears state-bearing rows and prevents identifier resurrection', async () => {
+    const room = base64url(randomBytes(16)); const viewer = base64url(randomBytes(32)); const editor = base64url(randomBytes(32));
+    const expiresAt = Date.now() + 1_000;
+    expect((await initializeRoom(room, viewer, editor, randomBytes(32), expiresAt)).status).toBe(201);
+    const storage = await miniflare.unsafeGetDurableObjectStorage(WORKER_NAME, DO_CLASS, {name: room});
+    await storage.exec("INSERT INTO recovery_transition_log VALUES(1,?, ?,?)", 'opaque-test-record', 'opaque-test-signature', Date.now());
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, Math.max(0, expiresAt - Date.now() + 100)));
+    const inspect = () => storage.exec<{count: number}>('SELECT COUNT(*) AS count FROM room_state');
+    let rows = await inspect();
+    for (let attempt = 0; attempt < 40 && rows[0]?.count !== 0; attempt++) {
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 25)); rows = await inspect();
+    }
+    expect(rows).toEqual([{count: 0}]);
+    expect(await storage.exec('SELECT COUNT(*) AS count FROM recovery_transition_log')).toEqual([{count: 0}]);
+    expect(await storage.exec('SELECT COUNT(*) AS count FROM event_tickets')).toEqual([{count: 0}]);
+    expect(await storage.exec('SELECT terminal_kind FROM room_tombstones')).toEqual([{terminal_kind: 'EXPIRED'}]);
+    expect((await getState(room, viewer)).status).toBe(403);
+    expect((await initializeRoom(room, viewer, editor)).status).toBe(409);
+  });
+
+  it('rolls back a failed terminal deletion and completes maintenance after the storage fault is removed', async () => {
+    const room = base64url(randomBytes(16)); const viewer = base64url(randomBytes(32)); const editor = base64url(randomBytes(32));
+    expect((await initializeRoom(room, viewer, editor)).status).toBe(201);
+    const storage = await miniflare.unsafeGetDurableObjectStorage(WORKER_NAME, DO_CLASS, {name: room});
+    await storage.exec("CREATE TRIGGER terminal_delete_fault BEFORE DELETE ON room_state BEGIN SELECT RAISE(ABORT,'TEST_TERMINAL_DELETE_FAULT'); END");
+    await storage.exec('UPDATE room_state SET expires_at_ms=?', Date.now() - 1);
+    const maintenance = () => fetch(`${apiOrigin}/__phase0/rooms/${room}/expiry-maintenance`, {method: 'POST'});
+    expect((await maintenance()).status).toBe(500);
+    expect(await storage.exec('SELECT COUNT(*) AS count FROM room_state')).toEqual([{count: 1}]);
+    expect(await storage.exec('SELECT COUNT(*) AS count FROM room_tombstones')).toEqual([{count: 0}]);
+    await storage.exec('DROP TRIGGER terminal_delete_fault');
+    expect((await maintenance()).status).toBe(200);
+    expect(await storage.exec('SELECT COUNT(*) AS count FROM room_state')).toEqual([{count: 0}]);
+    expect(await storage.exec('SELECT terminal_kind FROM room_tombstones')).toEqual([{terminal_kind: 'EXPIRED'}]);
+    expect((await getState(room, editor)).status).toBe(403);
+  });
+
+  it('commits local legacy revocation and removal scheduling together, then retains only a tombstone', async () => {
+    const room = base64url(randomBytes(16)); const viewer = base64url(randomBytes(32)); const editor = base64url(randomBytes(32));
+    expect((await initializeRoom(room, viewer, editor, randomBytes(32))).status).toBe(201);
+    const revoked = await fetch(`${apiOrigin}/v1/rooms/${room}/revoke`, {method: 'POST',
+      headers: {Origin: CONTROLLER_ORIGIN, Authorization: authorization(editor)}});
+    expect(revoked.status).toBe(200);
+    const storage = await miniflare.unsafeGetDurableObjectStorage(WORKER_NAME, DO_CLASS, {name: room});
+    let rows = await storage.exec<{count: number}>('SELECT COUNT(*) AS count FROM room_state');
+    for (let attempt = 0; attempt < 40 && rows[0]?.count !== 0; attempt++) {
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
+      rows = await storage.exec<{count: number}>('SELECT COUNT(*) AS count FROM room_state');
+    }
+    expect(rows).toEqual([{count: 0}]);
+    expect(await storage.exec('SELECT terminal_kind FROM room_tombstones')).toEqual([{terminal_kind: 'REVOKED'}]);
+    expect((await getState(room, viewer)).status).toBe(403);
+    expect((await initializeRoom(room, viewer, editor)).status).toBe(409);
   });
 
   it('holds only a current event request, wakes it on commit, and times out boundedly', async () => {

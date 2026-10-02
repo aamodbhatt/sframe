@@ -627,6 +627,14 @@ describe('local publishing prototype and capability-scoped package retrieval', (
       roomId, packageDigest: expectedPkgDigest, envelope: await encryptedState.json()});
     expect(restored.automergeBytes).toEqual(Uint8Array.of(1, 2, 3));
 
+    for (const action of ['rotate-links', 'revoke']) {
+      const denied = await fetch(`${apiOrigin}/v1/rooms/${roomId}/${action}`, {method: 'POST', body: '{}',
+        headers: {Origin: CONTROLLER_ORIGIN, Authorization: `SF-Cap ${encodeBase64Url(editorCap)}`, 'Content-Type': 'application/json'}});
+      expect(denied.status).toBe(503);
+      expect((await denied.json() as {title: string}).title).toBe('PUBLISHER_LIFECYCLE_NOT_IMPLEMENTED');
+    }
+    expect((await fetch(`${apiOrigin}/v1/rooms/${roomId}/state`, {headers: roomHeaders})).headers.get('ETag')).toBe(encryptedState.headers.get('ETag'));
+
     const next = await encryptSnapshot({roomKey, writerPrivateKey: writerPriv, roomId, appId: 'test.package',
       packageDigest: expectedPkgDigest, stateEpoch: 0, proposedRevision: 2,
       previousEnvelopeDigest: encodeBase64Url(genesis.envelopeDigest), automergeBytes: Uint8Array.of(1, 2, 3, 4)});

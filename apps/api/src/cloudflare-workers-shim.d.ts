@@ -11,6 +11,8 @@ declare module 'cloudflare:workers' {
 
   export interface DurableObjectStorage {
     sql: SqlStorage;
+    transaction<T>(closure: (transaction: DurableObjectStorage) => Promise<T>): Promise<T>;
+    getAlarm(): Promise<number | null>;
     transactionSync<T>(closure: () => T): T;
     setAlarm(scheduledTime: number | Date): Promise<void>;
   }
@@ -22,6 +24,7 @@ declare module 'cloudflare:workers' {
 
   export interface DurableObjectState {
     storage: DurableObjectStorage;
+    blockConcurrencyWhile<T>(callback: () => Promise<T>): Promise<T>;
     acceptWebSocket(socket: HibernatableWebSocket, tags?: string[]): void;
     getWebSockets(tag?: string): HibernatableWebSocket[];
   }
