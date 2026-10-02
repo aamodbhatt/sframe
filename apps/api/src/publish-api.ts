@@ -260,7 +260,8 @@ export const handlePackageUpload = async (request: Request, store = globalPublis
 
     const declaredDigest = request.headers.get('X-Smallframe-Package-Digest');
     if (declaredDigest !== null && !canonicalDigest(declaredDigest)) return problem(400, 'PACKAGE_DIGEST_INVALID');
-    const {packageDigest, artifactDigest} = verifyUploadedPackage(bytes, declaredDigest ?? '', publisher.publisherKeyId);
+    const inspected = verifyUploadedPackage(bytes, declaredDigest ?? '', publisher.publisherKeyId);
+    const {packageDigest, artifactDigest} = inspected;
 
     if (store.durable) {
       const operationId = request.headers.get('Idempotency-Key');
@@ -268,7 +269,7 @@ export const handlePackageUpload = async (request: Request, store = globalPublis
       const requestDigest = encodeBase64Url(new Uint8Array(await crypto.subtle.digest('SHA-256',
         new TextEncoder().encode(JSON.stringify({contentType: 'application/vnd.smallframe.package', declaredDigest, artifactDigest})))));
       const result = await store.durable.upload({packageDigest, artifactDigest, publisherKeyId: publisher.publisherKeyId,
-        byteLength: bytes.byteLength, bytes, createdAt: Date.now()}, operationId, requestDigest);
+        byteLength: bytes.byteLength, bytes, createdAt: Date.now()}, operationId, requestDigest, inspected);
       return savedResponse(result.body, result.created ? 201 : 200);
     }
     const existing = store.packages.get(packageDigest);

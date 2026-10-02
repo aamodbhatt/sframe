@@ -23,7 +23,7 @@ try {
   const wall = []; const cpu = [];
   for (let iteration = 0; iteration < 30; iteration++) {
     const before = process.cpuUsage(); const started = performance.now();
-    const result = JSON.parse(verifier.wasm_verify_package(bytes, '', ''));
+    const result = JSON.parse((server ? verifier.wasm_inspect_package : verifier.wasm_verify_package)(bytes, '', ''));
     wall.push(performance.now() - started);
     const used = process.cpuUsage(before); cpu.push((used.user + used.system) / 1_000);
     if (result.ok !== true) throw new Error('BENCHMARK_INPUT_INVALID');

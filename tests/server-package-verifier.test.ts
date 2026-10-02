@@ -1,12 +1,13 @@
 import {readFile} from 'node:fs/promises';
 import {resolve} from 'node:path';
 import {pathToFileURL} from 'node:url';
+import canonicalize from 'canonicalize';
 import {describe, expect, it} from 'vitest';
 
 const load = async (artifact: string) => {
   const verifier = await import(pathToFileURL(resolve(`${artifact}.js`)).href);
   verifier.initSync({module: await readFile(`${artifact}_bg.wasm`)});
-  return verifier as {wasm_verifier_self_test(): boolean; wasm_verify_package(bytes: Uint8Array, digest: string, publisher: string): string};
+  return verifier as {wasm_inspect_package(bytes: Uint8Array, digest: string, publisher: string): string; wasm_prepare_package(bytes: Uint8Array, digest: string, publisher: string): string; wasm_verifier_self_test(): boolean; wasm_verify_package(bytes: Uint8Array, digest: string, publisher: string): string};
 };
 
 describe('narrow server adapter agrees with the browser shared core', () => {
@@ -27,6 +28,11 @@ describe('narrow server adapter agrees with the browser shared core', () => {
           [accepted.packageDigest, 'sha256:wrong']]) {
           const actual = JSON.parse(server.wasm_verify_package(bytes, digest!, publisher!));
           expect(actual).toEqual(JSON.parse(browser.wasm_verify_package(bytes, digest!, publisher!)));
+          const inspected = JSON.parse(server.wasm_inspect_package(bytes, digest!, publisher!));
+          if (actual.ok) {
+            const prepared = JSON.parse(browser.wasm_prepare_package(bytes, digest!, publisher!));
+            expect(inspected).toEqual({...actual, manifestJson: canonicalize(prepared.manifest)});
+          } else expect(inspected).toEqual(actual);
         }
       }
     }

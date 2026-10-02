@@ -4,6 +4,7 @@
   "main": "src/do-worker.ts",
   "compatibility_date": "2026-07-30",
   "workers_dev": false,
+  "rules": [{"type": "Text", "globs": ["**/*.sql"], "fallthrough": true}],
   "vars": {
     "CONTROLLER_ORIGIN": "http://app.localhost:4173",
     "API_ORIGIN": "http://api.localhost:8787",

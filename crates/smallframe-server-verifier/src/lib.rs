@@ -66,11 +66,63 @@ pub fn wasm_verify_package(archive: &[u8], digest: &str, publisher: &str) -> Str
     }
 }
 
+// Public canonical manifest comes from the verified archive, never an independent
+// ZIP reader. The existing verification ABI remains unchanged.
+#[wasm_bindgen]
+pub fn wasm_inspect_package(archive: &[u8], digest: &str, publisher: &str) -> String {
+    let result = expected_digest(digest).and_then(|expected| {
+        verify_package_archive(
+            archive,
+            expected.as_ref(),
+            (!publisher.is_empty()).then_some(publisher),
+        )
+    });
+    match result {
+        Ok(package) => match String::from_utf8(package.canonical_files.manifest) {
+            Ok(manifest) => json!({"ok":true,
+                "packageDigest":Base64UrlUnpadded::encode_string(&package.package_digest),
+                "artifactDigest":Base64UrlUnpadded::encode_string(&package.artifact_digest),
+                "publisherKeyId":package.publisher_key_id,"manifestJson":manifest})
+            .to_string(),
+            Err(_) => {
+                json!({"ok":false,"error":{"code":ErrorCode::JsonInvalid.as_str()}}).to_string()
+            }
+        },
+        Err(error) => json!({"ok":false,"error":{"code":error.code().as_str()}}).to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     const ARCHIVE: &str =
         include_str!("../../../packages/protocol/vectors/canonical-package-v1.zip.b64");
+
+    #[test]
+    fn inspection_returns_only_the_exact_verified_canonical_manifest() {
+        let archive = Base64::decode_vec(ARCHIVE.trim()).expect("public vector");
+        let mut inspected: serde_json::Value =
+            serde_json::from_str(&wasm_inspect_package(&archive, "", "")).expect("inspection");
+        let manifest = inspected
+            .as_object_mut()
+            .expect("object")
+            .remove("manifestJson")
+            .expect("manifest")
+            .as_str()
+            .expect("string")
+            .to_owned();
+        assert_eq!(
+            canonical_json(&manifest).expect("canonical manifest"),
+            manifest
+        );
+        let package = verify_package_archive(&archive, None, None).expect("verified vector");
+        assert_eq!(manifest.as_bytes(), package.canonical_files.manifest);
+        assert_eq!(inspected.to_string(), wasm_verify_package(&archive, "", ""));
+        assert_eq!(
+            wasm_inspect_package(&archive, "short", ""),
+            wasm_verify_package(&archive, "short", "")
+        );
+    }
 
     #[test]
     fn adapter_binds_the_shared_public_vector_and_rejects_malformed_pins() {

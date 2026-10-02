@@ -518,7 +518,21 @@ describe('local publishing prototype and capability-scoped package retrieval', (
     await writeFile(limitWorker, `${originalWorker}\n/*${'x'.repeat(5_500 - Buffer.byteLength(originalWorker) - 5)}*/`);
     const limitArchive = join(packageStore, 'limit-package.zip');
     await native('pack', limitSource, '--output', limitArchive);
-    const limitBytes = await readFile(limitArchive);
+    const conflictingBytes = await readFile(limitArchive);
+    const conflict = await fetch(`${apiOrigin}/v1/packages`, {method: 'POST', body: conflictingBytes,
+      headers: {Origin: CONTROLLER_ORIGIN, Authorization: `Bearer ${apiTokenBase64Url}`,
+        'Idempotency-Key': randomBytes(16).toString('base64url'), 'Content-Type': 'application/vnd.smallframe.package'}});
+    expect(conflict.status).toBe(409);
+    expect((await conflict.json() as {title: string}).title).toBe('PACKAGE_VERSION_CONFLICT');
+    // The size-boundary fixture is a new version; preserve the exact byte limit
+    // and all original acceptance, overflow and replay assertions.
+    const limitManifestFile = join(limitSource, 'smallframe.json');
+    const limitManifest = JSON.parse(await readFile(limitManifestFile, 'utf8')) as {version: string};
+    limitManifest.version = '0.1.1';
+    await writeFile(limitManifestFile, JSON.stringify(limitManifest));
+    const acceptedLimitArchive = join(packageStore, 'limit-package-next-version.zip');
+    await native('pack', limitSource, '--output', acceptedLimitArchive);
+    const limitBytes = await readFile(acceptedLimitArchive);
     expect(limitBytes.byteLength).toBe(8_192);
     const limitOperation = randomBytes(16).toString('base64url');
     const sendLimit = (body: Uint8Array) => fetch(`${apiOrigin}/v1/packages`, {method: 'POST', body,
