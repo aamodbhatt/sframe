@@ -1,7 +1,7 @@
 import {createHash, randomBytes} from 'node:crypto';
 import {readFileSync} from 'node:fs';
 import {crc32} from 'node:zlib';
-import {wasm_verify_package} from '../target/phase1-wasm/smallframe_verifier.js';
+import {initSync, wasm_verify_package} from '../target/phase1-wasm/smallframe_verifier.js';
 import cases from '../packages/protocol/vectors/package-cases-v1.json';
 import {afterEach, describe, expect, it, vi} from 'vitest';
 import {handlePublishRoute} from '../apps/api/src/publish-router.js';
@@ -9,6 +9,8 @@ import {handleAdminCreateInvite, handleEnrollment, handlePackageUpload, MAX_PACK
   globalPublishStore, type PublishStore} from '../apps/api/src/publish-api.js';
 import {createSignedEnrollment, encodeBase64Url} from '../packages/protocol/src/index.js';
 import {utils} from '@noble/ed25519';
+
+initSync({module: readFileSync(new URL('../target/phase1-wasm/smallframe_verifier_bg.wasm', import.meta.url))});
 
 const validArchive = new Uint8Array(Buffer.from(readFileSync(new URL('../packages/protocol/vectors/canonical-package-v1.zip.b64', import.meta.url), 'utf8').trim(), 'base64'));
 const hash = (bytes: Uint8Array): string => createHash('sha256').update(bytes).digest('base64url');

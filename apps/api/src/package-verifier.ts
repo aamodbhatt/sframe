@@ -1,5 +1,5 @@
-import compiled from '../../../target/phase1-wasm/smallframe_verifier_bg.wasm';
-import {initSync, wasm_verifier_self_test, wasm_verify_package} from '../../../target/phase1-wasm/smallframe_verifier.js';
+import compiled from '../../../target/server-verifier-wasm/smallframe_server_verifier_bg.wasm';
+import {initSync, wasm_verifier_self_test, wasm_verify_package} from '../../../target/server-verifier-wasm/smallframe_server_verifier.js';
 import {parseUniqueJson} from '../../../packages/protocol/src/strict-json.js';
 
 initSync({module: compiled});

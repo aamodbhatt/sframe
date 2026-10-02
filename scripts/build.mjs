@@ -48,6 +48,17 @@ if (phase1Bindgen.status !== 0) process.exit(phase1Bindgen.status ?? 1);
 const phase1Wasm = readFileSync(join(phase1WasmOutput, 'smallframe_verifier_bg.wasm'));
 if (phase1Wasm.byteLength < 8 || phase1Wasm.byteLength > 2 * 1024 * 1024 || !phase1Wasm.subarray(0, 8).equals(Buffer.from([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]))) throw new Error('PHASE1_WASM_ARTIFACT_INVALID');
 const phase1WasmDigest = createHash('sha256').update(phase1Wasm).digest('hex');
+// A narrow server ABI reuses the exact package core, without exporting browser
+// state/CRDT functions. Its profile is independent of Candidate U's release build.
+const serverBuild = spawnSync('cargo', ['build', '--locked', '--profile', 'server-verifier', '--target', 'wasm32-unknown-unknown', '-p', 'smallframe-server-verifier'], {cwd: root, stdio: 'inherit', env: childEnv});
+if (serverBuild.status !== 0) process.exit(serverBuild.status ?? 1);
+const serverOutput = join(root, 'target', 'server-verifier-wasm');
+rmSync(serverOutput, {recursive: true, force: true});
+mkdirSync(serverOutput, {recursive: true});
+const serverBindgen = spawnSync(wasmBindgen, ['--target', 'web', '--no-typescript', '--out-dir', serverOutput, '--out-name', 'smallframe_server_verifier', join(root, 'target', 'wasm32-unknown-unknown', 'server-verifier', 'smallframe_server_verifier.wasm')], {cwd: root, stdio: 'inherit', env: childEnv});
+if (serverBindgen.status !== 0) process.exit(serverBindgen.status ?? 1);
+const serverWasm = readFileSync(join(serverOutput, 'smallframe_server_verifier_bg.wasm'));
+if (serverWasm.byteLength < 8 || serverWasm.byteLength > 2 * 1024 * 1024 || !serverWasm.subarray(0, 8).equals(Buffer.from([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]))) throw new Error('SERVER_VERIFIER_ARTIFACT_INVALID');
 // Public test template only. Each test publisher encrypts these exact shared
 // genesis bytes before its local relay initialization; recipients never recreate them.
 const genesisVerifier = await import(pathToFileURL(join(phase1WasmOutput, 'smallframe_verifier.js')).href);

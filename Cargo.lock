@@ -2340,6 +2340,16 @@ name = "smallframe-phase0-wasm"
 version = "0.1.0"
 
 [[package]]
+name = "smallframe-server-verifier"
+version = "0.1.0"
+dependencies = [
+ "base64ct",
+ "serde_json",
+ "smallframe-core",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "smallvec"
 version = "1.15.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

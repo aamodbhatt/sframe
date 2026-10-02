@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/smallframe-core", "crates/smallframe-cli", "crates/smallframe-phase0-wasm"]
+members = ["crates/smallframe-core", "crates/smallframe-cli", "crates/smallframe-phase0-wasm", "crates/smallframe-server-verifier"]
 
 [profile.release.package.smallframe-phase0-wasm]
 opt-level = "s"
@@ -12,3 +12,8 @@ lto = true
 opt-level = "z"
 panic = "abort"
 strip = true
+
+# Server package validation prioritizes execution cost; browser builds keep release.
+[profile.server-verifier]
+inherits = "release"
+opt-level = "s"
