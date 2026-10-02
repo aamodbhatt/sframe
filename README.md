@@ -111,6 +111,10 @@ Room expiry now registers an alarm in the same local DO storage transaction as i
 
 The room-saga checkpoint [`8ca015a`](https://github.com/aamodbhatt/sframe/commit/8ca015af03426163439e54d3adf0835b4c06ca17) passed all nine local gates (296 TypeScript, 48 Rust, 213 browser) and [CI 36983731939](https://github.com/aamodbhatt/sframe/actions/runs/36983731939). The prior Firefox navigation failures remain unexplained.
 
+The CLI holds an exclusive OS file lock for the lifetime of each identity/journal context and returns `LOCAL_STORE_BUSY` before reading secrets or sending requests if another process owns the store. The empty lock file stays in place across commands; normal teardown explicitly unlocks, and process termination releases the kernel lock. Tests cover independent processes, contention, termination and symlink rejection. This prevents cooperating CLI processes from concurrently replacing journal files; the unified binary vault, optimistic generation, aggregate limit and per-record wrapped keys in §8.1 remain unfinished.
+
+A Firefox CI failure on the expiry checkpoint exposed a sync-status race: a late WebSocket open event could overwrite an earlier relay-validation failure with “Synced.” A deterministic delayed-open regression reproduces it. Transport opening now leaves replica status unchanged; verified reads and committed writes determine sync status. The earlier Firefox initial-navigation failures still have no established cause.
+
 ## Verification evidence
 
 At the start of the **2026-09-23** repair, main was [`27dab13`](https://github.com/aamodbhatt/sframe/commit/27dab1305c0768b0db7d3674d5bc36ac25b90c80). Its relay upload deadline repair passed all nine gates locally: **246 unit/integration tests, 30 Rust tests and 177 browser tests** across Chromium, Firefox and WebKit. A stalled upload is rejected after one five-second deadline, cancellation cannot prolong the wait, and an actual encrypted-relay regression checks that the head stays unchanged and a valid retry succeeds.

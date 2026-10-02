@@ -128,6 +128,16 @@ impl UnlockStore for FileUnlockStore {
 pub struct IdentityContext {
     root: PathBuf,
     unlock: Box<dyn UnlockStore>,
+    // Stable lock file is never replaced or unlinked; dropping the handle releases it.
+    _store_lock: fs::File,
+}
+
+impl Drop for IdentityContext {
+    fn drop(&mut self) {
+        // Explicit unlock also releases an inherited descriptor during a concurrent
+        // fork/exec; closing only this handle may leave that short-lived copy locked.
+        let _ = self._store_lock.unlock();
+    }
 }
 
 impl IdentityContext {
@@ -135,6 +145,7 @@ impl IdentityContext {
         if let Some(root) = test_store {
             fs::create_dir_all(root).map_err(|_| "TEST_STORE_CREATE_FAILED".to_owned())?;
             return Ok(Self {
+                _store_lock: acquire_store_lock(root)?,
                 root: root.to_path_buf(),
                 unlock: Box::new(FileUnlockStore::new(root)),
             });
@@ -142,6 +153,7 @@ impl IdentityContext {
         let root = default_config_root()?;
         fs::create_dir_all(&root).map_err(|_| "CONFIG_CREATE_FAILED".to_owned())?;
         Ok(Self {
+            _store_lock: acquire_store_lock(&root)?,
             root,
             unlock: Box::new(KeyringUnlockStore),
         })
@@ -663,6 +675,30 @@ fn now_millis() -> Result<u64, String> {
     u64::try_from(duration.as_millis()).map_err(|_| "SYSTEM_CLOCK_INVALID".to_owned())
 }
 
+fn acquire_store_lock(root: &Path) -> Result<fs::File, String> {
+    let path = root.join(".vault.lock");
+    if let Ok(metadata) = fs::symlink_metadata(&path)
+        && !metadata.is_file()
+    {
+        return Err("LOCAL_STORE_LOCK_INVALID".to_owned());
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(path)
+        .map_err(|_| "LOCAL_STORE_LOCK_UNAVAILABLE".to_owned())?;
+    file.try_lock().map_err(|error| match error {
+        std::fs::TryLockError::WouldBlock => "LOCAL_STORE_BUSY".to_owned(),
+        std::fs::TryLockError::Error(_) => "LOCAL_STORE_LOCK_UNAVAILABLE".to_owned(),
+    })?;
+    Ok(file)
+}
+
 fn default_config_root() -> Result<PathBuf, String> {
     #[cfg(target_os = "windows")]
     let base = env::var_os("APPDATA");
@@ -779,6 +815,103 @@ mod tests {
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    #[test]
+    fn store_lock_rejects_concurrent_context_and_releases_without_removing_the_file() {
+        let root = temporary_root("store-lock");
+        let first = IdentityContext::discover(Some(&root)).expect("first lock");
+        assert_eq!(
+            IdentityContext::discover(Some(&root)).err().expect("busy"),
+            "LOCAL_STORE_BUSY"
+        );
+        assert!(!root.join("identity-v1.json").exists());
+        drop(first);
+        let second = IdentityContext::discover(Some(&root)).expect("released lock");
+        assert_eq!(
+            fs::metadata(root.join(".vault.lock"))
+                .expect("lock metadata")
+                .len(),
+            0
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(root.join(".vault.lock"))
+                    .expect("metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        drop(second);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn store_lock_child_process() {
+        let Some(root) = env::var_os("SMALLFRAME_TEST_LOCK_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let _context = IdentityContext::discover(Some(&root)).expect("child lock");
+        fs::write(root.join("lock-ready"), b"ready").expect("readiness");
+        std::thread::sleep(std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn store_lock_is_cross_process_and_released_after_termination() {
+        let root = temporary_root("store-lock-process");
+        fs::create_dir_all(&root).expect("root");
+        let mut child = std::process::Command::new(env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "identity::tests::store_lock_child_process",
+                "--nocapture",
+            ])
+            .env("SMALLFRAME_TEST_LOCK_ROOT", &root)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("child");
+        for _ in 0..100 {
+            if root.join("lock-ready").exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let ready = root.join("lock-ready").exists();
+        let blocked = IdentityContext::discover(Some(&root)).err();
+        child.kill().expect("terminate lock holder");
+        child.wait().expect("reap");
+        assert!(ready, "child did not acquire lock");
+        assert_eq!(blocked.as_deref(), Some("LOCAL_STORE_BUSY"));
+        let reopened = IdentityContext::discover(Some(&root)).expect("kernel released lock");
+        drop(reopened);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_lock_rejects_symlinks_without_touching_the_target() {
+        let root = temporary_root("store-lock-link");
+        fs::create_dir_all(&root).expect("root");
+        let target = root.join("unchanged-public-test-file");
+        fs::write(&target, b"public-test-marker").expect("marker");
+        std::os::unix::fs::symlink(&target, root.join(".vault.lock")).expect("symlink");
+        assert_eq!(
+            IdentityContext::discover(Some(&root))
+                .err()
+                .expect("reject"),
+            "LOCAL_STORE_LOCK_INVALID"
+        );
+        assert_eq!(
+            fs::read(target).expect("read marker"),
+            b"public-test-marker"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]

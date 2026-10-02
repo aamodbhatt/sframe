@@ -630,6 +630,18 @@ test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
 
   for (const fault of ['oversized', 'stalled'] as const) {
     test(`bounds an ${fault} relay response and retains a usable replica`, async ({page}) => {
+      await page.addInitScript(() => {
+        const sockets: WebSocket[] = [];
+        const original = window.WebSocket;
+        (globalThis as any).replayTransportOpen = () => {
+          if (!sockets.length) throw new Error('TEST_SOCKET_MISSING');
+          for (const socket of sockets) socket.dispatchEvent(new Event('open'));
+          return document.getElementById('connectivity')?.textContent;
+        };
+        window.WebSocket = new Proxy(original, {construct(target, args) {
+          const socket = Reflect.construct(target, args) as WebSocket; sockets.push(socket); return socket;
+        }});
+      });
       const signed = await createSignedRoomDescriptor({publisherPrivateKey: publisherPriv, roomId: activeRoomId,
         packageDigest: sharedFixture.packageDigest, publisherKeyId: sharedFixture.publisherKeyId,
         writerPublicKey: await getPublicKeyAsync(writerPriv), capability: editorCap,
@@ -665,6 +677,7 @@ test.describe('Phase 3 encrypted shared rooms & collaborative runtime', () => {
       const evidence = await page.evaluate(() => (globalThis as any).bodyFaultEvidence as {chunks: number; cancelled: boolean});
       expect(evidence.cancelled).toBe(true);
       expect(evidence.chunks).toBeLessThanOrEqual(13);
+      expect(await page.evaluate(() => (globalThis as any).replayTransportOpen())).toBe('Sync paused · local copy retained');
       await expect(app.getByText('0 decisions')).toBeVisible();
       const saved = await page.evaluate(async (roomId) => {
         const room = await (globalThis as any).SmallframeSharedStore.loadRoom(roomId);

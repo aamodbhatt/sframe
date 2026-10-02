@@ -545,7 +545,8 @@ import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.
         const wsUrl = `${apiOrigin.replace(/^http/u, 'ws')}/v1/rooms/${descriptor.roomId}/socket`;
         const ws = new WebSocket(wsUrl, ['smallframe.v1', `sf-ticket.${ticket}`]);
 
-        ws.onopen = () => { setStatus('Synced'); };
+        // Transport readiness cannot certify a verified/saved replica or clear a
+        // sync failure. The relay's revision hint schedules verification below.
         ws.onmessage = (event) => {
           try {
             const msg = JSON.parse(event.data as string) as {type: string; epoch: number; revision: number};
