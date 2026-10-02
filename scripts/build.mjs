@@ -1,4 +1,5 @@
 import {createHash} from 'node:crypto';
+import {gzipSync} from 'node:zlib';
 import {cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync} from 'node:fs';
 import {join} from 'node:path';
 import {spawnSync} from 'node:child_process';
@@ -59,6 +60,22 @@ const serverBindgen = spawnSync(wasmBindgen, ['--target', 'web', '--no-typescrip
 if (serverBindgen.status !== 0) process.exit(serverBindgen.status ?? 1);
 const serverWasm = readFileSync(join(serverOutput, 'smallframe_server_verifier_bg.wasm'));
 if (serverWasm.byteLength < 8 || serverWasm.byteLength > 2 * 1024 * 1024 || !serverWasm.subarray(0, 8).equals(Buffer.from([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]))) throw new Error('SERVER_VERIFIER_ARTIFACT_INVALID');
+// Build the same binding implementation with CRDT exports omitted. The trusted
+// controller state Worker retains the full release artifact above.
+const rendererVerifierBuild = spawnSync('cargo', ['build', '--locked', '--profile', 'renderer-verifier', '--target', 'wasm32-unknown-unknown', '-p', 'smallframe-core', '--no-default-features', '--features', 'renderer-wasm'], {cwd: root, stdio: 'inherit', env: childEnv});
+if (rendererVerifierBuild.status !== 0) process.exit(rendererVerifierBuild.status ?? 1);
+const rendererVerifierOutput = join(root, 'target', 'renderer-verifier-wasm');
+rmSync(rendererVerifierOutput, {recursive: true, force: true});
+mkdirSync(rendererVerifierOutput, {recursive: true});
+const rendererVerifierBindgen = spawnSync(wasmBindgen, ['--target', 'web', '--no-typescript', '--out-dir', rendererVerifierOutput, '--out-name', 'smallframe_renderer_verifier', join(root, 'target', 'wasm32-unknown-unknown', 'renderer-verifier', 'smallframe_core.wasm')], {cwd: root, stdio: 'inherit', env: childEnv});
+if (rendererVerifierBindgen.status !== 0) process.exit(rendererVerifierBindgen.status ?? 1);
+const rendererVerifierWasm = readFileSync(join(rendererVerifierOutput, 'smallframe_renderer_verifier_bg.wasm'));
+if (rendererVerifierWasm.byteLength < 8 || rendererVerifierWasm.byteLength > 2 * 1024 * 1024 || !rendererVerifierWasm.subarray(0, 8).equals(Buffer.from([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]))) throw new Error('RENDERER_VERIFIER_ARTIFACT_INVALID');
+const rendererVerifierDigest = createHash('sha256').update(rendererVerifierWasm).digest('hex');
+const rendererGlue = readFileSync(join(rendererVerifierOutput, 'smallframe_renderer_verifier.js'), 'utf8')
+  .replace(/^export \{[^\n]+\};?$/gmu, '').replace(/^export /gmu, '').replace(/import\.meta\.url/gu, "''");
+if (/^\s*(?:import|export)\s/mu.test(rendererGlue) || /^\s*\{[^\n]*\bas\s+(?:default|[A-Za-z_$])/mu.test(rendererGlue)) throw new Error('RENDERER_VERIFIER_GLUE_MODULE_SYNTAX');
+const rendererGluePrelude = `{\n${rendererGlue}\nglobalThis.__smallframePhase1Verifier = Object.freeze({initSync, wasm_prepare_package, wasm_sha256_hex, wasm_validate_state, wasm_verifier_self_test, wasm_verifier_version, wasm_verify_package});\n}\n`;
 // Public test template only. Each test publisher encrypts these exact shared
 // genesis bytes before its local relay initialization; recipients never recreate them.
 const genesisVerifier = await import(pathToFileURL(join(phase1WasmOutput, 'smallframe_verifier.js')).href);
@@ -72,7 +89,6 @@ const phase1Glue = phase1GlueRaw
 if (/^\s*(?:import|export)\s/mu.test(phase1Glue) || /^\s*\{[^\n]*\bas\s+(?:default|[A-Za-z_$])/mu.test(phase1Glue)) {
   throw new Error('PHASE1_WASM_GLUE_MODULE_SYNTAX');
 }
-const phase1GluePrelude = `{\n${phase1Glue}\nglobalThis.__smallframePhase1Verifier = Object.freeze({initSync, wasm_prepare_package, wasm_sha256_hex, wasm_validate_state, wasm_verifier_self_test, wasm_verifier_version, wasm_verify_package, wasm_automerge_genesis, wasm_automerge_apply_patch, wasm_automerge_merge, wasm_automerge_project, wasm_automerge_validate});\n}\n`;
 const phase0WasmCsp = process.env.SMALLFRAME_U_WASM_CSP ?? 'allow';
 if (!['allow', 'deny'].includes(phase0WasmCsp) || (candidate !== 'U' && phase0WasmCsp !== 'allow')) throw new Error('SMALLFRAME_U_WASM_CSP requires Candidate U and allow|deny');
 const wasmEvalSource = phase0WasmCsp === 'allow' ? " 'wasm-unsafe-eval'" : '';
@@ -404,29 +420,23 @@ const rendererProgramSource = readFileSync(join(dist, 'renderer', 'renderer.js')
   .replaceAll('__PHASE0_WASM_BASE64__', phase0Wasm.toString('base64'))
   .replaceAll('__PHASE0_WASM_SHA256__', phase0WasmDigest)
   .replaceAll('__PHASE0_WASM_BYTES__', String(phase0Wasm.byteLength))
-  .replaceAll('__PHASE1_WASM_BASE64__', phase1Wasm.toString('base64'))
-  .replaceAll('__PHASE1_WASM_SHA256__', phase1WasmDigest)
-  .replaceAll('__PHASE1_WASM_BYTES__', String(phase1Wasm.byteLength))
+  .replaceAll('__PHASE1_WASM_BASE64__', rendererVerifierWasm.toString('base64'))
+  .replaceAll('__PHASE1_WASM_SHA256__', rendererVerifierDigest)
+  .replaceAll('__PHASE1_WASM_BYTES__', String(rendererVerifierWasm.byteLength))
   .replaceAll("'__CANDIDATE_FACTORY_SOURCE__'", inlineScriptString(candidateFactorySource));
-const rendererSource = `${phase1GluePrelude}${rendererProgramSource}`;
+const rendererSource = `${rendererGluePrelude}${rendererProgramSource}`;
 const rendererCss = readFileSync(join(root, 'apps/renderer/renderer.css'), 'utf8');
 const rendererBootstrapHash = createHash('sha256').update(rendererSource).digest('base64');
 const rendererCssHash = createHash('sha256').update(rendererCss).digest('base64');
 const rendererMetaCsp = `default-src 'none'; script-src 'sha256-${rendererBootstrapHash}'${wasmEvalSource} blob:; style-src 'sha256-${rendererCssHash}'; img-src 'none'; font-src 'none'; connect-src 'none'; worker-src blob:; child-src 'none'; frame-src 'none'; media-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; navigate-to 'none'; require-trusted-types-for 'script'; trusted-types smallframe-renderer-worker`;
 const rendererMetaTag = candidate === 'A' ? `<meta http-equiv="Content-Security-Policy" content="${rendererMetaCsp.replaceAll('&', '&amp;').replaceAll('"', '&quot;')}">` : '';
 const rendererHtml = `<!doctype html><html><head>${rendererMetaTag}<meta charset="utf-8"><style>${rendererCss}</style></head><body><div id="sf-app-root"></div><script type="module">${rendererSource}</script></body></html>`;
+if (Buffer.byteLength(rendererHtml) > 2 * 1024 * 1024) throw new Error('RENDERER_TOO_LARGE');
 const rendererDigest = createHash('sha256').update(rendererHtml).digest('hex');
 const rendererPath = join(controller, 'runtime', 'renderer', `${rendererDigest}.html`);
 writeFileSync(rendererPath, rendererHtml);
 
 const swPath = join(controller, 'sw.js');
-let sw = readFileSync(swPath, 'utf8');
-sw = sw.replace(/\nexport \{\};\s*$/u, '\n');
-sw = sw.replaceAll('__RENDERER_DIGEST__', rendererDigest)
-  .replaceAll('__RENDERER_BOOTSTRAP_HASH__', rendererBootstrapHash)
-  .replaceAll('__RENDERER_CSS_HASH__', rendererCssHash)
-  .replaceAll('__RENDERER_WASM_EVAL_SOURCE__', wasmEvalSource);
-writeFileSync(swPath, sw);
 const mainPath = join(controller, 'main.js');
 const configuredPackage = process.env.SMALLFRAME_DEV_PACKAGE;
 const phase2DefaultPackagePath = join(root, 'packages/protocol/vectors/phase2-decision-board-v1.zip.b64');
@@ -445,7 +455,7 @@ writeFileSync(join(phase1WasmOutput, 'shared-test-package.json'), JSON.stringify
 const controllerReplacements = new Map([
   ['__RENDERER_DIGEST__', rendererDigest], ['__RENDERER_BOOTSTRAP_HASH__', rendererBootstrapHash],
   ['__RENDERER_CSS_HASH__', rendererCssHash], ['__RENDERER_WASM_EVAL_SOURCE__', wasmEvalSource],
-  ['__PHASE0_WASM_BYTES__', String(phase0Wasm.byteLength)], ['__PHASE1_WASM_BYTES__', String(phase1Wasm.byteLength)],
+  ['__PHASE0_WASM_BYTES__', String(phase0Wasm.byteLength)], ['__PHASE1_WASM_BYTES__', String(rendererVerifierWasm.byteLength)], ['__PHASE1_WASM_SHA256__', rendererVerifierDigest],
   ['__CHANNEL_TEST_FIXTURE__', candidateUChannelFixture], ['__PHASE2_PACKAGE_BASE64__', phase2Package.toString('base64')],
   ['__SHARED_TEST_PACKAGE_BASE64__', sharedFixture.archiveBase64], ['__PHASE2_DEFAULT_FLAG__', phase2Default ? '1' : '0'],
   ['__PHASE2_EXPECTED_DIGEST__', phase2ExpectedDigest], ['__PHASE2_EXPECTED_KEY_ID__', phase2ExpectedKeyId],
@@ -453,10 +463,10 @@ const controllerReplacements = new Map([
 ]);
 // Replace build constants before Vite can fold architecture branches, then
 // bundle the actual shared protocol implementation rather than a copied verifier.
-for (const name of ['main', 'personal-runtime', 'shared-runtime']) {
+for (const name of ['main', 'personal-runtime', 'shared-runtime', 'sw']) {
   const result = await bundle({configFile: false, logLevel: 'silent', plugins: [{name: 'smallframe-build-constants',
     transform(code, id) {
-      if (!id.endsWith('/apps/controller/src/main.ts')) return null;
+      if (!id.endsWith('/apps/controller/src/main.ts') && !id.endsWith('/apps/controller/src/sw.ts')) return null;
       for (const [from, to] of controllerReplacements) code = code.replaceAll(from, to);
       return {code, map: null};
     }}], build: {write: false, target: 'es2022', minify: false,
@@ -471,7 +481,7 @@ let main = readFileSync(mainPath, 'utf8').replace(/\nexport \{\};\s*$/u, '').rep
   .replaceAll('__RENDERER_CSS_HASH__', rendererCssHash)
   .replaceAll('__RENDERER_WASM_EVAL_SOURCE__', wasmEvalSource)
   .replaceAll('__PHASE0_WASM_BYTES__', String(phase0Wasm.byteLength))
-  .replaceAll('__PHASE1_WASM_BYTES__', String(phase1Wasm.byteLength))
+  .replaceAll('__PHASE1_WASM_BYTES__', String(rendererVerifierWasm.byteLength))
   .replaceAll('__CHANNEL_TEST_FIXTURE__', candidateUChannelFixture)
   .replaceAll('__PHASE2_PACKAGE_BASE64__', phase2Package.toString('base64'))
   .replaceAll('__SHARED_TEST_PACKAGE_BASE64__', sharedFixture.archiveBase64)
@@ -515,7 +525,7 @@ for (const p of staticPaths) {
 const controllerAssetSetDigest = createHash('sha256').update(Buffer.from(canonicalize(controllerAssetSet))).digest('base64url');
 const controllerShellDigest = controllerAssetSet['/index.html'].sha256;
 const rendererDigestB64 = controllerAssetSet[`/runtime/renderer/${rendererDigest}.html`].sha256;
-const verifierDigestB64 = createHash('sha256').update(phase1Wasm).digest('base64url');
+const verifierDigestB64 = createHash('sha256').update(rendererVerifierWasm).digest('base64url');
 const serviceWorkerDigestB64 = createHash('sha256').update(readFileSync(swPath)).digest('base64url');
 let gitCommit = '0123456789abcdef0123456789abcdef01234567';
 try {
@@ -569,4 +579,4 @@ const releaseEnvelope = {
 writeFileSync(join(controller, 'release.json'), JSON.stringify(releaseEnvelope, null, 2) + '\n');
 
 writeFileSync(join(dist, 'renderer', 'renderer.js'), rendererSource);
-console.log(JSON.stringify({candidate, fixture: fixture || 'valid', channelFixture: candidateUChannelFixture || 'valid', rendererDigest, rendererBytes: Buffer.byteLength(rendererHtml), rendererBootstrapHash, rendererCssHash, phase0WasmBytes: phase0Wasm.byteLength, phase0WasmDigest, phase1WasmBytes: phase1Wasm.byteLength, phase1WasmDigest, phase2PackageBytes: phase2Package.byteLength, phase2PackageArtifactDigest: createHash('sha256').update(phase2Package).digest('hex'), phase2Default, phase0WasmCsp, candidateFactory: candidateFactoryPath, candidateFactoryBytes: Buffer.byteLength(candidateFactorySource), candidateFactoryDigest: createHash('sha256').update(candidateFactorySource).digest('hex'), buildId}, null, 2));
+console.log(JSON.stringify({candidate, fixture: fixture || 'valid', channelFixture: candidateUChannelFixture || 'valid', rendererDigest, rendererBytes: Buffer.byteLength(rendererHtml), rendererBootstrapHash, rendererCssHash, phase0WasmBytes: phase0Wasm.byteLength, phase0WasmDigest, phase1WasmBytes: phase1Wasm.byteLength, phase1WasmDigest, rendererVerifierBytes: rendererVerifierWasm.byteLength, rendererVerifierDigest, rendererGzipBytes: gzipSync(rendererHtml).byteLength, phase2PackageBytes: phase2Package.byteLength, phase2PackageArtifactDigest: createHash('sha256').update(phase2Package).digest('hex'), phase2Default, phase0WasmCsp, candidateFactory: candidateFactoryPath, candidateFactoryBytes: Buffer.byteLength(candidateFactorySource), candidateFactoryDigest: createHash('sha256').update(candidateFactorySource).digest('hex'), buildId}, null, 2));

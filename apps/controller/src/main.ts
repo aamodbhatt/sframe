@@ -1,3 +1,4 @@
+import {readRendererBody} from './renderer-body.js';
 import {parseInviteFragment} from '../../../packages/protocol/src/room-descriptor.js';
 import type {ParsedInvite} from '../../../packages/protocol/src/room-descriptor.js';
 
@@ -22,6 +23,7 @@ const ARCHITECTURE_CANDIDATE: string = '__ARCHITECTURE_CANDIDATE__';
 const CHANNEL_TEST_FIXTURE: string = '__CHANNEL_TEST_FIXTURE__';
 const PHASE0_WASM_BYTES = Number('__PHASE0_WASM_BYTES__');
 const PHASE1_WASM_BYTES = Number('__PHASE1_WASM_BYTES__');
+const PHASE1_WASM_SHA256 = '__PHASE1_WASM_SHA256__';
 const PHASE2_PACKAGE_BASE64 = '__PHASE2_PACKAGE_BASE64__';
 const SHARED_TEST_PACKAGE_BASE64 = '__SHARED_TEST_PACKAGE_BASE64__';
 const PHASE2_DEFAULT = Boolean(Number('__PHASE2_DEFAULT_FLAG__'));
@@ -38,7 +40,6 @@ let sharedExecutionRole: 'viewer' | 'editor' = 'viewer';
 const executionRole = (): 'viewer' | 'editor' => SHARED_MODE ? sharedExecutionRole : PERSONAL_MODE ? PERSONAL_ROLE : 'editor';
 const executionIsReadOnly = (): boolean => executionRole() === 'viewer';
 const RENDERER_PATH = `/runtime/renderer/${RENDERER_DIGEST}.html`;
-const MAX_RENDERER_BYTES = 4 * 1024 * 1024;
 const REQUIRED_RENDERER_CSP = "default-src 'none'; script-src 'sha256-__RENDERER_BOOTSTRAP_HASH__'__RENDERER_WASM_EVAL_SOURCE__ blob:; style-src 'sha256-__RENDERER_CSS_HASH__'; img-src 'none'; font-src 'none'; connect-src 'none'; worker-src blob:; child-src 'none'; frame-src 'none'; media-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; navigate-to 'none'; frame-ancestors http://app.localhost:4173; sandbox allow-scripts; require-trusted-types-for 'script'; trusted-types smallframe-renderer-worker";
 const MAX_MESSAGE_BYTES = 256 * 1024;
 let frame: HTMLIFrameElement | undefined;
@@ -145,8 +146,7 @@ const readVerifiedRenderer = async (): Promise<string> => {
   const response = await caches.match(RENDERER_PATH);
   if (!response || response.status !== 200 || response.headers.get('content-type')?.toLowerCase() !== 'text/html; charset=utf-8') throw new Error('RENDERER_CACHE_ENTRY_INVALID');
   if (response.headers.get('content-security-policy') !== REQUIRED_RENDERER_CSP) throw new Error('RENDERER_POLICY_MISMATCH');
-  const body = await response.arrayBuffer();
-  if (body.byteLength > MAX_RENDERER_BYTES) throw new Error('RENDERER_TOO_LARGE');
+  const body = await readRendererBody(response);
   let html: string;
   try { html = new TextDecoder('utf-8', {fatal: true}).decode(body); } catch (_) { throw new Error('RENDERER_UTF8_INVALID'); }
   if (html.startsWith('\ufeff')) throw new Error('RENDERER_UTF8_BOM');
@@ -208,6 +208,7 @@ const setupServiceWorker = async (): Promise<string | undefined> => {
     const timeout = window.setTimeout(() => reject(new Error('SERVICE_WORKER_ATTEST_TIMEOUT')), 2000);
     channel.port1.onmessage = (event: MessageEvent) => {
       window.clearTimeout(timeout);
+      if (event.data?.type === 'sf.attest.result' && event.data.digest === RENDERER_DIGEST && event.data.error === 'RENDERER_TOO_LARGE') { reject(new Error('RENDERER_TOO_LARGE')); return; }
       if (event.data?.type !== 'sf.attest.result' || event.data.digest !== RENDERER_DIGEST || event.data.cachePresent !== true || event.data.responseDigest !== RENDERER_DIGEST || event.data.provenance !== 'service-worker-cache' || event.data.contentSecurityPolicy !== REQUIRED_RENDERER_CSP) reject(new Error('SERVICE_WORKER_ATTEST_MISMATCH'));
       else resolve({digest: event.data.digest as string, csp: event.data.contentSecurityPolicy as string, buildId: typeof event.data.buildId === 'string' ? event.data.buildId : undefined});
     };
@@ -463,7 +464,7 @@ const onPortMessage = (event: MessageEvent): void => {
   if (message.type === 'sf.renderer.rendered') schemaValid = exactKeys(message, baseKeys) && (!IS_CANDIDATE_U || (workerLifecycleState === 'running' && acceptedAppReadyGeneration === workerLifecycleGeneration));
   else if (message.type === 'sf.renderer.app-ready') {
     const expected = USES_CLASSIC_WORKER ? [...baseKeys, 'workerKind', 'blobCount', 'workerSelfOrigin', 'workerLocationOrigin', 'workerLocationHref', 'wasmStarted', 'wasmBytes', 'wasmProbe', 'wasmDigest', 'generation', 'restartCount', 'lastReason', ...(IS_CANDIDATE_U ? ['verifierStarted', 'verifierBytes', 'verifierVersion', 'verifierDigest'] : [])] : baseKeys;
-    schemaValid = exactKeys(message, expected) && (!IS_CANDIDATE_U || (message.workerKind === 'classic-blob' && message.blobCount === 1 && message.workerSelfOrigin === 'null' && message.workerLocationOrigin === 'null' && typeof message.workerLocationHref === 'string' && message.workerLocationHref.startsWith('blob:null/') && message.wasmStarted === true && Number.isSafeInteger(message.wasmBytes) && message.wasmBytes === PHASE0_WASM_BYTES && message.wasmProbe === 0xf88bbfb9 && typeof message.wasmDigest === 'string' && /^[0-9a-f]{64}$/u.test(message.wasmDigest) && message.verifierStarted === true && Number.isSafeInteger(message.verifierBytes) && message.verifierBytes === PHASE1_WASM_BYTES && PHASE1_WASM_BYTES <= 2 * 1024 * 1024 && message.verifierVersion === 1 && typeof message.verifierDigest === 'string' && /^[0-9a-f]{64}$/u.test(message.verifierDigest) && Number.isSafeInteger(message.generation) && Number(message.generation) >= 1 && Number.isSafeInteger(message.restartCount) && Number(message.restartCount) >= 0 && typeof message.lastReason === 'string' && message.lastReason.length <= 64 && workerLifecycleState === 'running' && message.generation === workerLifecycleGeneration && message.restartCount === workerLifecycleRestartCount && acceptedAppReadyGeneration !== workerLifecycleGeneration));
+    schemaValid = exactKeys(message, expected) && (!IS_CANDIDATE_U || (message.workerKind === 'classic-blob' && message.blobCount === 1 && message.workerSelfOrigin === 'null' && message.workerLocationOrigin === 'null' && typeof message.workerLocationHref === 'string' && message.workerLocationHref.startsWith('blob:null/') && message.wasmStarted === true && Number.isSafeInteger(message.wasmBytes) && message.wasmBytes === PHASE0_WASM_BYTES && message.wasmProbe === 0xf88bbfb9 && typeof message.wasmDigest === 'string' && /^[0-9a-f]{64}$/u.test(message.wasmDigest) && message.verifierStarted === true && Number.isSafeInteger(message.verifierBytes) && message.verifierBytes === PHASE1_WASM_BYTES && PHASE1_WASM_BYTES <= 2 * 1024 * 1024 && message.verifierVersion === 1 && typeof message.verifierDigest === 'string' && message.verifierDigest === PHASE1_WASM_SHA256 && Number.isSafeInteger(message.generation) && Number(message.generation) >= 1 && Number.isSafeInteger(message.restartCount) && Number(message.restartCount) >= 0 && typeof message.lastReason === 'string' && message.lastReason.length <= 64 && workerLifecycleState === 'running' && message.generation === workerLifecycleGeneration && message.restartCount === workerLifecycleRestartCount && acceptedAppReadyGeneration !== workerLifecycleGeneration));
   }
   else if (message.type === 'sf.renderer.worker-lifecycle') {
     const hasStopCode = Object.prototype.hasOwnProperty.call(message, 'stopCode');

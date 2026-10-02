@@ -9,7 +9,7 @@ const usesClassicWorker = candidate === 'S' || candidate === 'T' || candidate ==
 const usesCandidateTFraming = candidate === 'T' || candidate === 'U';
 const phase0WasmArtifact = candidate === 'U' ? readFileSync(join(process.cwd(), 'target', 'wasm32-unknown-unknown', 'release', 'smallframe_phase0_wasm.wasm')) : Buffer.alloc(0);
 const phase0WasmDigest = createHash('sha256').update(phase0WasmArtifact).digest('hex');
-const phase1WasmArtifact = candidate === 'U' ? readFileSync(join(process.cwd(), 'target', 'phase1-wasm', 'smallframe_verifier_bg.wasm')) : Buffer.alloc(0);
+const phase1WasmArtifact = candidate === 'U' ? readFileSync(join(process.cwd(), 'target', 'renderer-verifier-wasm', 'smallframe_renderer_verifier_bg.wasm')) : Buffer.alloc(0);
 const phase1WasmDigest = createHash('sha256').update(phase1WasmArtifact).digest('hex');
 const phase1PackageVector = candidate === 'U' ? readFileSync(join(process.cwd(), 'packages', 'protocol', 'vectors', 'canonical-package-v1.zip.b64'), 'utf8').trim() : '';
 type PageLike = Parameters<Parameters<typeof test>[1]>[0]['page'];
@@ -557,5 +557,26 @@ if (candidate === 'T' || candidate === 'U') {
     await page.frameLocator('iframe').getByRole('button', {name: 'Add decision'}).click();
     await expect(page.frameLocator('iframe').getByText('Decisions: 1')).toBeVisible();
     await expect(page.locator('#status')).toContainText('renderer accepted the declarative tree');
+  });
+}
+
+if (candidate === 'U') {
+  test('rejects an oversized cached renderer before creating a frame', async ({page}) => {
+    await page.goto('/', {waitUntil: 'commit'});
+    await expect(page.locator('#build')).toContainText('Verified renderer');
+    const path = await rendererPathFrom(page);
+    await page.evaluate(async (rendererPath) => {
+      let replaced = false;
+      for (const name of await caches.keys()) {
+        const cache = await caches.open(name); const response = await cache.match(rendererPath);
+        if (!response) continue;
+        await cache.put(rendererPath, new Response(new Uint8Array(2 * 1024 * 1024 + 1), {headers: response.headers}));
+        replaced = true;
+      }
+      if (!replaced) throw new Error('TEST_RENDERER_CACHE_MISSING');
+    }, path);
+    await page.reload({waitUntil: 'commit'});
+    await expect(page.locator('#status')).toContainText('RENDERER_TOO_LARGE');
+    await expect(page.locator('#app-host iframe')).toHaveCount(0);
   });
 }

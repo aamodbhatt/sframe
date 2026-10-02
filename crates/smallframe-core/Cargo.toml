@@ -12,6 +12,7 @@ crate-type = ["rlib", "cdylib"]
 default = ["full-schema"]
 full-schema = ["dep:jsonschema"]
 wasm = ["dep:wasm-bindgen"]
+renderer-wasm = ["dep:wasm-bindgen"]
 
 [dependencies]
 curve25519-dalek = "=4.1.3"

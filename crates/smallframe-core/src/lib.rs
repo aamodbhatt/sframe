@@ -40,5 +40,5 @@ pub use recovery_chain::{
 };
 pub use state_schema::validate_state_schema;
 
-#[cfg(feature = "wasm")]
+#[cfg(any(feature = "wasm", feature = "renderer-wasm"))]
 mod wasm;

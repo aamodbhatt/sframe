@@ -17,3 +17,7 @@ strip = true
 [profile.server-verifier]
 inherits = "release"
 opt-level = "s"
+
+# Renderer exposes the same verifier/state-schema ABI without CRDT exports.
+[profile.renderer-verifier]
+inherits = "release"
