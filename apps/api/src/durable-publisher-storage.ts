@@ -1,5 +1,6 @@
 import type {D1Database, R2Bucket, R2Object} from '@cloudflare/workers-types';
 import {decodeBase64Url, encodeBase64Url, type PublisherEnrollmentRecord} from '../../../packages/protocol/src/index.js';
+import {DurableRoomStorage} from './durable-room-storage.js';
 import type {StoredInvite, StoredPackageRecord, StoredPublisher} from './publish-api.js';
 
 // Local schema only. Production routes remain closed; no remote migration runs.
@@ -46,7 +47,10 @@ const validateOperation = (operation: UploadRow): void => {
 
 export class DurablePublisherStorage {
   private ready: Promise<unknown> | undefined;
-  constructor(readonly db: D1Database, readonly bucket: R2Bucket, readonly now = Date.now) {}
+  readonly rooms: DurableRoomStorage;
+  constructor(readonly db: D1Database, readonly bucket: R2Bucket, readonly now = Date.now) {
+    this.rooms = new DurableRoomStorage(db, () => this.initialize(), now);
+  }
   async initialize(): Promise<void> {
     this.ready ??= this.db.batch(SCHEMA.map((sql) => this.db.prepare(sql)));
     await this.ready;
@@ -181,5 +185,6 @@ export class DurablePublisherStorage {
       this.db.prepare('DELETE FROM publisher_enrollments WHERE revokedAt IS NOT NULL AND revokedAt<?').bind(this.now() - 30 * 86_400_000),
       this.db.prepare("DELETE FROM publisher_upload_operations WHERE state='D1_ACTIVE' AND completedAt<?").bind(this.now() - 86_400_000),
     ]);
+    await this.rooms.cleanup();
   }
 }

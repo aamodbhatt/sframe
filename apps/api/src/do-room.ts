@@ -14,6 +14,7 @@ import {
 } from './do-crypto.js';
 import {readApiRuntimeConfig, type ApiEnvironment} from './runtime-config.js';
 
+import {strictEd25519Points} from '../../../packages/protocol/src/ed25519-points.js';
 import {verifyAsync} from '@noble/ed25519';
 import canonicalize from 'canonicalize';
 import {
@@ -139,6 +140,7 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
     try { this.ctx.storage.sql.exec('ALTER TABLE room_state ADD COLUMN writer_signature BLOB'); } catch {}
     try { this.ctx.storage.sql.exec('ALTER TABLE room_state ADD COLUMN envelope_salt TEXT'); } catch {}
     try { this.ctx.storage.sql.exec('ALTER TABLE room_state ADD COLUMN aad_json TEXT'); } catch {}
+    this.ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS creation_receipts (singleton INTEGER PRIMARY KEY CHECK(singleton=1), operation_id TEXT NOT NULL, request_digest TEXT NOT NULL, publisher_key_id TEXT NOT NULL, genesis_digest TEXT NOT NULL, configuration_digest TEXT NOT NULL) STRICT`).toArray();
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS recovery_transition_log (
         epoch INTEGER PRIMARY KEY,
@@ -165,6 +167,8 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
   }
 
   private async dispatchPhase0(url: URL, request: Request): Promise<Response | null> {
+    const publisherMatch = /^\/__publisher\/rooms\/([A-Za-z0-9_-]{22})\/init-envelope$/u.exec(url.pathname);
+    if (publisherMatch?.[1]) return this.initializeEncryptedForLocalTest(publisherMatch[1], request, true);
     const envelopeMatch = /^\/__phase0\/rooms\/([A-Za-z0-9_-]{22})\/init-envelope$/u.exec(url.pathname);
     if (envelopeMatch?.[1]) return this.initializeEncryptedForLocalTest(envelopeMatch[1], request);
     const initMatch = /^\/__phase0\/rooms\/([A-Za-z0-9_-]{22})\/init$/u.exec(url.pathname);
@@ -182,12 +186,28 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
 
   // Test-only bootstrap: the production publisher saga must eventually supply this
   // same pinned genesis atomically. Never expose this route outside local mode.
-  private async initializeEncryptedForLocalTest(roomId: string, request: Request): Promise<Response> {
+  private parseCreationBinding(body: Record<string, any>, publisher: boolean):
+    {operationId: string; requestDigest: string; publisherKeyId: string} | undefined | null {
+    const keys = Object.keys(body).sort().join(',');
+    if (!publisher) return keys === 'editorCapHash,envelope,expiresAtMs,viewerCapHash' ? undefined : null;
+    if (keys !== 'editorCapHash,envelope,expiresAtMs,operationId,publisherKeyId,requestDigest,viewerCapHash'
+      || typeof body.operationId !== 'string' || !ROOM_ID_RE.test(body.operationId)
+      || decodeBase64Url(body.operationId, 16)?.byteLength !== 16 || !decodeFixed32(body.requestDigest)
+      || typeof body.publisherKeyId !== 'string' || !body.publisherKeyId.startsWith('sha256:')
+      || !decodeFixed32(body.publisherKeyId.slice(7))) return null;
+    return {operationId: body.operationId, requestDigest: body.requestDigest, publisherKeyId: body.publisherKeyId};
+  }
+
+  private async initializeEncryptedForLocalTest(roomId: string, request: Request, publisher = false): Promise<Response> {
     if (this.env.ENVIRONMENT !== 'local' || request.method !== 'POST') return problem(404, 'NOT_FOUND');
+    if (publisher && request.headers.get('Content-Type') !== 'application/json') return problem(415, 'CONTENT_TYPE_INVALID');
     const bounded = await readBoundedBody(request, 724_992);
     if (bounded.kind !== 'ok') return problem(400, 'BODY_INVALID');
     try {
       const body = parseUniqueJson(new TextDecoder('utf-8', {fatal: true}).decode(bounded.body)) as Record<string, any>;
+      const binding = this.parseCreationBinding(body, publisher);
+      if (binding === null) return problem(400, 'BODY_INVALID');
+      const configurationDigest = encodeBase64Url(await sha256(bounded.body));
       const viewer = decodeFixed32(body.viewerCapHash);
       const editor = decodeFixed32(body.editorCapHash);
       const envelope = this.parsePutWireEnvelope(new TextEncoder().encode(JSON.stringify(body.envelope)));
@@ -198,7 +218,12 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
       const verified = await this.verifyWireEnvelope(envelope, initial);
       if (!verified.ok) return problem(verified.status, verified.code);
       const created = this.ctx.storage.transactionSync(() => {
-        if (this.loadRoom(roomId)) return false;
+        const current = this.loadRoom(roomId);
+        const receipt = this.ctx.storage.sql.exec<{operation_id: string; request_digest: string; publisher_key_id: string; genesis_digest: string; configuration_digest: string}>('SELECT * FROM creation_receipts WHERE singleton=1').toArray()[0];
+        if (current || receipt) return current && binding && receipt
+          && receipt.operation_id === binding.operationId && receipt.request_digest === binding.requestDigest
+          && receipt.publisher_key_id === binding.publisherKeyId && receipt.genesis_digest === verified.envelopeDigest
+          && receipt.configuration_digest === configurationDigest ? 'existing' : 'conflict';
         this.ctx.storage.sql.exec(`INSERT INTO room_state (
           singleton, room_id, viewer_cap_hash, editor_cap_hash, expires_at_ms,
           state_epoch, revision, envelope_digest, ciphertext, etag, recovery_status,
@@ -208,9 +233,11 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
         verified.envelopeDigest, exactArrayBuffer(verified.cipherBytes), verified.etag,
         zero, exactArrayBuffer(verified.writerPubBytes), exactArrayBuffer(verified.writerSigBytes),
         envelope.envelopeSalt, JSON.stringify(envelope.aad)).toArray();
-        return true;
+        if (binding) this.ctx.storage.sql.exec('INSERT INTO creation_receipts VALUES(1,?,?,?,?,?)',
+          binding.operationId, binding.requestDigest, binding.publisherKeyId, verified.envelopeDigest, configurationDigest).toArray();
+        return 'created';
       });
-      return created ? new Response(null, {status: 201}) : problem(409, 'INITIALIZATION_CONFLICT');
+      return created === 'conflict' ? problem(409, 'INITIALIZATION_CONFLICT') : new Response(null, {status: created === 'created' ? 201 : 200});
     } catch {
       return problem(400, 'BODY_INVALID');
     }
@@ -687,7 +714,7 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
       rawRoomId, rawPackageDigest, wireEnvelope.stateEpoch, wireEnvelope.revision,
       rawPrevDigest, saltBytes, aadBytes, cipherBytes
     );
-    const validSig = await verifyAsync(writerSigBytes, writeMessage, writerPubBytes);
+    const validSig = strictEd25519Points(writerSigBytes, writerPubBytes) && await verifyAsync(writerSigBytes, writeMessage, writerPubBytes);
     if (!validSig) return {ok: false as const, status: 400, code: 'WRITER_SIGNATURE_INVALID'};
 
     const unsignedEnvelope = {

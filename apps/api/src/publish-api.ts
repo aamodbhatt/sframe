@@ -10,6 +10,7 @@ import type {WireEnvelope} from '../../../packages/protocol/src/crypto-envelope.
 import {parseUniqueJson} from '../../../packages/protocol/src/strict-json.js';
 import canonicalize from 'canonicalize';
 import {verifyUploadedPackage} from './package-verifier.js';
+import {validSignedGenesis} from './publisher-genesis.js';
 import {readBoundedBody} from './bounded-body.js';
 import {PublisherStorageError, type DurablePublisherStorage} from './durable-publisher-storage.js';
 
@@ -406,7 +407,7 @@ const verifyRoomCreationContext = async (body: RoomCreationBody, publisher: Stor
   if (!(await verifyRoomDescriptor(viewer, viewerSig, pubKey)).valid
     || !(await verifyRoomDescriptor(editor, editorSig, pubKey)).valid) throw new Error('ROOM_DESCRIPTOR_SIGNATURE_INVALID');
   if (!roomDescriptorContextValid(body, publisher, viewer, editor)) throw new Error('ROOM_CONTEXT_MISMATCH');
-  if (!genesisContextValid(body, editor)) throw new Error('GENESIS_CONTEXT_INVALID');
+  if (!genesisContextValid(body, editor) || !await validSignedGenesis(body.envelope, body.roomId, body.packageDigest, editor.writerPublicKey)) throw new Error('GENESIS_CONTEXT_INVALID');
   return {viewer, editor};
 };
 
@@ -419,12 +420,17 @@ export const handleRoomCreationSaga = async (
   if (!publisher) return problem(401, 'UNAUTHORIZED');
 
   try {
+    if (request.headers.get('Content-Type') !== 'application/json') return problem(415, 'UNSUPPORTED_MEDIA_TYPE');
     const bounded = await readBoundedBody(request, 724_992);
     if (bounded.kind === 'too-large') return problem(413, 'ROOM_CREATION_SIZE_LIMIT');
     if (bounded.kind !== 'ok') return problem(400, 'ROOM_CREATION_PAYLOAD_INVALID');
     const rawBody = parseRoomCreationBody(bounded.body);
 
     const requestDigest = encodeBase64Url(new Uint8Array(await crypto.subtle.digest('SHA-256', bounded.body)));
+    if (store.durable) {
+      const replay = await store.durable.rooms.replay(publisher.publisherKeyId, rawBody.operationId, requestDigest);
+      if (replay) return savedResponse(replay);
+    }
     const operationKey = `room:${publisher.publisherKeyId}:${rawBody.operationId}`;
     const existingOp = store.operations.get(operationKey);
     if (existingOp) {
@@ -440,6 +446,16 @@ export const handleRoomCreationSaga = async (
     if (!(await handleGetPackage(rawBody.packageDigest, store)).ok) return problem(409, 'STORED_PACKAGE_INVALID');
 
     const {viewer: viewerDesc, editor: editorDesc} = await verifyRoomCreationContext(rawBody, publisher);
+
+    if (store.durable) {
+      const result = await store.durable.rooms.create({roomId: rawBody.roomId, packageDigest: rawBody.packageDigest,
+        publisherKeyId: publisher.publisherKeyId, createdAt: Date.now(), expiresAt: editorDesc.expiresAt,
+        viewerDescriptor: viewerDesc, editorDescriptor: editorDesc}, rawBody.operationId, requestDigest, JSON.stringify({
+          viewerCapHash: viewerDesc.capabilityHash, editorCapHash: editorDesc.capabilityHash, expiresAtMs: editorDesc.expiresAt,
+          envelope: rawBody.envelope, operationId: rawBody.operationId, requestDigest, publisherKeyId: publisher.publisherKeyId,
+        }), env.ROOMS);
+      return savedResponse(result.body, result.created ? 201 : 200);
+    }
 
     // Initialize the Durable Object for this room
     const doObj = env.ROOMS.get(env.ROOMS.idFromName(rawBody.roomId));
@@ -485,7 +501,8 @@ export const handleRoomCreationSaga = async (
     });
 
     return jsonResponse(responseData, 201);
-  } catch {
+  } catch (error) {
+    if (error instanceof PublisherStorageError) return problem(error.status, error.code);
     return problem(400, 'ROOM_CREATION_PAYLOAD_INVALID');
   }
 };

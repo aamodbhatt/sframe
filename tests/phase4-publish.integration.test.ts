@@ -7,6 +7,8 @@ import {join, resolve} from 'node:path';
 import {pathToFileURL} from 'node:url';
 import {describe, expect, it, beforeAll, afterAll} from 'vitest';
 import {Miniflare} from 'miniflare';
+import type {D1Database} from '@cloudflare/workers-types';
+import {DurableRoomStorage, type PublisherRoomNamespace} from '../apps/api/src/durable-room-storage.js';
 import {build} from 'vite';
 import {compiledVerifierPlugin} from '../scripts/compiled-verifier-plugin.mjs';
 import {getPublicKeyAsync, utils} from '@noble/ed25519';
@@ -27,6 +29,7 @@ const DO_CLASS = 'RoomDurableObject';
 
 let temporaryDirectory = '';
 let miniflare: Miniflare;
+let workerOptions: ConstructorParameters<typeof Miniflare>[0];
 let apiOrigin = '';
 
 describe('local publishing prototype and capability-scoped package retrieval', () => {
@@ -51,7 +54,7 @@ describe('local publishing prototype and capability-scoped package retrieval', (
       logLevel: 'silent',
     });
 
-    miniflare = new Miniflare({
+    workerOptions = {
       unsafeInspectDurableObjects: true,
       modules: true,
       modulesRoot: temporaryDirectory,
@@ -71,11 +74,15 @@ describe('local publishing prototype and capability-scoped package retrieval', (
         PHASE0_MAX_TRANSPORTS: '1',
       },
       d1Databases: ['DB'],
+      d1Persist: join(temporaryDirectory, 'd1-storage'),
+      r2Persist: join(temporaryDirectory, 'r2-storage'),
+      durableObjectsPersist: join(temporaryDirectory, 'do-storage'),
       r2Buckets: ['PACKAGES'],
       durableObjects: {
         ROOMS: {className: DO_CLASS, useSQLite: true},
       },
-    });
+    };
+    miniflare = new Miniflare(workerOptions);
 
     const url = await miniflare.ready;
     apiOrigin = url.origin;
@@ -101,7 +108,10 @@ describe('local publishing prototype and capability-scoped package retrieval', (
         try {
           const stderr = String((error as {stderr?: unknown}).stderr ?? '');
           const parsed = JSON.parse(stderr) as {error?: {code?: unknown}};
-          if (typeof parsed.error?.code === 'string' && /^[A-Z_]+$/u.test(parsed.error.code)) code = parsed.error.code;
+          if (typeof parsed.error?.code === 'string') {
+            const candidate = parsed.error.code.split(':')[0]!;
+            if (/^[A-Z_]+$/u.test(candidate)) code = candidate;
+          }
         } catch { /* Failures never include request bodies or secret URLs. */ }
         if (code === 'CLI_COMMAND_FAILED') {
           const detail = error as {stderr?: unknown; stdout?: unknown; code?: unknown; signal?: unknown};
@@ -273,8 +283,26 @@ describe('local publishing prototype and capability-scoped package retrieval', (
     await writeFile(oversizedManifestPath, JSON.stringify(oversizedManifest));
     await expect(run('publish', oversizedSource, '--api-url', apiOrigin)).rejects.toThrow('PACKAGE_UPLOAD_LOCAL_BETA_SIZE_LIMIT');
     expect((await readdir(store)).filter((name) => name.startsWith('upload-'))).toHaveLength(0);
-    const published = await run('publish', source,
-      '--api-url', apiOrigin, '--show-secrets');
+    let db = await miniflare.getD1Database('DB') as unknown as D1Database;
+    await new DurableRoomStorage(db, async () => {}).initialize();
+    await db.prepare("CREATE TRIGGER room_activation_fault BEFORE UPDATE OF status ON rooms WHEN NEW.status='ACTIVE' BEGIN SELECT RAISE(ABORT,'TEST_ROOM_ACTIVATION_FAULT'); END").run();
+    await expect(run('publish', source, '--api-url', apiOrigin, '--show-secrets')).rejects.toThrow('ROOM_CREATION_PENDING');
+    const pendingRooms = (await readdir(store)).filter((name) => /^room-[A-Za-z0-9_-]{22}\.json$/u.test(name));
+    expect(pendingRooms).toHaveLength(1);
+    const pendingRoomId = pendingRooms[0]!.slice(5, -5);
+    expect((await run('operations', 'status', pendingRoomId)).localStatus).toBe('PENDING');
+    expect((await db.prepare('SELECT state FROM publisher_room_operations WHERE roomId=?').bind(pendingRoomId).first<{state: string}>())?.state).toBe('DO_ACTIVE_WITH_GENESIS');
+    expect((await db.prepare('SELECT status FROM rooms WHERE id=?').bind(pendingRoomId).first<{status: string}>())?.status).toBe('PENDING');
+    const sameOrigin = apiOrigin; const port = Number(new URL(apiOrigin).port);
+    await miniflare.dispose();
+    miniflare = new Miniflare({...workerOptions, port});
+    apiOrigin = (await miniflare.ready).origin;
+    expect(apiOrigin).toBe(sameOrigin);
+    db = await miniflare.getD1Database('DB') as unknown as D1Database;
+    await db.prepare('DROP TRIGGER room_activation_fault').run();
+    await rm(join(source, 'app.worker.js'));
+    const published = await run('operations', 'resume', pendingRoomId, '--show-secrets');
+    expect((await db.prepare('SELECT status FROM rooms WHERE id=?').bind(pendingRoomId).first<{status: string}>())?.status).toBe('ACTIVE');
     expect(published.ok).toBe(true);
     const viewer = await parseInviteFragment(new URL(published.viewerInviteUrl).hash);
     const editor = await parseInviteFragment(new URL(published.editorInviteUrl).hash);
@@ -335,6 +363,31 @@ describe('local publishing prototype and capability-scoped package retrieval', (
     record.creationRequestSha256 = originalDigest;
     await saveRecord();
     expect((await run('operations', 'status', published.operationRef)).localStatus).toBe('PENDING');
+    const operationRow = await db.prepare('SELECT initBody FROM publisher_room_operations WHERE roomId=?').bind(published.roomId).first<{initBody: string}>();
+    expect(operationRow).not.toBeNull();
+    expect((await fetch(`${apiOrigin}/__publisher/rooms/${published.roomId}/init-envelope`, {method: 'POST',
+      headers: {'Content-Type': 'application/json'}, body: operationRow!.initBody})).status).toBe(404);
+    const namespace = await miniflare.getDurableObjectNamespace('ROOMS');
+    const object = namespace.get(namespace.idFromName(published.roomId));
+    const initialize = (body: string) => object.fetch(`http://internal/__publisher/rooms/${published.roomId}/init-envelope`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body});
+    expect((await initialize(operationRow!.initBody)).status).toBe(200);
+    const conflicting = JSON.parse(operationRow!.initBody) as Record<string, unknown>;
+    conflicting.operationId = randomBytes(16).toString('base64url');
+    expect((await initialize(JSON.stringify(conflicting))).status).toBe(409);
+    const extra = JSON.parse(operationRow!.initBody) as Record<string, unknown>; extra.unexpected = true;
+    expect((await initialize(JSON.stringify(extra))).status).toBe(400);
+    // Simulate a stale D1 mirror while the authoritative DO retains its receipt.
+    await db.prepare("UPDATE rooms SET status='PENDING' WHERE id=?").bind(published.roomId).run();
+    await db.prepare("UPDATE publisher_room_operations SET state='DO_ACTIVE_WITH_GENESIS' WHERE roomId=?").bind(published.roomId).run();
+    const localNamespace: PublisherRoomNamespace = {idFromName: (name) => namespace.idFromName(name), get: (id) => ({
+      fetch: async (request) => {
+        const result = await namespace.get(id).fetch(request.url, {method: 'POST',
+          headers: {'Content-Type': 'application/json'}, body: await request.arrayBuffer()});
+        return new Response(null, {status: result.status});
+      },
+    })};
+    expect(await new DurableRoomStorage(db, async () => {}).reconcile(localNamespace)).toEqual({activated: 1, pending: 0});
     const resumed = await run('operations', 'resume', published.operationRef, '--show-secrets');
     expect(resumed.ok).toBe(true);
     const fingerprint = (value: string) => createHash('sha256').update(value).digest('hex');
@@ -548,6 +601,8 @@ describe('local publishing prototype and capability-scoped package retrieval', (
       writerPublicKey: encodeBase64Url(randomBytes(32))}})).status).toBe(400);
     expect((await createRoom({...roomBody, envelope: {...genesis.envelope,
       writerSignature: encodeBase64Url(randomBytes(64))}})).status).toBe(400);
+    const db = await miniflare.getD1Database('DB');
+    expect((await db.prepare('SELECT COUNT(*) AS count FROM publisher_room_operations WHERE operationId=?').bind(roomOpId).first<{count: number}>())?.count).toBe(0);
     const roomRes = await createRoom(roomBody);
     expect(roomRes.status).toBe(201);
     const roomData = (await roomRes.json()) as {ok: boolean; roomId: string};
@@ -571,6 +626,21 @@ describe('local publishing prototype and capability-scoped package retrieval', (
     const restored = await decryptSnapshot({roomKey, expectedWriterPublicKey: writerPub, expectedAppId: 'test.package',
       roomId, packageDigest: expectedPkgDigest, envelope: await encryptedState.json()});
     expect(restored.automergeBytes).toEqual(Uint8Array.of(1, 2, 3));
+
+    const next = await encryptSnapshot({roomKey, writerPrivateKey: writerPriv, roomId, appId: 'test.package',
+      packageDigest: expectedPkgDigest, stateEpoch: 0, proposedRevision: 2,
+      previousEnvelopeDigest: encodeBase64Url(genesis.envelopeDigest), automergeBytes: Uint8Array.of(1, 2, 3, 4)});
+    expect((await fetch(`${apiOrigin}/v1/rooms/${roomId}/state`, {method: 'PUT', body: JSON.stringify(next.envelope),
+      headers: {Origin: CONTROLLER_ORIGIN, Authorization: `SF-Cap ${encodeBase64Url(editorCap)}`,
+        'Content-Type': 'application/json', 'If-Match': encryptedState.headers.get('ETag')!}})).status).toBe(204);
+    const receipt = await db.prepare('SELECT initBody FROM publisher_room_operations WHERE operationId=?').bind(roomOpId).first<{initBody: string}>();
+    const roomNamespace = await miniflare.getDurableObjectNamespace('ROOMS');
+    const roomObject = roomNamespace.get(roomNamespace.idFromName(roomId));
+    expect((await roomObject.fetch(`http://internal/__publisher/rooms/${roomId}/init-envelope`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: receipt!.initBody})).status).toBe(200);
+    const advanced = await fetch(`${apiOrigin}/v1/rooms/${roomId}/state`, {headers: roomHeaders});
+    expect(advanced.headers.get('ETag')).toBe(next.etag);
+    expect((await advanced.json() as {revision: number}).revision).toBe(2);
 
     // Test-only encrypted genesis pins the package in authoritative DO state.
     const encryptedRoomId = encodeBase64Url(randomBytes(16));
