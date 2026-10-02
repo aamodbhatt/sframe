@@ -5,7 +5,7 @@ import {resolve} from 'node:path';
 // no application or publisher code receives this trusted verifier import.
 export const compiledVerifierPlugin = ({worker = false} = {}) => {
   const artifact = resolve('target/server-verifier-wasm/smallframe_server_verifier_bg.wasm');
-  const migrations = new Set(['0001-local-publisher.sql', '0002-local-package-versions.sql'].map((name) => resolve('infra/migrations', name)));
+  const migrations = new Set(['0001-local-publisher.sql', '0002-local-package-versions.sql', '0003-local-publisher-authority.sql'].map((name) => resolve('infra/migrations', name)));
   const virtual = '\0smallframe-compiled-verifier';
   return {
     name: 'smallframe-compiled-verifier',

@@ -29,6 +29,7 @@ export type StoredInvite = {
 };
 
 export type StoredPublisher = {
+  publisherId?: string;
   publisherKeyId: string;
   publisherPublicKey: string;
   tokenHash: string;

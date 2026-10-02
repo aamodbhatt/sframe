@@ -1,5 +1,6 @@
 import type {D1Database} from '@cloudflare/workers-types';
 import initial from '../../../infra/migrations/0001-local-publisher.sql';
+import authority from '../../../infra/migrations/0003-local-publisher-authority.sql';
 import versions from '../../../infra/migrations/0002-local-package-versions.sql';
 import {encodeBase64Url} from '../../../packages/protocol/src/index.js';
 import {fail} from './publisher-storage-errors.js';
@@ -9,7 +10,7 @@ import {fail} from './publisher-storage-errors.js';
 export const migratePublisherSchema = async (db: D1Database): Promise<void> => {
   await db.prepare('CREATE TABLE IF NOT EXISTS publisher_schema_migrations(version INTEGER PRIMARY KEY, checksum TEXT NOT NULL)').run();
   const applied = await db.prepare('SELECT version,checksum FROM publisher_schema_migrations ORDER BY version').all<{version: number; checksum: string}>();
-  const migrations = [initial, versions];
+  const migrations = [initial, versions, authority];
   if (applied.results.some((row, index) => row.version !== index + 1) || applied.results.length > migrations.length) fail(503, 'PUBLISHER_SCHEMA_INVALID');
   for (const [index, sql] of migrations.entries()) {
     const version = index + 1;

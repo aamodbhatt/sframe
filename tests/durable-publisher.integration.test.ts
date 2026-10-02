@@ -170,7 +170,8 @@ describe('real local D1/R2 publisher durability and fault boundaries', () => {
   it('rolls back an interrupted version migration and preserves preceding publisher data', async () => {
     const {db, bucket} = await fixture();
     await db.prepare('DROP TABLE app_versions').run(); await db.prepare('DROP TABLE apps').run();
-    await db.prepare('DELETE FROM publisher_schema_migrations WHERE version=2').run();
+    await db.prepare('DELETE FROM publisher_schema_migrations WHERE version>=2').run();
+    await db.prepare('DROP TABLE api_tokens').run(); await db.prepare('DROP TABLE invite_codes').run();
     const broken = {prepare: db.prepare.bind(db), batch: (statements: Parameters<D1Database['batch']>[0]) =>
       db.batch([...statements, db.prepare('INSERT INTO nonexistent_migration_fault VALUES(1)')])} as unknown as D1Database;
     await expect(new DurablePublisherStorage(broken, bucket).initialize()).rejects.toThrow();
@@ -178,7 +179,7 @@ describe('real local D1/R2 publisher durability and fault boundaries', () => {
     expect((await db.prepare('SELECT COUNT(*) AS n FROM publishers').first<{n: number}>())?.n).toBe(1);
     expect((await db.prepare('SELECT COUNT(*) AS n FROM publisher_schema_migrations').first<{n: number}>())?.n).toBe(1);
     await new DurablePublisherStorage(db, bucket).initialize();
-    expect((await db.prepare('SELECT COUNT(*) AS n FROM publisher_schema_migrations').first<{n: number}>())?.n).toBe(2);
+    expect((await db.prepare('SELECT COUNT(*) AS n FROM publisher_schema_migrations').first<{n: number}>())?.n).toBe(3);
   });
 
   it('rejects copied verification metadata and altered bytes before any persistent reservation', async () => {
@@ -193,6 +194,114 @@ describe('real local D1/R2 publisher durability and fault boundaries', () => {
     expect((await db.prepare('SELECT COUNT(*) AS n FROM app_versions').first<{n: number}>())?.n).toBe(0);
     expect((await db.prepare('SELECT COUNT(*) AS n FROM publisher_upload_operations').first<{n: number}>())?.n).toBe(0);
     expect(await bucket.head(`packages/${record.packageDigest}.zip`)).toBeNull();
+  });
+
+  it('upgrades prior enrollment authority without reviving revoked tokens and preserves registered publisher IDs', async () => {
+    const {storage, db, enroll, restart} = await fixture();
+    const active = await enroll(); const revoked = await enroll();
+    const result = await storage.enroll(active.record, active.digest);
+    await storage.enroll(revoked.record, revoked.digest); await storage.revoke(revoked.record.tokenHash);
+    await db.prepare('DROP TABLE api_tokens').run(); await db.prepare('DROP TABLE invite_codes').run();
+    await db.prepare('DELETE FROM publisher_schema_migrations WHERE version=3').run();
+    const registeredId = randomBytes(16).toString('base64url');
+    await db.prepare('UPDATE publishers SET id=? WHERE key_id=?').bind(registeredId, active.record.publisherKeyId).run();
+    const upgraded = await restart();
+    expect(await upgraded.replayEnrollment(active.record, active.digest)).toBe(result.body);
+    expect((await upgraded.publisher(active.record.tokenHash))?.publisherId).toBe(registeredId);
+    expect(await upgraded.publisher(revoked.record.tokenHash)).toBeNull();
+    await expect(upgraded.replayEnrollment(revoked.record, revoked.digest)).rejects.toMatchObject({code: 'PUBLISHER_REVOKED'});
+    expect((await upgraded.db.prepare('SELECT publisher_id FROM invite_codes WHERE code_hash=?').bind(active.record.inviteCodeHash)
+      .first<{publisher_id: string}>())?.publisher_id).toBe(registeredId);
+    expect((await upgraded.db.prepare('SELECT COUNT(*) AS n FROM publisher_schema_migrations').first<{n: number}>())?.n).toBe(3);
+  });
+
+  it('upgrades populated authority under concurrent startup and rejects conflicting copied records atomically', async () => {
+    const {storage, db, bucket, enroll} = await fixture(); const enrollment = await enroll();
+    await storage.enroll(enrollment.record, enrollment.digest);
+    await db.prepare('DROP TABLE api_tokens').run(); await db.prepare('DROP TABLE invite_codes').run();
+    await db.prepare('DELETE FROM publisher_schema_migrations WHERE version=3').run();
+    let arrivals = 0; let release!: () => void;
+    const barrier = new Promise<void>((resolve) => {release = resolve;});
+    const racingDb = {batch: db.batch.bind(db), prepare: (sql: string) => {
+      const statement = db.prepare(sql);
+      if (sql !== 'SELECT version,checksum FROM publisher_schema_migrations ORDER BY version') return statement;
+      return new Proxy(statement, {get(target, property) {
+        if (property === 'all') return async () => {
+          const rows = await target.all(); arrivals++; if (arrivals === 2) release(); await barrier; return rows;
+        };
+        const value = Reflect.get(target, property); return typeof value === 'function' ? value.bind(target) : value;
+      }});
+    }} as unknown as D1Database;
+    const starts = await Promise.allSettled([1, 2].map(() => new DurablePublisherStorage(racingDb, bucket).initialize()));
+    expect(starts.map((start) => start.status)).toEqual(['fulfilled', 'fulfilled']);
+    expect(await new DurablePublisherStorage(db, bucket).publisher(enrollment.record.tokenHash)).not.toBeNull();
+    const original = await db.prepare('SELECT created_at FROM api_tokens WHERE token_hash=?').bind(enrollment.record.tokenHash)
+      .first<{created_at: number}>();
+    await db.prepare('DELETE FROM publisher_schema_migrations WHERE version=3').run();
+    await db.prepare('UPDATE api_tokens SET created_at=created_at+1 WHERE token_hash=?').bind(enrollment.record.tokenHash).run();
+    await expect(new DurablePublisherStorage(db, bucket).initialize()).rejects.toThrow();
+    expect(await db.prepare('SELECT version FROM publisher_schema_migrations WHERE version=3').first()).toBeNull();
+    expect((await db.prepare('SELECT created_at FROM api_tokens WHERE token_hash=?').bind(enrollment.record.tokenHash)
+      .first<{created_at: number}>())?.created_at).toBe(original!.created_at + 1);
+    await db.prepare('UPDATE api_tokens SET created_at=created_at-1 WHERE token_hash=?').bind(enrollment.record.tokenHash).run();
+    await db.prepare('UPDATE invite_codes SET expires_at=expires_at+1 WHERE code_hash=?').bind(enrollment.record.inviteCodeHash).run();
+    await expect(new DurablePublisherStorage(db, bucket).initialize()).rejects.toThrow();
+    expect(await db.prepare('SELECT version FROM publisher_schema_migrations WHERE version=3').first()).toBeNull();
+    await db.prepare('UPDATE invite_codes SET expires_at=expires_at-1 WHERE code_hash=?').bind(enrollment.record.inviteCodeHash).run();
+    expect(await new DurablePublisherStorage(db, bucket).publisher(enrollment.record.tokenHash)).not.toBeNull();
+  });
+
+  it('rejects missing, mismatched, suspended or separately revoked token authority and buckets successful use by UTC day', async () => {
+    const {storage, db, enroll, advance} = await fixture(); const enrollment = await enroll();
+    await storage.enroll(enrollment.record, enrollment.digest);
+    const token = enrollment.record.tokenHash; const owner = enrollment.record.publisherKeyId;
+    expect((await storage.publisher(token))?.publisherKeyId).toBe(owner);
+    const first = await db.prepare('SELECT last_used_bucket,created_at FROM api_tokens WHERE token_hash=?').bind(token)
+      .first<{last_used_bucket: number; created_at: number}>();
+    expect(first!.last_used_bucket % 86_400_000).toBe(0);
+    advance(1000); await storage.publisher(token);
+    expect((await db.prepare('SELECT last_used_bucket FROM api_tokens WHERE token_hash=?').bind(token)
+      .first<{last_used_bucket: number}>())?.last_used_bucket).toBe(first!.last_used_bucket);
+    advance(86_400_000); await storage.publisher(token);
+    expect((await db.prepare('SELECT last_used_bucket FROM api_tokens WHERE token_hash=?').bind(token)
+      .first<{last_used_bucket: number}>())?.last_used_bucket).toBe(first!.last_used_bucket + 86_400_000);
+    await db.prepare('UPDATE api_tokens SET publisher_id=? WHERE token_hash=?').bind(cases.canonical.publisherKeyId, token).run();
+    expect(await storage.publisher(token)).toBeNull();
+    await expect(storage.replayEnrollment(enrollment.record, enrollment.digest)).rejects.toMatchObject({code: 'ENROLLMENT_RECORD_INVALID'});
+    await db.prepare('UPDATE api_tokens SET publisher_id=?,created_at=created_at+1 WHERE token_hash=?').bind(owner, token).run();
+    expect(await storage.publisher(token)).toBeNull();
+    await db.prepare('UPDATE api_tokens SET created_at=created_at-1 WHERE token_hash=?').bind(token).run();
+    await db.prepare("UPDATE publishers SET status='SUSPENDED' WHERE key_id=?").bind(owner).run();
+    expect(await storage.publisher(token)).toBeNull();
+    await expect(storage.replayEnrollment(enrollment.record, enrollment.digest)).rejects.toMatchObject({code: 'PUBLISHER_REVOKED'});
+    await db.prepare("UPDATE publishers SET status='ACTIVE' WHERE key_id=?").bind(owner).run();
+    await db.prepare('UPDATE api_tokens SET revoked_at=? WHERE token_hash=?').bind(Date.now(), token).run();
+    expect(await storage.publisher(token)).toBeNull();
+    await expect(storage.replayEnrollment(enrollment.record, enrollment.digest)).rejects.toMatchObject({code: 'PUBLISHER_REVOKED'});
+    await db.prepare('DELETE FROM api_tokens WHERE token_hash=?').bind(token).run();
+    expect(await storage.publisher(token)).toBeNull();
+    await expect(storage.replayEnrollment(enrollment.record, enrollment.digest)).rejects.toMatchObject({code: 'ENROLLMENT_RECORD_INVALID'});
+  });
+
+  it('rolls back token activation with invite consumption and revokes both authority records atomically', async () => {
+    const {storage, db, enroll, advance} = await fixture(); const enrollment = await enroll();
+    await db.prepare("CREATE TRIGGER token_activation_fault BEFORE INSERT ON api_tokens BEGIN SELECT RAISE(ABORT,'TOKEN_ACTIVATION_FAULT'); END").run();
+    await expect(storage.enroll(enrollment.record, enrollment.digest)).rejects.toMatchObject({code: 'ENROLLMENT_CONFLICT'});
+    expect((await db.prepare('SELECT used_at FROM invite_codes WHERE code_hash=?').bind(enrollment.record.inviteCodeHash)
+      .first<{used_at: number | null}>())?.used_at).toBeNull();
+    expect(await db.prepare('SELECT token_hash FROM api_tokens WHERE token_hash=?').bind(enrollment.record.tokenHash).first()).toBeNull();
+    expect(await db.prepare('SELECT publisherKeyId FROM publisher_enrollments WHERE publisherKeyId=?').bind(enrollment.record.publisherKeyId).first()).toBeNull();
+    await db.prepare('DROP TRIGGER token_activation_fault').run(); await storage.enroll(enrollment.record, enrollment.digest);
+    await db.prepare("CREATE TRIGGER token_revocation_fault BEFORE UPDATE ON publisher_enrollments BEGIN SELECT RAISE(ABORT,'TOKEN_REVOCATION_FAULT'); END").run();
+    await expect(storage.revoke(enrollment.record.tokenHash)).rejects.toThrow();
+    expect((await storage.publisher(enrollment.record.tokenHash))?.publisherKeyId).toBe(enrollment.record.publisherKeyId);
+    expect((await db.prepare('SELECT revoked_at FROM api_tokens WHERE token_hash=?').bind(enrollment.record.tokenHash)
+      .first<{revoked_at: number | null}>())?.revoked_at).toBeNull();
+    await db.prepare('DROP TRIGGER token_revocation_fault').run(); await storage.revoke(enrollment.record.tokenHash);
+    expect(await storage.publisher(enrollment.record.tokenHash)).toBeNull();
+    advance(31 * 86_400_000); await storage.cleanup();
+    expect(await db.prepare('SELECT token_hash FROM api_tokens WHERE token_hash=?').bind(enrollment.record.tokenHash).first()).toBeNull();
+    expect(await storage.replayEnrollment(enrollment.record, enrollment.digest)).toBeNull();
   });
 
   it('upgrades the preceding schema without losing active packages and rejects migration drift', async () => {

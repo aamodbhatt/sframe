@@ -52,7 +52,7 @@ export class DurableRoomStorage {
         VALUES(?,'/v1/rooms',?,?,?,?,?,'D1_PENDING',?,?,?,?) ON CONFLICT DO NOTHING`)
         .bind(record.publisherKeyId, operationId, requestDigest, record.roomId, record.packageDigest, record.expiresAt, initBody, initDigest, body, now),
       this.db.prepare(`INSERT INTO rooms(id,app_version_digest,publisher_id,operation_id,request_digest,status,expires_at,created_at,updated_at)
-        SELECT ?,?,?,?,?,'PENDING',?,?,? WHERE EXISTS(SELECT 1 FROM publisher_room_operations WHERE publisherKeyId=? AND route='/v1/rooms' AND operationId=? AND requestDigest=?) ON CONFLICT DO NOTHING`)
+        SELECT ?,?,(SELECT id FROM publishers WHERE key_id=?),?,?,'PENDING',?,?,? WHERE EXISTS(SELECT 1 FROM publisher_room_operations WHERE publisherKeyId=? AND route='/v1/rooms' AND operationId=? AND requestDigest=?) ON CONFLICT DO NOTHING`)
         .bind(record.roomId, record.packageDigest, record.publisherKeyId, operationId, requestDigest, record.expiresAt, now, now,
           record.publisherKeyId, operationId, requestDigest),
     ]);
@@ -63,7 +63,7 @@ export class DurableRoomStorage {
     return {body: operation.responseBody, created: true};
   }
   private async matchingRoom(operation: RoomOperation, expectedStatus?: string): Promise<void> {
-    const room = await this.db.prepare(`SELECT status FROM rooms WHERE id=? AND app_version_digest=? AND publisher_id=? AND operation_id=? AND request_digest=? AND expires_at=?`)
+    const room = await this.db.prepare(`SELECT status FROM rooms WHERE id=? AND app_version_digest=? AND publisher_id=(SELECT id FROM publishers WHERE key_id=?) AND operation_id=? AND request_digest=? AND expires_at=?`)
       .bind(operation.roomId, operation.packageDigest, operation.publisherKeyId, operation.operationId, operation.requestDigest, operation.expiresAt)
       .first<{status: string}>();
     if (!room || expectedStatus && room.status !== expectedStatus) fail(409, 'ROOM_CREATION_CONFLICT');
@@ -82,10 +82,10 @@ export class DurableRoomStorage {
     await this.db.prepare("UPDATE publisher_room_operations SET state='DO_ACTIVE_WITH_GENESIS' WHERE publisherKeyId=? AND route='/v1/rooms' AND operationId=? AND state='D1_PENDING'")
       .bind(operation.publisherKeyId, operation.operationId).run();
     await this.db.batch([
-      this.db.prepare("UPDATE rooms SET status='ACTIVE',updated_at=? WHERE id=? AND publisher_id=? AND operation_id=? AND request_digest=?")
+      this.db.prepare("UPDATE rooms SET status='ACTIVE',updated_at=? WHERE id=? AND publisher_id=(SELECT id FROM publishers WHERE key_id=?) AND operation_id=? AND request_digest=?")
         .bind(this.now(), operation.roomId, operation.publisherKeyId, operation.operationId, operation.requestDigest),
       this.db.prepare(`UPDATE publisher_room_operations SET state='D1_ACTIVE',completedAt=COALESCE(completedAt,?) WHERE publisherKeyId=? AND route='/v1/rooms' AND operationId=?
-        AND EXISTS(SELECT 1 FROM rooms WHERE id=? AND status='ACTIVE' AND publisher_id=? AND operation_id=? AND request_digest=?)`)
+        AND EXISTS(SELECT 1 FROM rooms WHERE id=? AND status='ACTIVE' AND publisher_id=(SELECT id FROM publishers WHERE key_id=?) AND operation_id=? AND request_digest=?)`)
         .bind(this.now(), operation.publisherKeyId, operation.operationId, operation.roomId, operation.publisherKeyId, operation.operationId, operation.requestDigest),
     ]);
     if ((await this.operation(operation.publisherKeyId, operation.operationId))?.state !== 'D1_ACTIVE') fail(409, 'ROOM_CREATION_CONFLICT');

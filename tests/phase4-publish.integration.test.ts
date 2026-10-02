@@ -439,6 +439,12 @@ describe('local publishing prototype and capability-scoped package retrieval', (
     const publisherKeyDigest = await crypto.subtle.digest('SHA-256', publisherPub);
     const publisherKeyId = `sha256:${encodeBase64Url(new Uint8Array(publisherKeyDigest))}`;
 
+    // Registered identity is independent of its current signing-key ID.
+    const registeredPublisherId = randomBytes(16).toString('base64url');
+    const publisherDb = await miniflare.getD1Database('DB');
+    await publisherDb.prepare('INSERT INTO publishers(id,public_key,key_id,created_at) VALUES(?,?,?,?)')
+      .bind(registeredPublisherId, encodeBase64Url(publisherPub), publisherKeyId, Date.now()).run();
+
     const rawToken = randomBytes(32);
     const tokenHash = createHash('sha256').update(rawToken).digest();
     const operationId = randomBytes(16);
@@ -622,6 +628,8 @@ describe('local publishing prototype and capability-scoped package retrieval', (
     const roomData = (await roomRes.json()) as {ok: boolean; roomId: string};
     expect(roomData.ok).toBe(true);
     expect(roomData.roomId).toBe(roomId);
+    expect((await db.prepare('SELECT publisher_id FROM rooms WHERE id=?').bind(roomId)
+      .first<{publisher_id: string}>())?.publisher_id).toBe(registeredPublisherId);
     expect((await createRoom(roomBody)).status).toBe(200);
     expect((await createRoom({...roomBody, envelope: {...genesis.envelope,
       writerSignature: encodeBase64Url(randomBytes(64))}})).status).toBe(409);

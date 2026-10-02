@@ -2,6 +2,7 @@ import type {D1Database, R2Bucket, R2Object} from '@cloudflare/workers-types';
 import {decodeBase64Url, encodeBase64Url, type PublisherEnrollmentRecord} from '../../../packages/protocol/src/index.js';
 import {fail} from './publisher-storage-errors.js';
 import {migratePublisherSchema} from './publisher-schema-migrations.js';
+import {PublisherAuthority} from './publisher-authority.js';
 import {PublisherVersionIndex} from './publisher-version-index.js';
 import {verifyUploadedPackage, isVerifiedInspection, type PackageManifestMetadata} from './package-verifier.js';
 import {DurableRoomStorage} from './durable-room-storage.js';
@@ -47,8 +48,10 @@ const validateInspectedBytes = async (record: StoredPackageRecord, inspected: Re
 export class DurablePublisherStorage {
   private ready: Promise<unknown> | undefined;
   readonly rooms: DurableRoomStorage;
+  private readonly authority: PublisherAuthority;
   private readonly versions: PublisherVersionIndex;
   constructor(readonly db: D1Database, readonly bucket: R2Bucket, readonly now = Date.now) {
+    this.authority = new PublisherAuthority(db, now);
     this.versions = new PublisherVersionIndex(db);
     this.rooms = new DurableRoomStorage(db, () => this.initialize(), now);
   }
@@ -58,13 +61,11 @@ export class DurablePublisherStorage {
   }
   async createInvite(record: StoredInvite): Promise<boolean> {
     await this.initialize();
-    const result = await this.db.prepare('INSERT INTO publisher_invites(codeHash,createdAt,expiresAt) VALUES(?,?,?) ON CONFLICT(codeHash) DO NOTHING')
-      .bind(record.codeHash, record.createdAt, record.expiresAt).run();
-    return result.meta.changes === 1;
+    return this.authority.createInvite(record);
   }
   async publisher(tokenHash: string): Promise<StoredPublisher | null> {
     await this.initialize();
-    return this.db.prepare('SELECT publisherKeyId,publisherPublicKey,tokenHash,enrolledAt FROM publisher_enrollments WHERE tokenHash=? AND revokedAt IS NULL').bind(tokenHash).first<StoredPublisher>();
+    return this.authority.publisher(tokenHash);
   }
   private async enrollment(publisherKeyId: string, operationId: string): Promise<EnrollmentRow | null> {
     return this.db.prepare('SELECT * FROM publisher_enrollments WHERE publisherKeyId=? AND operationId=?').bind(publisherKeyId, operationId).first<EnrollmentRow>();
@@ -77,7 +78,7 @@ export class DurablePublisherStorage {
     if (saved.publisherPublicKey !== record.publisherPublicKey || saved.tokenHash !== record.tokenHash
       || !Number.isSafeInteger(saved.enrolledAt)
       || saved.responseBody !== JSON.stringify({ok: true, publisherKeyId: record.publisherKeyId, enrolledAt: saved.enrolledAt})) fail(409, 'ENROLLMENT_RECORD_INVALID');
-    if (saved.revokedAt !== null) fail(403, 'PUBLISHER_REVOKED');
+    await this.authority.assertEnrollment(saved);
     return saved.responseBody;
   }
   async enroll(record: PublisherEnrollmentRecord, requestDigest: string): Promise<{body: string; created: boolean}> {
@@ -89,17 +90,7 @@ export class DurablePublisherStorage {
     // Uniqueness failures roll back every statement; the conditional insert
     // prevents concurrent different publishers from consuming one invite.
     try {
-      await this.db.batch([
-        this.db.prepare(`INSERT INTO publishers(id,public_key,key_id,created_at)
-          SELECT ?,?,?,? FROM publisher_invites WHERE codeHash=? AND usedAt IS NULL AND expiresAt>=? ON CONFLICT(key_id) DO NOTHING`)
-          .bind(record.publisherKeyId, record.publisherPublicKey, record.publisherKeyId, now, record.inviteCodeHash, now),
-        this.db.prepare(`INSERT INTO publisher_enrollments(publisherKeyId,publisherPublicKey,tokenHash,enrolledAt,inviteCodeHash,operationId,requestDigest,responseBody)
-          SELECT ?,?,?,?,?,?,?,? FROM publisher_invites WHERE codeHash=? AND usedAt IS NULL AND expiresAt>=?`)
-          .bind(record.publisherKeyId, record.publisherPublicKey, record.tokenHash, now, record.inviteCodeHash, record.operationId, requestDigest, responseBody, record.inviteCodeHash, now),
-        this.db.prepare(`UPDATE publisher_invites SET usedAt=?,usedByPublisherKeyId=? WHERE codeHash=? AND usedAt IS NULL
-          AND EXISTS(SELECT 1 FROM publisher_enrollments WHERE publisherKeyId=? AND operationId=? AND requestDigest=?)`)
-          .bind(now, record.publisherKeyId, record.inviteCodeHash, record.publisherKeyId, record.operationId, requestDigest),
-      ]);
+      await this.db.batch(this.authority.enrollmentStatements(record, requestDigest, responseBody, now));
     } catch {
       const raced = await this.replayEnrollment(record, requestDigest);
       if (raced) return {body: raced, created: false};
@@ -111,7 +102,7 @@ export class DurablePublisherStorage {
   }
   async revoke(tokenHash: string): Promise<void> {
     await this.initialize();
-    await this.db.prepare('UPDATE publisher_enrollments SET revokedAt=? WHERE tokenHash=? AND revokedAt IS NULL').bind(this.now(), tokenHash).run();
+    await this.authority.revoke(tokenHash);
   }
   private operation(publisher: string, operationId: string): Promise<UploadRow | null> {
     return this.db.prepare("SELECT * FROM publisher_upload_operations WHERE publisherKeyId=? AND route='/v1/packages' AND operationId=?").bind(publisher, operationId).first<UploadRow>();
@@ -239,6 +230,7 @@ export class DurablePublisherStorage {
     await this.initialize();
     // Active enrollment results survive beyond 24h until revocation+30 days.
     await this.db.batch([
+      this.authority.cleanupStatement(this.now() - 30 * 86_400_000),
       this.db.prepare('DELETE FROM publisher_enrollments WHERE revokedAt IS NOT NULL AND revokedAt<?').bind(this.now() - 30 * 86_400_000),
       this.db.prepare("DELETE FROM publisher_upload_operations WHERE state='D1_ACTIVE' AND completedAt<?").bind(this.now() - 86_400_000),
     ]);
