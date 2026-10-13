@@ -41,7 +41,7 @@ fn decode_canonical(value: &str, maximum: usize) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-fn valid_target(value: &str) -> bool {
+pub(crate) fn valid_target(value: &str) -> bool {
     if value.len() > 2_048
         || value
             .bytes()

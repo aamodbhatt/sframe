@@ -174,6 +174,8 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
     if (maintenance?.[1] && this.env.ENVIRONMENT === 'local' && request.method === 'POST') {
       return new Response(JSON.stringify(await this.deliverExpiryAlarm()), {headers: jsonHeaders});
     }
+    const ownerStatus = /^\/__publisher\/rooms\/([A-Za-z0-9_-]{22})\/status$/u.exec(url.pathname);
+    if (ownerStatus?.[1]) return this.publisherStatus(ownerStatus[1], request);
     const publisherMatch = /^\/__publisher\/rooms\/([A-Za-z0-9_-]{22})\/init-envelope$/u.exec(url.pathname);
     if (publisherMatch?.[1]) return this.initializeEncryptedForLocalTest(publisherMatch[1], request, true);
     const envelopeMatch = /^\/__phase0\/rooms\/([A-Za-z0-9_-]{22})\/init-envelope$/u.exec(url.pathname);
@@ -189,6 +191,33 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
       return new Response(JSON.stringify({waiters: this.waiters.size, sockets: this.ctx.getWebSockets().length}), {headers: jsonHeaders});
     }
     return null;
+  }
+
+  private publisherStatus(roomId: string, request: Request): Response {
+    if (this.env.ENVIRONMENT !== 'local' || request.method !== 'GET') return problem(404, 'NOT_FOUND');
+    const receipt = this.ctx.storage.sql.exec<{operation_id: string; request_digest: string; publisher_key_id: string}>(
+      'SELECT operation_id,request_digest,publisher_key_id FROM creation_receipts WHERE singleton=1').toArray()[0];
+    if (!receipt) return problem(404, 'NOT_FOUND');
+    if (request.headers.get('X-Smallframe-Publisher-Key-Id') !== receipt.publisher_key_id
+      || request.headers.get('X-Smallframe-Creation-Digest') !== receipt.request_digest) return problem(403, 'ROOM_AUTH_INVALID');
+    const room = this.loadRoom(roomId);
+    if (!room) {
+      const tombstone = this.ctx.storage.sql.exec<{terminal_kind: string}>(
+        'SELECT terminal_kind FROM room_tombstones WHERE singleton=1 AND room_id=?', roomId).toArray()[0];
+      if (!tombstone) return problem(503, 'ROOM_STATUS_UNAVAILABLE');
+      return new Response(JSON.stringify({roomId, operationId: receipt.operation_id,
+        status: tombstone.terminal_kind, stateEpoch: null, revision: null}), {headers: jsonHeaders});
+    }
+    if (!room.aad_json) return problem(503, 'ROOM_STATUS_UNAVAILABLE');
+    const pinned = JSON.parse(room.aad_json);
+    if (pinned.roomId !== roomId || pinned.packageDigest !== request.headers.get('X-Smallframe-Package-Digest')) {
+      return problem(403, 'ROOM_AUTH_INVALID');
+    }
+    const status = room.revoked_at_ms !== null ? 'REVOKED' : room.expires_at_ms <= Date.now() ? 'EXPIRED' : room.recovery_status;
+    if (!['ACTIVE', 'RECOVERY_REQUIRED', 'REVOKED', 'EXPIRED'].includes(status ?? '')) return problem(503, 'ROOM_STATUS_UNAVAILABLE');
+    const terminal = status === 'REVOKED' || status === 'EXPIRED';
+    return new Response(JSON.stringify({roomId, operationId: receipt.operation_id, status,
+      stateEpoch: terminal ? null : room.state_epoch, revision: terminal ? null : room.revision}), {headers: jsonHeaders});
   }
 
   // Test-only bootstrap: the production publisher saga must eventually supply this

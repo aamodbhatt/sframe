@@ -3,6 +3,7 @@
 mod app;
 mod identity;
 mod publish;
+mod publisher_status;
 mod snapshot;
 mod upload;
 
@@ -12,8 +13,9 @@ use identity::{IdentityContext, read_passphrase};
 use publish::{
     enroll_publisher, enrollment_operation_status, publish_package, resume_enrollment_operation,
     resume_room_operation, room_operation_status, room_request_repair, room_revoke,
-    room_rotate_links, room_status,
+    room_rotate_links,
 };
+use publisher_status::room_status;
 use serde::Serialize;
 use serde_json::json;
 use std::{

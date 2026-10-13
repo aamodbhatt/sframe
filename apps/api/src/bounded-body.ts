@@ -4,7 +4,7 @@ type BoundedBodyResult =
   | {kind: 'invalid'};
 
 // One deadline covers the entire upload; individual chunks do not renew it.
-export const readBoundedBody = async (request: Request, maximumBytes: number, timeoutMs = 5000): Promise<BoundedBodyResult> => {
+export const readBoundedBody = async (request: Pick<Request, 'body'>, maximumBytes: number, timeoutMs = 5000): Promise<BoundedBodyResult> => {
   let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {

@@ -1,3 +1,4 @@
+import {handlePublisherRoomStatus} from './publisher-room-status.js';
 import type {RuntimeEnvironment} from '../../../packages/protocol/src/runtime-config.js';
 import {handleAdminCreateInvite, handleEnrollment, handlePackageUpload, handlePublisherGetPackage,
   handleRoomCreationSaga, globalPublishStore, type PublishStore} from './publish-api.js';
@@ -24,8 +25,9 @@ export const localPublishStore = (env: Pick<PublishEnvironment, 'DB' | 'PACKAGES
 };
 
 export const handlePublishRoute = async (pathname: string, request: Request, env: PublishEnvironment): Promise<Response | null> => {
+  const statusRoute = /^\/v1\/publisher\/rooms\/([A-Za-z0-9_-]{22})$/u.exec(pathname);
   const prototypePath = ['/v1/enroll', '/v1/admin/invite', '/v1/packages', '/v1/rooms'].includes(pathname)
-    || pathname.startsWith('/v1/packages/');
+    || pathname.startsWith('/v1/packages/') || !!statusRoute;
   // The unfinished room saga and production authority
   // are local fixtures. Reject before credentials/body/DO access elsewhere.
   if (prototypePath && env.ENVIRONMENT !== 'local') {
@@ -37,6 +39,7 @@ export const handlePublishRoute = async (pathname: string, request: Request, env
   if (!prototypePath) return null;
   let store: PublishStore;
   try { store = localPublishStore(env); } catch { return new Response(null, {status: 503}); }
+  if (statusRoute?.[1]) return handlePublisherRoomStatus(request, statusRoute[1], env.ROOMS, store);
   if (pathname === '/v1/enroll' && request.method === 'POST') return handleEnrollment(request, store);
   if (pathname === '/v1/admin/invite' && request.method === 'POST') return handleAdminCreateInvite(request, store);
   if (pathname === '/v1/packages' && request.method === 'POST') return handlePackageUpload(request, store);

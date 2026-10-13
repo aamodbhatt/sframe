@@ -87,35 +87,6 @@ fn http_post_json_bytes(
     serde_json::from_str(&response_str).map_err(|_| "HTTP_RESPONSE_INVALID".to_owned())
 }
 
-fn http_get_json(url: &str, auth_header: Option<&str>) -> Result<serde_json::Value, String> {
-    let mut cmd = ProcessCommand::new("curl");
-    cmd.args([
-        "-s",
-        "-S",
-        "-X",
-        "GET",
-        url,
-        "-H",
-        "Origin: http://app.localhost:4173",
-    ]);
-    if let Some(auth) = auth_header {
-        cmd.args(["-H", &format!("Authorization: {auth}")]);
-    }
-
-    let output = cmd
-        .output()
-        .map_err(|e| format!("HTTP_REQUEST_FAILED: {e}"))?;
-    let response_str = String::from_utf8_lossy(&output.stdout);
-    if !output.status.success() {
-        return Err(format!(
-            "HTTP_ERROR: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-
-    serde_json::from_str(&response_str).map_err(|_| "HTTP_RESPONSE_INVALID".to_owned())
-}
-
 pub fn enroll_publisher(
     ctx: &IdentityContext,
     invite_file: Option<&Path>,
@@ -806,15 +777,6 @@ pub fn resume_room_operation(
         ));
     }
     Ok(result)
-}
-
-pub fn room_status(
-    _ctx: &IdentityContext,
-    room_id: &str,
-    api_url: &str,
-) -> Result<serde_json::Value, String> {
-    let url = format!("{}/v1/rooms/{}", api_url.trim_end_matches('/'), room_id);
-    http_get_json(&url, None)
 }
 
 pub fn room_rotate_links(

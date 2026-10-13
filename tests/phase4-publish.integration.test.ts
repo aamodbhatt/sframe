@@ -293,6 +293,12 @@ describe('local publishing prototype and capability-scoped package retrieval', (
     expect((await run('operations', 'status', pendingRoomId)).localStatus).toBe('PENDING');
     expect((await db.prepare('SELECT state FROM publisher_room_operations WHERE roomId=?').bind(pendingRoomId).first<{state: string}>())?.state).toBe('DO_ACTIVE_WITH_GENESIS');
     expect((await db.prepare('SELECT status FROM rooms WHERE id=?').bind(pendingRoomId).first<{status: string}>())?.status).toBe('PENDING');
+    const pendingStatus = await run('room', 'status', pendingRoomId, '--api-url', apiOrigin);
+    expect(pendingStatus.status).toBe('ACTIVE');
+    expect(pendingStatus.d1Status).toBe('STALE');
+    expect(pendingStatus.creationStatus).toBe('DO_ACTIVE_WITH_GENESIS');
+    expect(Object.keys(pendingStatus).sort()).toEqual(['creationStatus', 'd1Status', 'expiresAt', 'operationId',
+      'packageDigest', 'revision', 'roomId', 'stateEpoch', 'status']);
     const sameOrigin = apiOrigin; const port = Number(new URL(apiOrigin).port);
     await miniflare.dispose();
     miniflare = new Miniflare({...workerOptions, port});
@@ -331,6 +337,7 @@ describe('local publishing prototype and capability-scoped package retrieval', (
     expect(stored.includes('roomKey')).toBe(false);
     expect(stored.includes('creationRequest')).toBe(false);
     expect((await run('operations', 'status', published.operationRef)).localStatus).toBe('CONFIRMED');
+    expect((await run('room', 'status', published.roomId, '--api-url', apiOrigin)).d1Status).toBe('CURRENT');
     await writeFile(join(source, 'app.worker.js'), 'source changed after publication');
     const roomFile = join(store, `room-${published.roomId}.json`);
     const unlock = await readFile(join(store, 'unlock.key'));
@@ -631,6 +638,36 @@ describe('local publishing prototype and capability-scoped package retrieval', (
     expect((await db.prepare('SELECT publisher_id FROM rooms WHERE id=?').bind(roomId)
       .first<{publisher_id: string}>())?.publisher_id).toBe(registeredPublisherId);
     expect((await createRoom(roomBody)).status).toBe(200);
+    const ownerStatusUrl = `${apiOrigin}/v1/publisher/rooms/${roomId}`;
+    const ownerHeaders = {Authorization: `Bearer ${encodeBase64Url(rawToken)}`};
+    expect((await fetch(ownerStatusUrl)).status).toBe(401);
+    expect((await fetch(ownerStatusUrl, {headers: {Authorization: `SF-Cap ${encodeBase64Url(editorCap)}`}})).status).toBe(401);
+    expect((await fetch(ownerStatusUrl, {headers: {...ownerHeaders, Origin: CONTROLLER_ORIGIN}})).status).toBe(403);
+    expect((await fetch(ownerStatusUrl + '?unexpected=1', {headers: ownerHeaders})).status).toBe(400);
+    expect((await fetch(ownerStatusUrl, {method: 'POST', headers: ownerHeaders})).status).toBe(405);
+    const statusResponse = await fetch(ownerStatusUrl, {headers: ownerHeaders});
+    expect(statusResponse.status).toBe(200);
+    expect(statusResponse.headers.get('Cache-Control')).toBe('private, no-store');
+    const statusData = await statusResponse.json() as Record<string, unknown>;
+    expect(Object.keys(statusData).sort()).toEqual(['creationStatus', 'd1Status', 'expiresAt', 'operationId',
+      'packageDigest', 'revision', 'roomId', 'stateEpoch', 'status']);
+    expect(statusData).toMatchObject({roomId, status: 'ACTIVE', d1Status: 'CURRENT', stateEpoch: 0, revision: 1});
+    const strangerInvite = randomBytes(24).toString('base64url'); const strangerToken = randomBytes(32);
+    expect((await fetch(`${apiOrigin}/v1/admin/invite`, {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({code: strangerInvite})})).status).toBe(201);
+    const strangerEnrollment = await createSignedEnrollment({publisherPrivateKey: randomBytes(32),
+      tokenHash: createHash('sha256').update(strangerToken).digest(), operationId: randomBytes(16),
+      inviteCodeHash: createHash('sha256').update(strangerInvite).digest()});
+    expect((await fetch(`${apiOrigin}/v1/enroll`, {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({jcsBytes: encodeBase64Url(strangerEnrollment.jcsBytes),
+        signature: encodeBase64Url(strangerEnrollment.signature)})})).status).toBe(201);
+    const strangerHeaders = {Authorization: `Bearer ${encodeBase64Url(strangerToken)}`};
+    expect((await fetch(ownerStatusUrl, {headers: strangerHeaders})).status).toBe(404);
+    // Even a corrupted D1 ownership mirror cannot grant authority over the DO receipt.
+    await db.prepare('UPDATE rooms SET publisher_id=? WHERE id=?').bind(strangerEnrollment.record.publisherKeyId, roomId).run();
+    expect((await fetch(ownerStatusUrl, {headers: strangerHeaders})).status).toBe(404);
+    await db.prepare('UPDATE rooms SET publisher_id=? WHERE id=?').bind(registeredPublisherId, roomId).run();
+    expect((await fetch(`${apiOrigin}/__publisher/rooms/${roomId}/status`, {headers: ownerHeaders})).status).toBe(404);
     expect((await createRoom({...roomBody, envelope: {...genesis.envelope,
       writerSignature: encodeBase64Url(randomBytes(64))}})).status).toBe(409);
 
@@ -671,6 +708,19 @@ describe('local publishing prototype and capability-scoped package retrieval', (
     const advanced = await fetch(`${apiOrigin}/v1/rooms/${roomId}/state`, {headers: roomHeaders});
     expect(advanced.headers.get('ETag')).toBe(next.etag);
     expect((await advanced.json() as {revision: number}).revision).toBe(2);
+    expect(await (await fetch(ownerStatusUrl, {headers: ownerHeaders})).json()).toMatchObject({revision: 2, status: 'ACTIVE'});
+    const ownedStorage = await miniflare.unsafeGetDurableObjectStorage(WORKER_NAME, DO_CLASS, {name: roomId});
+    await ownedStorage.exec("UPDATE room_state SET recovery_status='RECOVERY_REQUIRED'");
+    expect(await (await fetch(ownerStatusUrl, {headers: ownerHeaders})).json())
+      .toMatchObject({status: 'RECOVERY_REQUIRED', d1Status: 'STALE', revision: 2});
+    expect((await db.prepare('SELECT status FROM rooms WHERE id=?').bind(roomId).first<{status: string}>())?.status).toBe('ACTIVE');
+    await ownedStorage.exec("UPDATE room_state SET recovery_status='UNKNOWN'");
+    expect((await fetch(ownerStatusUrl, {headers: ownerHeaders})).status).toBe(503);
+    await ownedStorage.exec("UPDATE room_state SET recovery_status='ACTIVE',expires_at_ms=?", Date.now() - 1);
+    expect((await fetch(`${apiOrigin}/__phase0/rooms/${roomId}/expiry-maintenance`, {method: 'POST'})).status).toBe(200);
+    expect(await (await fetch(ownerStatusUrl, {headers: ownerHeaders})).json())
+      .toMatchObject({status: 'EXPIRED', d1Status: 'STALE', stateEpoch: null, revision: null});
+    expect((await fetch(ownerStatusUrl, {headers: strangerHeaders})).status).toBe(404);
 
     // Test-only encrypted genesis pins the package in authoritative DO state.
     const encryptedRoomId = encodeBase64Url(randomBytes(16));
