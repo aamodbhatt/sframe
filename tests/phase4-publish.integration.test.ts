@@ -314,6 +314,10 @@ describe('local publishing prototype and capability-scoped package retrieval', (
     const editor = await parseInviteFragment(new URL(published.editorInviteUrl).hash);
     expect(viewer.descriptor.packageDigest).toBe(published.packageDigest);
     expect(editor.descriptor.packageDigest).toBe(published.packageDigest);
+    const resumedBindingStorage = await miniflare.unsafeGetDurableObjectStorage(WORKER_NAME, DO_CLASS, {name: published.roomId});
+    expect((await resumedBindingStorage.exec('SELECT publisher_key_id,viewer_descriptor_digest,editor_descriptor_digest FROM room_owner_binding'))[0])
+      .toEqual({publisher_key_id: published.publisherKeyId, viewer_descriptor_digest: encodeBase64Url(viewer.descriptorDigest),
+        editor_descriptor_digest: encodeBase64Url(editor.descriptorDigest)});
     const headers = {Origin: CONTROLLER_ORIGIN, Authorization: `SF-Cap ${encodeBase64Url(viewer.capability)}`};
     const packageResponse = await fetch(`${apiOrigin}/v1/rooms/${viewer.descriptor.roomId}/packages/${published.packageDigest}`, {headers});
     expect(packageResponse.status).toBe(200);
@@ -630,6 +634,16 @@ describe('local publishing prototype and capability-scoped package retrieval', (
       writerSignature: encodeBase64Url(randomBytes(64))}})).status).toBe(400);
     const db = await miniflare.getD1Database('DB');
     expect((await db.prepare('SELECT COUNT(*) AS count FROM publisher_room_operations WHERE operationId=?').bind(roomOpId).first<{count: number}>())?.count).toBe(0);
+    const bindingNamespace = await miniflare.getDurableObjectNamespace('ROOMS');
+    const bindingObject = bindingNamespace.get(bindingNamespace.idFromName(roomId));
+    expect((await bindingObject.fetch(`http://internal/__publisher/rooms/${roomId}/status`)).status).toBe(404);
+    const bindingStorage = await miniflare.unsafeGetDurableObjectStorage(WORKER_NAME, DO_CLASS, {name: roomId});
+    await bindingStorage.exec("CREATE TRIGGER owner_binding_fault BEFORE INSERT ON room_owner_binding BEGIN SELECT RAISE(ABORT,'SIMULATED_OWNER_BINDING_FAULT'); END");
+    expect((await createRoom(roomBody)).status).toBe(503);
+    for (const table of ['room_state', 'creation_receipts', 'room_owner_binding']) {
+      expect((await bindingStorage.exec(`SELECT COUNT(*) AS n FROM ${table}`))[0]?.n).toBe(0);
+    }
+    await bindingStorage.exec('DROP TRIGGER owner_binding_fault');
     const roomRes = await createRoom(roomBody);
     expect(roomRes.status).toBe(201);
     const roomData = (await roomRes.json()) as {ok: boolean; roomId: string};
@@ -638,6 +652,11 @@ describe('local publishing prototype and capability-scoped package retrieval', (
     expect((await db.prepare('SELECT publisher_id FROM rooms WHERE id=?').bind(roomId)
       .first<{publisher_id: string}>())?.publisher_id).toBe(registeredPublisherId);
     expect((await createRoom(roomBody)).status).toBe(200);
+    const pinnedOwner = (await bindingStorage.exec('SELECT * FROM room_owner_binding'))[0];
+    expect(pinnedOwner).toMatchObject({room_id: roomId, package_digest: expectedPkgDigest, publisher_key_id: publisherKeyId,
+      publisher_public_key: encodeBase64Url(publisherPub),
+      viewer_descriptor_digest: encodeBase64Url(viewerDesc.descriptorDigest),
+      editor_descriptor_digest: encodeBase64Url(editorDesc.descriptorDigest)});
     const ownerStatusUrl = `${apiOrigin}/v1/publisher/rooms/${roomId}`;
     const ownerHeaders = {Authorization: `Bearer ${encodeBase64Url(rawToken)}`};
     expect((await fetch(ownerStatusUrl)).status).toBe(401);
@@ -705,9 +724,49 @@ describe('local publishing prototype and capability-scoped package retrieval', (
     const roomObject = roomNamespace.get(roomNamespace.idFromName(roomId));
     expect((await roomObject.fetch(`http://internal/__publisher/rooms/${roomId}/init-envelope`, {
       method: 'POST', headers: {'Content-Type': 'application/json'}, body: receipt!.initBody})).status).toBe(200);
+    const alteredOwner = JSON.parse(receipt!.initBody) as Record<string, any>;
+    alteredOwner.ownerBinding.viewerDescriptorDigest = randomBytes(32).toString('base64url');
+    expect((await roomObject.fetch(`http://internal/__publisher/rooms/${roomId}/init-envelope`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(alteredOwner)})).status).toBe(409);
+    alteredOwner.ownerBinding.publisherPublicKey = randomBytes(32).toString('base64url');
+    expect((await roomObject.fetch(`http://internal/__publisher/rooms/${roomId}/init-envelope`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(alteredOwner)})).status).toBe(400);
     const advanced = await fetch(`${apiOrigin}/v1/rooms/${roomId}/state`, {headers: roomHeaders});
     expect(advanced.headers.get('ETag')).toBe(next.etag);
     expect((await advanced.json() as {revision: number}).revision).toBe(2);
+    const legacyRoomId = randomBytes(16).toString('base64url');
+    const legacyGenesis = await encryptSnapshot({roomKey: randomBytes(32), writerPrivateKey: writerPriv,
+      roomId: legacyRoomId, appId: 'test.package', packageDigest: expectedPkgDigest, stateEpoch: 0,
+      proposedRevision: 1, previousEnvelopeDigest: encodeBase64Url(new Uint8Array(32)), automergeBytes: randomBytes(8)});
+    const legacyInit = {...JSON.parse(receipt!.initBody), envelope: legacyGenesis.envelope,
+      operationId: randomBytes(16).toString('base64url'), requestDigest: randomBytes(32).toString('base64url')};
+    const legacyOwner = legacyInit.ownerBinding; delete legacyInit.ownerBinding;
+    const legacyDescriptors = await Promise.all(['viewer', 'editor'].map((role) => createSignedRoomDescriptor({
+      roomId: legacyRoomId, packageDigest: expectedPkgDigest, publisherKeyId, publisherPrivateKey: publisherPriv,
+      writerPublicKey: writerPub, capability: role === 'viewer' ? viewerCap : editorCap,
+      role: role as 'viewer' | 'editor', expiresAt: legacyInit.expiresAtMs})));
+    const legacyPublicBody = {...roomBody, roomId: legacyRoomId, operationId: legacyInit.operationId, envelope: legacyGenesis.envelope,
+      viewerDescriptorJcs: encodeBase64Url(legacyDescriptors[0]!.jcsBytes), viewerDescriptorSignature: encodeBase64Url(legacyDescriptors[0]!.signature),
+      editorDescriptorJcs: encodeBase64Url(legacyDescriptors[1]!.jcsBytes), editorDescriptorSignature: encodeBase64Url(legacyDescriptors[1]!.signature)};
+    legacyInit.requestDigest = createHash('sha256').update(JSON.stringify(legacyPublicBody)).digest('base64url');
+    const interruptedLegacy: PublisherRoomNamespace = {idFromName: (name) => roomNamespace.idFromName(name),
+      get: () => ({fetch: async () => {throw new Error('SIMULATED_PRE_BINDING_SERVER_INTERRUPTION');}})};
+    await expect(new DurableRoomStorage(db, async () => {}).create({roomId: legacyRoomId, packageDigest: expectedPkgDigest,
+      publisherKeyId, createdAt: Date.now(), expiresAt: legacyInit.expiresAtMs,
+      viewerDescriptor: legacyDescriptors[0]!.descriptor, editorDescriptor: legacyDescriptors[1]!.descriptor},
+    legacyInit.operationId, legacyInit.requestDigest, JSON.stringify(legacyInit), interruptedLegacy))
+      .rejects.toThrow('SIMULATED_PRE_BINDING_SERVER_INTERRUPTION');
+    const originalLegacyBytes = JSON.stringify(legacyInit);
+    expect((await createRoom(legacyPublicBody)).status).toBe(201);
+    expect((await db.prepare('SELECT initBody FROM publisher_room_operations WHERE operationId=?').bind(legacyInit.operationId)
+      .first<{initBody: string}>())?.initBody).toBe(originalLegacyBytes);
+    const legacyObject = roomNamespace.get(roomNamespace.idFromName(legacyRoomId));
+    const initializeLegacy = (body: unknown) => legacyObject.fetch(`http://internal/__publisher/rooms/${legacyRoomId}/init-envelope`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+    expect((await initializeLegacy(legacyInit)).status).toBe(200);
+    expect((await initializeLegacy({...legacyInit, ownerBinding: legacyOwner})).status).toBe(409);
+    const legacyStorage = await miniflare.unsafeGetDurableObjectStorage(WORKER_NAME, DO_CLASS, {name: legacyRoomId});
+    expect(await legacyStorage.exec('SELECT COUNT(*) AS n FROM room_owner_binding')).toEqual([{n: 0}]);
     expect(await (await fetch(ownerStatusUrl, {headers: ownerHeaders})).json()).toMatchObject({revision: 2, status: 'ACTIVE'});
     const ownedStorage = await miniflare.unsafeGetDurableObjectStorage(WORKER_NAME, DO_CLASS, {name: roomId});
     await ownedStorage.exec("UPDATE room_state SET recovery_status='RECOVERY_REQUIRED'");

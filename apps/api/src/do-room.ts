@@ -1,3 +1,4 @@
+import {initializeRoomOwnerBinding, parseRoomOwnerBinding, roomOwnerKeyMatches, insertRoomOwnerBinding, roomOwnerBindingMatches, type RoomOwnerBinding} from './room-owner-binding.js';
 import {readBoundedBody} from './bounded-body.js';
 import {parseUniqueJson} from '../../../packages/protocol/src/strict-json.js';
 import {DurableObject, type DurableObjectState, type HibernatableWebSocket} from 'cloudflare:workers';
@@ -160,6 +161,7 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
     `).toArray();
     this.ctx.storage.sql.exec('CREATE INDEX IF NOT EXISTS event_tickets_expiry ON event_tickets(expires_at_ms)').toArray();
     this.ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS room_tombstones (singleton INTEGER PRIMARY KEY CHECK(singleton=1), room_id TEXT NOT NULL UNIQUE, terminal_kind TEXT NOT NULL CHECK(terminal_kind IN ('EXPIRED','REVOKED')), terminal_at_ms INTEGER NOT NULL) STRICT`).toArray();
+    initializeRoomOwnerBinding(this.ctx.storage.sql);
     this.ctx.blockConcurrencyWhile(() => this.repairLifetimeAlarm());
   }
 
@@ -223,15 +225,19 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
   // Test-only bootstrap: the production publisher saga must eventually supply this
   // same pinned genesis atomically. Never expose this route outside local mode.
   private parseCreationBinding(body: Record<string, any>, publisher: boolean):
-    {operationId: string; requestDigest: string; publisherKeyId: string} | undefined | null {
+    {operationId: string; requestDigest: string; publisherKeyId: string; owner: RoomOwnerBinding | undefined} | undefined | null {
     const keys = Object.keys(body).sort().join(',');
     if (!publisher) return keys === 'editorCapHash,envelope,expiresAtMs,viewerCapHash' ? undefined : null;
-    if (keys !== 'editorCapHash,envelope,expiresAtMs,operationId,publisherKeyId,requestDigest,viewerCapHash'
+    const owner = Object.hasOwn(body, 'ownerBinding') ? parseRoomOwnerBinding(body.ownerBinding) : undefined;
+    if (owner === null) return null;
+    const expected = owner ? 'editorCapHash,envelope,expiresAtMs,operationId,ownerBinding,publisherKeyId,requestDigest,viewerCapHash'
+      : 'editorCapHash,envelope,expiresAtMs,operationId,publisherKeyId,requestDigest,viewerCapHash';
+    if (keys !== expected
       || typeof body.operationId !== 'string' || !ROOM_ID_RE.test(body.operationId)
       || decodeBase64Url(body.operationId, 16)?.byteLength !== 16 || !decodeFixed32(body.requestDigest)
       || typeof body.publisherKeyId !== 'string' || !body.publisherKeyId.startsWith('sha256:')
       || !decodeFixed32(body.publisherKeyId.slice(7))) return null;
-    return {operationId: body.operationId, requestDigest: body.requestDigest, publisherKeyId: body.publisherKeyId};
+    return {operationId: body.operationId, requestDigest: body.requestDigest, publisherKeyId: body.publisherKeyId, owner};
   }
 
   private async initializeEncryptedForLocalTest(roomId: string, request: Request, publisher = false): Promise<Response> {
@@ -243,6 +249,7 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
       const body = parseUniqueJson(new TextDecoder('utf-8', {fatal: true}).decode(bounded.body)) as Record<string, any>;
       const binding = this.parseCreationBinding(body, publisher);
       if (binding === null) return problem(400, 'BODY_INVALID');
+      if (binding?.owner && !await roomOwnerKeyMatches(binding.owner, binding.publisherKeyId)) return problem(400, 'OWNER_KEY_INVALID');
       const configurationDigest = encodeBase64Url(await sha256(bounded.body));
       const viewer = decodeFixed32(body.viewerCapHash);
       const editor = decodeFixed32(body.editorCapHash);
@@ -261,7 +268,9 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
           if (current || receipt) return current && binding && receipt
             && receipt.operation_id === binding.operationId && receipt.request_digest === binding.requestDigest
             && receipt.publisher_key_id === binding.publisherKeyId && receipt.genesis_digest === verified.envelopeDigest
-            && receipt.configuration_digest === configurationDigest ? 'existing' : 'conflict';
+            && receipt.configuration_digest === configurationDigest
+            && (!binding.owner || roomOwnerBindingMatches(this.ctx.storage.sql, binding.owner, roomId, envelope.aad.packageDigest,
+              binding.publisherKeyId, body.expiresAtMs)) ? 'existing' : 'conflict';
           this.ctx.storage.sql.exec(`INSERT INTO room_state (
             singleton, room_id, viewer_cap_hash, editor_cap_hash, expires_at_ms,
             state_epoch, revision, envelope_digest, ciphertext, etag, recovery_status,
@@ -271,6 +280,8 @@ export class RoomDurableObject extends DurableObject<RoomEnvironment> {
           verified.envelopeDigest, exactArrayBuffer(verified.cipherBytes), verified.etag,
           zero, exactArrayBuffer(verified.writerPubBytes), exactArrayBuffer(verified.writerSigBytes),
           envelope.envelopeSalt, JSON.stringify(envelope.aad)).toArray();
+          if (binding?.owner) insertRoomOwnerBinding(this.ctx.storage.sql, binding.owner, roomId, envelope.aad.packageDigest,
+            binding.publisherKeyId, body.expiresAtMs);
           if (binding) this.ctx.storage.sql.exec('INSERT INTO creation_receipts VALUES(1,?,?,?,?,?)',
             binding.operationId, binding.requestDigest, binding.publisherKeyId, verified.envelopeDigest, configurationDigest).toArray();
           return 'created';

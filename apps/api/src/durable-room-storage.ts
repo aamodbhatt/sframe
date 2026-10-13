@@ -2,6 +2,7 @@ import type {D1Database} from '@cloudflare/workers-types';
 import {encodeBase64Url} from '../../../packages/protocol/src/index.js';
 import type {StoredRoomRecord} from './publish-api.js';
 import {PublisherStorageError} from './durable-publisher-storage.js';
+import {compatibleLegacyRoomInitialization} from './room-owner-binding.js';
 
 export type PublisherRoomNamespace = {get(id: any): {fetch(request: Request): Promise<Response>}; idFromName(name: string): any};
 type RoomOperation = {publisherKeyId: string; operationId: string; requestDigest: string; roomId: string;
@@ -58,7 +59,8 @@ export class DurableRoomStorage {
     ]);
     const operation = await this.operation(record.publisherKeyId, operationId);
     if (!operation || operation.requestDigest !== requestDigest) fail(409, 'IDEMPOTENCY_MISMATCH');
-    if (operation.initDigest !== initDigest || operation.responseBody !== body) fail(409, 'ROOM_OPERATION_INVALID');
+    if (operation.initDigest !== initDigest && !compatibleLegacyRoomInitialization(operation.initBody, initBody)
+      || operation.responseBody !== body) fail(409, 'ROOM_OPERATION_INVALID');
     await this.converge(operation, namespace);
     return {body: operation.responseBody, created: true};
   }

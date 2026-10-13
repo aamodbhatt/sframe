@@ -7,6 +7,7 @@ import {
   type RoomDescriptor
 } from '../../../packages/protocol/src/index.js';
 import type {WireEnvelope} from '../../../packages/protocol/src/crypto-envelope.js';
+import {computeDescriptorDigest} from '../../../packages/protocol/src/room-descriptor.js';
 import {parseUniqueJson} from '../../../packages/protocol/src/strict-json.js';
 import canonicalize from 'canonicalize';
 import {verifyUploadedPackage} from './package-verifier.js';
@@ -413,6 +414,9 @@ const verifyRoomCreationContext = async (body: RoomCreationBody, publisher: Stor
   return {viewer, editor};
 };
 
+const descriptorDigest = async (encoded: string, signature: string): Promise<string> =>
+  encodeBase64Url(await computeDescriptorDigest(decodeBase64Url(encoded), decodeBase64Url(signature)));
+
 export const handleRoomCreationSaga = async (
   request: Request,
   env: {ROOMS: {get: (id: any) => {fetch: (req: Request) => Promise<Response>}; idFromName: (name: string) => any}},
@@ -455,6 +459,9 @@ export const handleRoomCreationSaga = async (
         viewerDescriptor: viewerDesc, editorDescriptor: editorDesc}, rawBody.operationId, requestDigest, JSON.stringify({
           viewerCapHash: viewerDesc.capabilityHash, editorCapHash: editorDesc.capabilityHash, expiresAtMs: editorDesc.expiresAt,
           envelope: rawBody.envelope, operationId: rawBody.operationId, requestDigest, publisherKeyId: publisher.publisherKeyId,
+          ownerBinding: {publisherPublicKey: publisher.publisherPublicKey,
+            viewerDescriptorDigest: await descriptorDigest(rawBody.viewerDescriptorJcs, rawBody.viewerDescriptorSignature),
+            editorDescriptorDigest: await descriptorDigest(rawBody.editorDescriptorJcs, rawBody.editorDescriptorSignature)},
         }), env.ROOMS);
       return savedResponse(result.body, result.created ? 201 : 200);
     }
